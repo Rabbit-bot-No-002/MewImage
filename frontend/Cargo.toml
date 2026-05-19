@@ -1,0 +1,65 @@
+[package]
+name = "mew-image-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autobins = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm-siv = "0.11.1"
+base64.workspace = true
+console_error_panic_hook = "0.1.7"
+getrandom = { version = "0.2.16", features = ["js"] }
+gloo-file = { version = "0.4.0", features = ["futures"] }
+gloo-net = "0.7.0"
+gloo-timers = { version = "0.3.0", features = ["futures"] }
+js-sys = "0.3.82"
+leptos = { version = "0.8.19", features = ["csr"] }
+mew-image-shared = { path = "../shared" }
+rexie = "0.6.2"
+serde.workspace = true
+serde-wasm-bindgen = "0.6.5"
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+uuid.workspace = true
+wasm-bindgen = "0.2.105"
+wasm-bindgen-futures = "0.4.55"
+web-sys = { version = "0.3.82", features = [
+    "Blob",
+    "BlobPropertyBag",
+    "Clipboard",
+    "CanvasRenderingContext2d",
+    "ClipboardEvent",
+    "CssStyleDeclaration",
+    "DataTransfer",
+    "Document",
+    "DomRect",
+    "DragEvent",
+    "Element",
+    "Event",
+    "File",
+    "FileList",
+    "FileReader",
+    "FormData",
+    "Headers",
+    "HtmlCanvasElement",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "HtmlImageElement",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "ImageData",
+    "MouseEvent",
+    "Navigator",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Storage",
+    "Url",
+    "Window",
+] }

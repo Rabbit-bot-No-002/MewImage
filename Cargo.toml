@@ -1,0 +1,17 @@
+[workspace]
+members = ["backend", "frontend", "shared"]
+default-members = ["backend", "shared"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+base64 = "0.22.1"
+chrono = { version = "0.4.42", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+uuid = { version = "1.18.1", features = ["serde", "v4", "js"] }

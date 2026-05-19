@@ -1,0 +1,1625 @@
+mod state;
+
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
+
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng},
+};
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::{Client as S3Client, config::Region, primitives::ByteStream};
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::DefaultBodyLimit,
+    extract::{Multipart, Path, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chrono::{Duration, Utc};
+use mew_image_shared::{
+    AuthRequest, AuthResponse, GenerateViaProxyRequest, GeneratedImageResult, GenerationResult,
+    ImageAssetRef, MeResponse, MergePreviewResponse, ParameterSnapshot, ProviderEndpointMode,
+    ProviderKind, ProviderTemplate, ProviderTemplateImportRequest, ProxyInvokeRequest,
+    ProxyInvokeResponse, SyncEnvelope, SyncPullResponse, SyncPushRequest, UploadCompleteRequest,
+    UploadCompleteResponse, UploadInitRequest, UploadInitResponse, UserSummary,
+    aspect_ratio_from_dimensions, extract_gemini_generation_result,
+    extract_nano_banana_result, extract_openai_responses_result, merge_envelopes, new_id,
+    nano_banana_image_size_from_dimensions, now_rfc3339,
+};
+use rand::distr::{Alphanumeric, SampleString};
+use reqwest::Url;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
+use state::{AppConfig, AppState};
+use tokio::net::TcpListener;
+use tower_http::{
+    cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer},
+    services::ServeDir,
+    trace::TraceLayer,
+};
+use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+use tracing::{error, info, warn};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "mew_image_backend=debug,tower_http=info".into()),
+        )
+        .init();
+
+    let config = AppConfig::from_env()?;
+    ensure_sqlite_parent_dir(&config.database_url)?;
+    let db_options = SqliteConnectOptions::from_str(&config.database_url)?.create_if_missing(true);
+    let db = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(db_options)
+        .await?;
+    init_db(&db).await?;
+
+    let s3 = build_s3_client(&config).await?;
+    let builtins = vec![
+        ProviderTemplate::builtin_openai(),
+        ProviderTemplate::builtin_nano_banana(),
+    ];
+
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        db,
+        s3,
+        http: reqwest::Client::builder().build()?,
+        provider_builtins: builtins,
+    });
+
+    let session_layer = SessionManagerLayer::new(MemoryStore::default())
+        .with_secure(config.session_secure)
+        .with_same_site(tower_sessions::cookie::SameSite::Lax);
+
+    let app = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/auth/register", post(register))
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
+        .route("/api/auth/me", get(me))
+        .route("/api/sync/push", post(sync_push))
+        .route("/api/sync/pull", get(sync_pull))
+        .route("/api/sync/merge-preview", post(sync_merge_preview))
+        .route(
+            "/api/providers/templates",
+            get(list_provider_templates).post(import_provider_template),
+        )
+        .route("/api/providers/generate", post(generate_via_proxy))
+        .route("/api/assets/upload-init", post(upload_init))
+        .route("/api/assets/upload/{token}", put(upload_bytes))
+        .route("/api/assets/complete", post(upload_complete))
+        .route("/api/assets/{asset_id}", get(get_asset))
+        .route("/api/proxy/forward", post(proxy_forward))
+        .fallback_service(
+            ServeDir::new(&config.frontend_dist).append_index_html_on_directories(true),
+        )
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
+        .layer(TraceLayer::new_for_http())
+        .layer(
+            CorsLayer::new()
+                .allow_credentials(true)
+                .allow_headers(AllowHeaders::mirror_request())
+                .allow_methods(AllowMethods::mirror_request())
+                .allow_origin(AllowOrigin::mirror_request()),
+        )
+        .layer(session_layer)
+        .with_state(state);
+
+    let addr: SocketAddr = config.listen_addr.parse()?;
+    let listener = TcpListener::bind(addr).await?;
+    info!("backend listening on {}", addr);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn ensure_sqlite_parent_dir(database_url: &str) -> anyhow::Result<()> {
+    let path = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .unwrap_or(database_url);
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+async fn build_s3_client(config: &AppConfig) -> anyhow::Result<Option<S3Client>> {
+    if config.s3_bucket.is_empty() {
+        return Ok(None);
+    }
+
+    let mut loader = aws_config::defaults(BehaviorVersion::latest())
+        .region(Region::new(config.s3_region.clone()));
+    if let Some(endpoint) = config.s3_endpoint.clone() {
+        loader = loader.endpoint_url(endpoint);
+    }
+    if let (Some(access_key), Some(secret_key)) =
+        (config.s3_access_key.clone(), config.s3_secret_key.clone())
+    {
+        let creds =
+            aws_sdk_s3::config::Credentials::new(access_key, secret_key, None, None, "mew-image");
+        loader = loader.credentials_provider(creds);
+    }
+    let shared_config = loader.load().await;
+    Ok(Some(S3Client::new(&shared_config)))
+}
+
+async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
+    for statement in [
+        r#"CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS sync_snapshots (
+            user_id TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS provider_templates (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS assets (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            object_key TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            byte_len INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS upload_tokens (
+            token TEXT PRIMARY KEY,
+            asset_id TEXT NOT NULL,
+            user_id TEXT,
+            object_key TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            byte_len INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )"#,
+    ] {
+        sqlx::query(statement).execute(db).await?;
+    }
+    Ok(())
+}
+
+async fn health() -> impl IntoResponse {
+    Json(json!({ "ok": true }))
+}
+
+async fn register(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AuthRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    validate_credentials(&payload)?;
+
+    let password_hash = hash_password(&payload.password)?;
+    let user = UserSummary {
+        id: new_id(),
+        username: payload.username.trim().to_string(),
+        created_at: now_rfc3339(),
+    };
+
+    let result = sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&user.id)
+    .bind(&user.username)
+    .bind(&password_hash)
+    .bind(&user.created_at)
+    .execute(&state.db)
+    .await;
+
+    if let Err(error) = result {
+        if error.to_string().contains("UNIQUE") {
+            return Err(AppError::bad_request("用户名已存在"));
+        }
+        return Err(AppError::internal(error));
+    }
+
+    session
+        .insert("user_id", &user.id)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(AuthResponse { user }))
+}
+
+async fn login(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AuthRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    validate_credentials(&payload)?;
+
+    let row =
+        sqlx::query("SELECT id, username, password_hash, created_at FROM users WHERE username = ?")
+            .bind(payload.username.trim())
+            .fetch_optional(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+
+    let Some(row) = row else {
+        return Err(AppError::unauthorized("用户名或密码错误"));
+    };
+
+    let password_hash = row.get::<String, _>("password_hash");
+    verify_password(&payload.password, &password_hash)?;
+
+    let user = UserSummary {
+        id: row.get("id"),
+        username: row.get("username"),
+        created_at: row.get("created_at"),
+    };
+    session
+        .insert("user_id", &user.id)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(AuthResponse { user }))
+}
+
+async fn logout(session: Session) -> Result<StatusCode, AppError> {
+    session.delete().await.map_err(AppError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn me(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MeResponse>, AppError> {
+    let user = current_user(&state, &session).await?;
+    Ok(Json(MeResponse { user }))
+}
+
+async fn sync_push(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<SyncPushRequest>,
+) -> Result<Json<SyncPullResponse>, AppError> {
+    let user = require_user(&state, &session).await?;
+    let existing = load_sync_envelope(&state.db, &user.id).await?;
+    let normalized = normalize_envelope_assets(&state, Some(&user.id), payload.envelope).await?;
+    let merged = merge_envelopes(&existing, &normalized);
+    let updated_at = now_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO sync_snapshots (user_id, payload, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+    )
+    .bind(&user.id)
+    .bind(serde_json::to_string(&merged).map_err(AppError::internal)?)
+    .bind(&updated_at)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(Json(SyncPullResponse {
+        envelope: merged,
+        checkpoint: mew_image_shared::SyncCheckpoint {
+            last_push_at: Some(updated_at.clone()),
+            last_pull_at: Some(updated_at.clone()),
+            last_merged_at: Some(updated_at.clone()),
+            server_cursor: Some(updated_at),
+        },
+    }))
+}
+
+async fn sync_pull(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<SyncPullResponse>, AppError> {
+    let user = require_user(&state, &session).await?;
+    let envelope = load_sync_envelope(&state.db, &user.id).await?;
+    let now = now_rfc3339();
+    Ok(Json(SyncPullResponse {
+        envelope,
+        checkpoint: mew_image_shared::SyncCheckpoint {
+            last_pull_at: Some(now.clone()),
+            server_cursor: Some(now),
+            ..Default::default()
+        },
+    }))
+}
+
+async fn sync_merge_preview(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<SyncPushRequest>,
+) -> Result<Json<MergePreviewResponse>, AppError> {
+    let user = require_user(&state, &session).await?;
+    let existing = load_sync_envelope(&state.db, &user.id).await?;
+    let merged = merge_envelopes(&existing, &payload.envelope);
+    Ok(Json(MergePreviewResponse {
+        merged_updated_at: merged.updated_at.clone(),
+        config_count: merged.configs.len(),
+        task_count: merged.tasks.len(),
+        thread_count: merged.threads.len(),
+        asset_count: merged.assets.len(),
+    }))
+}
+
+async fn list_provider_templates(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<Vec<ProviderTemplate>>, AppError> {
+    let user = current_user(&state, &session).await?;
+    let mut templates = state.provider_builtins.clone();
+    if let Some(user) = user {
+        let rows = sqlx::query(
+            "SELECT payload FROM provider_templates WHERE user_id = ? ORDER BY updated_at DESC",
+        )
+        .bind(user.id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+        for row in rows {
+            let payload = row.get::<String, _>("payload");
+            if let Ok(template) = serde_json::from_str::<ProviderTemplate>(&payload) {
+                templates.push(template);
+            }
+        }
+    }
+    Ok(Json(templates))
+}
+
+async fn import_provider_template(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<ProviderTemplateImportRequest>,
+) -> Result<Json<ProviderTemplate>, AppError> {
+    validate_template(&payload.template)?;
+
+    if let Some(user) = current_user(&state, &session).await? {
+        let serialized = serde_json::to_string(&payload.template).map_err(AppError::internal)?;
+        sqlx::query(
+            "INSERT INTO provider_templates (id, user_id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+        )
+        .bind(&payload.template.id)
+        .bind(&user.id)
+        .bind(serialized)
+        .bind(&payload.template.created_at)
+        .bind(&payload.template.updated_at)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    }
+
+    Ok(Json(payload.template))
+}
+
+async fn upload_init(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<UploadInitRequest>,
+) -> Result<Json<UploadInitResponse>, AppError> {
+    let user = current_user(&state, &session).await?;
+    let asset_id = new_id();
+    let token = random_token();
+    let prefix = user
+        .as_ref()
+        .map(|user| user.id.clone())
+        .unwrap_or_else(|| "guest".into());
+    let object_key = format!("assets/{prefix}/{}-{}", payload.sha256, payload.file_name);
+    let expires_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+
+    sqlx::query(
+        "INSERT INTO upload_tokens (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&token)
+    .bind(&asset_id)
+    .bind(user.as_ref().map(|user| user.id.clone()))
+    .bind(&object_key)
+    .bind(&payload.mime_type)
+    .bind(payload.byte_len as i64)
+    .bind(&payload.sha256)
+    .bind(&expires_at)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+
+    Ok(Json(UploadInitResponse {
+        upload_token: token.clone(),
+        upload_url: format!("/api/assets/upload/{token}"),
+        asset_id,
+        object_key,
+    }))
+}
+
+async fn upload_bytes(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, AppError> {
+    let row = sqlx::query(
+        "SELECT asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at FROM upload_tokens WHERE token = ?",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+    let Some(row) = row else {
+        return Err(AppError::not_found("上传凭证不存在"));
+    };
+
+    let expected_len = row.get::<i64, _>("byte_len") as usize;
+    if expected_len != body.len() {
+        return Err(AppError::bad_request("上传大小与预期不一致"));
+    }
+
+    let hash = hex_sha256(&body);
+    let expected_hash = row.get::<String, _>("sha256");
+    if hash != expected_hash {
+        return Err(AppError::bad_request("文件哈希校验失败"));
+    }
+
+    put_object(
+        &state,
+        row.get::<String, _>("object_key").as_str(),
+        row.get::<String, _>("mime_type").as_str(),
+        body.to_vec(),
+    )
+    .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn upload_complete(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<UploadCompleteRequest>,
+) -> Result<Json<UploadCompleteResponse>, AppError> {
+    let row = sqlx::query(
+        "SELECT asset_id, user_id, object_key, mime_type, byte_len, sha256 FROM upload_tokens WHERE token = ?",
+    )
+    .bind(&payload.upload_token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+    let Some(row) = row else {
+        return Err(AppError::not_found("上传凭证不存在"));
+    };
+
+    let created_at = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET object_key = excluded.object_key, mime_type = excluded.mime_type, sha256 = excluded.sha256, byte_len = excluded.byte_len",
+    )
+    .bind(row.get::<String, _>("asset_id"))
+    .bind(row.get::<Option<String>, _>("user_id"))
+    .bind(row.get::<String, _>("object_key"))
+    .bind(row.get::<String, _>("mime_type"))
+    .bind(row.get::<String, _>("sha256"))
+    .bind(row.get::<i64, _>("byte_len"))
+    .bind(&created_at)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+
+    let asset = ImageAssetRef {
+        id: row.get("asset_id"),
+        sha256: row.get("sha256"),
+        mime_type: row.get("mime_type"),
+        byte_len: row.get::<i64, _>("byte_len") as u64,
+        width: None,
+        height: None,
+        created_at: created_at.clone(),
+        updated_at: created_at,
+        data_url: None,
+        remote_object_key: Some(row.get("object_key")),
+        remote_url: Some(format!("/api/assets/{}", row.get::<String, _>("asset_id"))),
+        source_task_id: None,
+        metadata: Default::default(),
+    };
+    Ok(Json(UploadCompleteResponse { asset }))
+}
+
+async fn get_asset(
+    State(state): State<Arc<AppState>>,
+    Path(asset_id): Path<String>,
+) -> Result<Response, AppError> {
+    let row = sqlx::query("SELECT object_key, mime_type FROM assets WHERE id = ?")
+        .bind(asset_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let Some(row) = row else {
+        return Err(AppError::not_found("资源不存在"));
+    };
+
+    let client = state
+        .s3
+        .as_ref()
+        .ok_or_else(|| AppError::internal_message("对象存储未配置"))?;
+    let output = client
+        .get_object()
+        .bucket(&state.config.s3_bucket)
+        .key(row.get::<String, _>("object_key"))
+        .send()
+        .await
+        .map_err(AppError::internal)?;
+
+    let bytes = output
+        .body
+        .collect()
+        .await
+        .map_err(AppError::internal)?
+        .into_bytes();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&row.get::<String, _>("mime_type")).map_err(AppError::internal)?,
+    );
+    Ok((StatusCode::OK, headers, bytes).into_response())
+}
+
+async fn proxy_forward(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ProxyInvokeRequest>,
+) -> Result<Json<ProxyInvokeResponse>, AppError> {
+    let method: Method = payload
+        .method
+        .parse()
+        .map_err(|_| AppError::bad_request("无效的 HTTP 方法"))?;
+    let url = Url::parse(&payload.url).map_err(|_| AppError::bad_request("无效的目标地址"))?;
+
+    let mut request = state.http.request(method, url);
+    for (key, value) in &payload.headers {
+        if is_forbidden_header(key) {
+            continue;
+        }
+        request = request.header(key, value);
+    }
+
+    if let Some(body) = payload.body_base64 {
+        let bytes = BASE64
+            .decode(body)
+            .map_err(|_| AppError::bad_request("请求体 Base64 无效"))?;
+        request = request.body(bytes);
+    }
+
+    let response = request.send().await.map_err(|error| {
+        warn!("proxy request failed: {}", error);
+        AppError::bad_gateway("上游请求失败，可能是网络错误或接口拒绝访问")
+    })?;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let mut headers = std::collections::BTreeMap::new();
+    for (key, value) in response.headers() {
+        if is_forbidden_header(key.as_str()) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            headers.insert(key.to_string(), value.to_string());
+        }
+    }
+    let body = response.bytes().await.map_err(AppError::internal)?;
+
+    Ok(Json(ProxyInvokeResponse {
+        status,
+        content_type,
+        headers,
+        body_base64: BASE64.encode(body),
+    }))
+}
+
+async fn generate_via_proxy(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<Json<GenerationResult>, AppError> {
+    let payload = parse_generate_multipart(multipart).await?;
+    let started_at = Utc::now();
+    let response_json = match payload.template.kind {
+        ProviderKind::OpenAiCompatible => invoke_openai_compatible(&state, &payload).await?,
+        ProviderKind::Gemini => invoke_gemini(&state, &payload).await?,
+        ProviderKind::NanoBanana => invoke_nano_banana(&state, &payload).await?,
+        ProviderKind::CustomHttp => invoke_custom_http(&state, &payload).await?,
+    };
+
+    let duration_ms = (Utc::now() - started_at).num_milliseconds().max(0) as u64;
+    Ok(Json(extract_generation_result(
+        &payload.template,
+        payload.config.output_format.as_deref(),
+        &payload.request,
+        response_json,
+        duration_ms,
+    )))
+}
+
+async fn parse_generate_multipart(
+    mut multipart: Multipart,
+) -> Result<GenerateViaProxyRequest, AppError> {
+    let mut payload = None;
+    let mut reference_assets_meta = None;
+    let mut reference_assets_files = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(AppError::internal)? {
+        let name = field.name().unwrap_or_default().to_string();
+        let content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        match name.as_str() {
+            "payload" => {
+                let text = field.text().await.map_err(AppError::internal)?;
+                payload = Some(
+                    serde_json::from_str::<GenerateViaProxyRequest>(&text).map_err(|error| {
+                        AppError::bad_request(format!("生成请求解析失败：{error}"))
+                    })?,
+                );
+            }
+            "reference_assets_meta" => {
+                reference_assets_meta = Some(field.text().await.map_err(AppError::internal)?);
+            }
+            "reference_asset_files" => {
+                let bytes = field.bytes().await.map_err(AppError::internal)?;
+                reference_assets_files.push((content_type, bytes.to_vec()));
+            }
+            _ => {}
+        }
+    }
+
+    let mut payload = payload.ok_or_else(|| AppError::bad_request("缺少生成请求主体"))?;
+    let reference_assets_meta: Vec<ReferenceAssetMeta> = reference_assets_meta
+        .map(|text| {
+            serde_json::from_str(&text)
+                .map_err(|error| AppError::bad_request(format!("参考图元数据解析失败：{error}")))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if reference_assets_meta.len() != reference_assets_files.len() {
+        return Err(AppError::bad_request("参考图文件数量与元数据数量不一致"));
+    }
+
+    let mut reference_assets = Vec::with_capacity(reference_assets_meta.len());
+    for (asset, (mime_type, bytes)) in reference_assets_meta
+        .into_iter()
+        .zip(reference_assets_files.into_iter())
+    {
+        reference_assets.push(ImageAssetRef {
+            id: asset.id,
+            sha256: asset.sha256,
+            mime_type: mime_type.clone(),
+            byte_len: bytes.len() as u64,
+            width: asset.width,
+            height: asset.height,
+            created_at: asset.created_at,
+            updated_at: asset.updated_at,
+            data_url: Some(format!("data:{mime_type};base64,{}", BASE64.encode(&bytes))),
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: asset.source_task_id,
+            metadata: asset.metadata,
+        });
+    }
+
+    payload.request.reference_assets = reference_assets;
+    Ok(payload)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ReferenceAssetMeta {
+    id: String,
+    sha256: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    created_at: String,
+    updated_at: String,
+    #[serde(default)]
+    source_task_id: Option<String>,
+    #[serde(default)]
+    metadata: std::collections::BTreeMap<String, String>,
+}
+
+async fn current_user(
+    state: &AppState,
+    session: &Session,
+) -> Result<Option<UserSummary>, AppError> {
+    let Some(user_id) = session
+        .get::<String>("user_id")
+        .await
+        .map_err(AppError::internal)?
+    else {
+        return Ok(None);
+    };
+    let row = sqlx::query("SELECT id, username, created_at FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+
+    Ok(row.map(|row| UserSummary {
+        id: row.get("id"),
+        username: row.get("username"),
+        created_at: row.get("created_at"),
+    }))
+}
+
+async fn require_user(state: &AppState, session: &Session) -> Result<UserSummary, AppError> {
+    current_user(state, session)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("请先登录以启用云端同步"))
+}
+
+async fn load_sync_envelope(db: &SqlitePool, user_id: &str) -> Result<SyncEnvelope, AppError> {
+    let row = sqlx::query("SELECT payload FROM sync_snapshots WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .map_err(AppError::internal)?;
+
+    match row {
+        Some(row) => {
+            serde_json::from_str(&row.get::<String, _>("payload")).map_err(AppError::internal)
+        }
+        None => Ok(SyncEnvelope::default()),
+    }
+}
+
+async fn normalize_envelope_assets(
+    state: &AppState,
+    user_id: Option<&str>,
+    mut envelope: SyncEnvelope,
+) -> Result<SyncEnvelope, AppError> {
+    for config in &mut envelope.configs {
+        config.api_key_plaintext = None;
+    }
+    for asset in &mut envelope.assets {
+        if asset.remote_object_key.is_some() {
+            asset.remote_url = Some(format!("/api/assets/{}", asset.id));
+            asset.data_url = None;
+            continue;
+        }
+        let Some(data_url) = asset.data_url.clone() else {
+            continue;
+        };
+        let (mime_type, bytes) = decode_data_url(&data_url)?;
+        let object_key = format!("assets/{}/{}.bin", user_id.unwrap_or("guest"), asset.sha256);
+        put_object(state, &object_key, &mime_type, bytes).await?;
+        asset.remote_object_key = Some(object_key);
+        asset.remote_url = Some(format!("/api/assets/{}", asset.id));
+        asset.data_url = None;
+
+        sqlx::query(
+            "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET object_key = excluded.object_key, mime_type = excluded.mime_type, sha256 = excluded.sha256, byte_len = excluded.byte_len",
+        )
+        .bind(&asset.id)
+        .bind(user_id)
+        .bind(asset.remote_object_key.as_deref().unwrap_or_default())
+        .bind(&mime_type)
+        .bind(&asset.sha256)
+        .bind(asset.byte_len as i64)
+        .bind(&asset.created_at)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    }
+    envelope.updated_at = now_rfc3339();
+    Ok(envelope)
+}
+
+async fn put_object(
+    state: &AppState,
+    object_key: &str,
+    mime_type: &str,
+    bytes: Vec<u8>,
+) -> Result<(), AppError> {
+    let Some(client) = state.s3.as_ref() else {
+        return Ok(());
+    };
+    client
+        .put_object()
+        .bucket(&state.config.s3_bucket)
+        .key(object_key)
+        .content_type(mime_type)
+        .body(ByteStream::from(bytes))
+        .send()
+        .await
+        .map_err(AppError::internal)?;
+    Ok(())
+}
+
+fn validate_credentials(payload: &AuthRequest) -> Result<(), AppError> {
+    if payload.username.trim().len() < 3 {
+        return Err(AppError::bad_request("用户名至少 3 个字符"));
+    }
+    if payload.password.len() < 8 {
+        return Err(AppError::bad_request("密码至少 8 个字符"));
+    }
+    Ok(())
+}
+
+fn hash_password(password: &str) -> Result<String, AppError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|error| AppError::internal_message(format!("密码哈希失败：{error}")))
+}
+
+fn verify_password(password: &str, password_hash: &str) -> Result<(), AppError> {
+    let parsed = PasswordHash::new(password_hash)
+        .map_err(|error| AppError::internal_message(format!("密码哈希格式无效：{error}")))?;
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .map_err(|_| AppError::unauthorized("用户名或密码错误"))
+}
+
+fn validate_template(template: &ProviderTemplate) -> Result<(), AppError> {
+    if template.name.trim().is_empty() {
+        return Err(AppError::bad_request("模板名称不能为空"));
+    }
+    if template.base_url.trim().is_empty() {
+        return Err(AppError::bad_request("模板基础地址不能为空"));
+    }
+    if !template.base_url.starts_with("http") {
+        return Err(AppError::bad_request("模板基础地址必须是 http/https"));
+    }
+    Ok(())
+}
+
+fn decode_data_url(data_url: &str) -> Result<(String, Vec<u8>), AppError> {
+    let Some((meta, data)) = data_url.split_once(',') else {
+        return Err(AppError::bad_request("无效的数据 URL"));
+    };
+    let mime_type = meta
+        .trim_start_matches("data:")
+        .trim_end_matches(";base64")
+        .to_string();
+    let bytes = BASE64
+        .decode(data)
+        .map_err(|_| AppError::bad_request("资源 Base64 无效"))?;
+    Ok((mime_type, bytes))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn random_token() -> String {
+    Alphanumeric.sample_string(&mut rand::rng(), 32)
+}
+
+fn is_forbidden_header(header_name: &str) -> bool {
+    matches!(
+        header_name.to_ascii_lowercase().as_str(),
+        "host" | "content-length" | "connection"
+    )
+}
+
+fn openai_images_endpoint(request: &mew_image_shared::GenerationRequest) -> &'static str {
+    if !request.reference_assets.is_empty() {
+        "/v1/images/edits"
+    } else {
+        "/v1/images/generations"
+    }
+}
+
+fn join_api_url(base_url: &str, endpoint_path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let endpoint = endpoint_path.trim_start_matches('/');
+    let base = if base.ends_with("/v1") && endpoint.starts_with("v1/") {
+        base.trim_end_matches("/v1")
+    } else {
+        base
+    };
+    format!("{base}/{endpoint}")
+}
+
+fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
+    let (prefix, payload) = data_url.split_once(',')?;
+    let mime_type = prefix
+        .strip_prefix("data:")?
+        .strip_suffix(";base64")?;
+    Some((mime_type, payload))
+}
+
+async fn invoke_openai_compatible(
+    state: &AppState,
+    payload: &GenerateViaProxyRequest,
+) -> Result<serde_json::Value, AppError> {
+    let api_key = payload
+        .config
+        .api_key_plaintext
+        .clone()
+        .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
+    let url = join_api_url(
+        &payload.config.base_url,
+        match payload.config.endpoint_mode {
+            ProviderEndpointMode::ImagesApi => openai_images_endpoint(&payload.request),
+            ProviderEndpointMode::ResponsesApi => "/v1/responses",
+            ProviderEndpointMode::CustomJson => payload.template.endpoint_path.as_str(),
+        },
+    );
+
+    let request = state.http.post(url).bearer_auth(api_key);
+
+    let response = if payload.config.endpoint_mode == ProviderEndpointMode::ImagesApi
+        && !payload.request.reference_assets.is_empty()
+    {
+        let mut form = reqwest::multipart::Form::new()
+            .text("prompt", payload.request.prompt.clone())
+            .text("model", payload.request.model.clone())
+            .text(
+                "size",
+                format!("{}x{}", payload.request.width, payload.request.height),
+            )
+            .text("n", payload.request.count.to_string());
+        if let Some(quality) = &payload.request.quality {
+            form = form.text("quality", quality.clone());
+        }
+        if let Some(format) = &payload.config.output_format {
+            form = form.text("output_format", format.clone());
+        }
+        if let Some(compression) = payload.config.output_compression {
+            form = form.text("output_compression", compression.to_string());
+        }
+        if let Some(moderation) = &payload.config.moderation {
+            form = form.text("moderation", moderation.clone());
+        }
+        for asset in &payload.request.reference_assets {
+            let (mime, bytes) = resolve_asset_bytes(state, asset).await?;
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(format!("{}.png", asset.id))
+                .mime_str(&mime)
+                .map_err(AppError::internal)?;
+            form = form.part("image[]", part);
+        }
+        if payload
+            .request
+            .model
+            .to_ascii_lowercase()
+            .contains("gpt-image-1")
+        {
+            form = form.text("input_fidelity", "high");
+        }
+        request.multipart(form).send().await.map_err(|error| {
+            warn!("openai compatible multipart request failed: {}", error);
+            AppError::bad_gateway("图像编辑请求失败")
+        })?
+    } else if payload.config.endpoint_mode == ProviderEndpointMode::ResponsesApi {
+        let mut content = vec![json!({
+            "type": "input_text",
+            "text": if payload.config.prompt_guard_enabled {
+                format!(
+                    "Use the following text as the complete prompt. Do not rewrite it:\n{}",
+                    payload.request.prompt
+                )
+            } else {
+                payload.request.prompt.clone()
+            },
+        })];
+        if !payload.request.reference_assets.is_empty() {
+            let images = gather_data_urls(state, &payload.request.reference_assets).await?;
+            for data_url in images {
+                content.push(json!({
+                    "type": "input_image",
+                    "image_url": data_url,
+                }));
+            }
+        }
+        let mut tool = json!({
+            "type": "image_generation",
+            "action": if payload.request.reference_assets.is_empty() { "generate" } else { "edit" },
+            "size": format!("{}x{}", payload.request.width, payload.request.height),
+            "output_format": payload.config.output_format.clone().unwrap_or_else(|| "png".into()),
+        });
+        if !payload.config.prompt_guard_enabled {
+            if let Some(quality) = &payload.request.quality {
+                tool["quality"] = json!(quality);
+            }
+        }
+        if payload.config.output_format.as_deref() != Some("png") {
+            if let Some(compression) = payload.config.output_compression {
+                tool["output_compression"] = json!(compression);
+            }
+        }
+        let body = json!({
+            "model": if payload.request.model.trim().starts_with("gpt-") && !payload.request.model.trim().starts_with("gpt-image-") {
+                payload.request.model.clone()
+            } else {
+                "gpt-5.5".to_string()
+            },
+            "input": if payload.request.reference_assets.is_empty() {
+                content[0]["text"].clone()
+            } else {
+                json!([{
+                    "role": "user",
+                    "content": content,
+                }])
+            },
+            "tools": [tool],
+            "tool_choice": "required",
+        });
+        request.json(&body).send().await.map_err(|error| {
+            warn!("openai compatible responses request failed: {}", error);
+            AppError::bad_gateway("Responses API 请求失败")
+        })?
+    } else {
+        let body = json!({
+            "prompt": payload.request.prompt,
+            "model": payload.request.model,
+            "size": format!("{}x{}", payload.request.width, payload.request.height),
+            "quality": payload.request.quality,
+            "n": payload.request.count,
+            "output_format": payload.config.output_format,
+            "output_compression": payload.config.output_compression,
+            "moderation": payload.config.moderation,
+        });
+        request.json(&body).send().await.map_err(|error| {
+            warn!("openai compatible json request failed: {}", error);
+            AppError::bad_gateway("Images API 请求失败")
+        })?
+    };
+
+    response.json().await.map_err(AppError::internal)
+}
+
+async fn invoke_nano_banana(
+    state: &AppState,
+    payload: &GenerateViaProxyRequest,
+) -> Result<serde_json::Value, AppError> {
+    let api_key = payload
+        .config
+        .api_key_plaintext
+        .clone()
+        .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
+    let url = join_api_url(&payload.config.base_url, payload.template.endpoint_path.as_str());
+
+    let response = if payload.request.reference_assets.is_empty() {
+        state
+            .http
+            .post(url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Accept", "application/json")
+            .json(&json!({
+                "model": payload.request.model,
+                "prompt": payload.request.prompt,
+                "aspect_ratio": aspect_ratio_from_dimensions(payload.request.width, payload.request.height),
+                "response_format": "url",
+                "image_size": nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
+            }))
+            .send()
+            .await
+            .map_err(|error| {
+                warn!("nano banana request failed: {}", error);
+                AppError::bad_gateway("nano banana 请求失败")
+            })?
+    } else {
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", payload.request.model.clone())
+            .text("prompt", payload.request.prompt.clone())
+            .text(
+                "aspect_ratio",
+                aspect_ratio_from_dimensions(payload.request.width, payload.request.height),
+            )
+            .text("response_format", "url")
+            .text(
+                "image_size",
+                nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
+            );
+        for asset in &payload.request.reference_assets {
+            let (mime, bytes) = resolve_asset_bytes(state, asset).await?;
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(format!("{}.{}", asset.id, mime_extension(&mime)))
+                .mime_str(&mime)
+                .map_err(AppError::internal)?;
+            form = form.part("image", part);
+        }
+        state
+            .http
+            .post(url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Accept", "application/json")
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| {
+                warn!("nano banana multipart request failed: {}", error);
+                AppError::bad_gateway("nano banana 请求失败")
+            })?
+    };
+
+    response.json().await.map_err(AppError::internal)
+}
+
+async fn invoke_gemini(
+    state: &AppState,
+    payload: &GenerateViaProxyRequest,
+) -> Result<serde_json::Value, AppError> {
+    let api_key = payload
+        .config
+        .api_key_plaintext
+        .clone()
+        .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
+    let url = join_api_url(&payload.config.base_url, payload.template.endpoint_path.as_str());
+    let body = build_gemini_payload(state, payload).await?;
+    let response = state
+        .http
+        .post(url)
+        .header("x-goog-api-key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            warn!("gemini request failed: {}", error);
+            AppError::bad_gateway("Gemini 图像请求失败")
+        })?;
+
+    response.json().await.map_err(AppError::internal)
+}
+
+async fn invoke_custom_http(
+    state: &AppState,
+    payload: &GenerateViaProxyRequest,
+) -> Result<serde_json::Value, AppError> {
+    let api_key = payload
+        .config
+        .api_key_plaintext
+        .clone()
+        .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
+    let url = format!(
+        "{}{}",
+        payload.config.base_url.trim_end_matches('/'),
+        payload.template.endpoint_path
+    );
+    let mut body = json!({});
+    set_json_path(
+        &mut body,
+        payload.template.prompt_field.as_deref().unwrap_or("prompt"),
+        json!(payload.request.prompt),
+    );
+    set_json_path(
+        &mut body,
+        payload.template.model_field.as_deref().unwrap_or("model"),
+        json!(payload.request.model),
+    );
+    set_json_path(
+        &mut body,
+        payload.template.size_field.as_deref().unwrap_or("size"),
+        json!(format!(
+            "{}x{}",
+            payload.request.width, payload.request.height
+        )),
+    );
+    set_json_path(
+        &mut body,
+        payload.template.count_field.as_deref().unwrap_or("n"),
+        json!(payload.request.count),
+    );
+    if let Some(quality) = &payload.request.quality {
+        if let Some(path) = payload.template.quality_field.as_deref() {
+            set_json_path(&mut body, path, json!(quality));
+        }
+    }
+
+    let response = state
+        .http
+        .request(
+            payload
+                .template
+                .method
+                .parse()
+                .map_err(|_| AppError::bad_request("自定义模板 HTTP 方法无效"))?,
+            url,
+        )
+        .header(&payload.template.auth_header, format!("Bearer {}", api_key))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            warn!("custom provider request failed: {}", error);
+            AppError::bad_gateway("自定义服务商请求失败")
+        })?;
+
+    response.json().await.map_err(AppError::internal)
+}
+
+fn mime_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/webp" => "webp",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        _ => "bin",
+    }
+}
+
+fn extract_generation_result(
+    template: &ProviderTemplate,
+    output_format: Option<&str>,
+    request: &mew_image_shared::GenerationRequest,
+    response_json: serde_json::Value,
+    duration_ms: u64,
+) -> GenerationResult {
+    if template.kind == ProviderKind::Gemini {
+        let mut result = extract_gemini_generation_result(request, response_json, output_format)
+            .unwrap_or_else(|error| GenerationResult {
+                images: Vec::new(),
+                parameter_snapshot: ParameterSnapshot {
+                    requested_width: Some(request.width),
+                    requested_height: Some(request.height),
+                    actual_width: Some(request.width),
+                    actual_height: Some(request.height),
+                    requested_quality: request.quality.clone(),
+                    actual_quality: Some("standard".into()),
+                    revised_prompt: None,
+                    duration_ms: Some(duration_ms),
+                },
+                raw_response_json: Some(serde_json::json!({ "error": error })),
+            });
+        result.parameter_snapshot.duration_ms = Some(duration_ms);
+        return result;
+    }
+    if template.kind == ProviderKind::NanoBanana {
+        let mut result = extract_nano_banana_result(request, response_json, output_format)
+            .unwrap_or_else(|error| GenerationResult {
+                images: Vec::new(),
+                parameter_snapshot: ParameterSnapshot {
+                    requested_width: Some(request.width),
+                    requested_height: Some(request.height),
+                    actual_width: Some(request.width),
+                    actual_height: Some(request.height),
+                    requested_quality: request.quality.clone(),
+                    actual_quality: Some("standard".into()),
+                    revised_prompt: None,
+                    duration_ms: Some(duration_ms),
+                },
+                raw_response_json: Some(serde_json::json!({ "error": error })),
+            });
+        result.parameter_snapshot.duration_ms = Some(duration_ms);
+        return result;
+    }
+    if request.endpoint_mode == ProviderEndpointMode::ResponsesApi {
+        let mut result = extract_openai_responses_result(
+            request,
+            response_json,
+            output_format,
+        )
+        .unwrap_or_else(|error| GenerationResult {
+            images: Vec::new(),
+            parameter_snapshot: ParameterSnapshot {
+                requested_width: Some(request.width),
+                requested_height: Some(request.height),
+                actual_width: Some(request.width),
+                actual_height: Some(request.height),
+                requested_quality: request.quality.clone(),
+                actual_quality: request.quality.clone(),
+                revised_prompt: None,
+                duration_ms: Some(duration_ms),
+            },
+            raw_response_json: Some(serde_json::json!({ "error": error })),
+        });
+        result.parameter_snapshot.duration_ms = Some(duration_ms);
+        return result;
+    }
+    let urls = template
+        .response_image_url_path
+        .as_deref()
+        .map(|path| collect_json_path(&response_json, path))
+        .unwrap_or_default();
+    let base64_images = template
+        .response_image_base64_path
+        .as_deref()
+        .map(|path| collect_json_path(&response_json, path))
+        .unwrap_or_default();
+
+    let mut images = Vec::new();
+    for value in urls {
+        if let Some(url) = value.as_str() {
+            images.push(GeneratedImageResult {
+                url: Some(url.to_string()),
+                data_url: None,
+            });
+        }
+    }
+    for value in base64_images {
+        if let Some(raw) = value.as_str() {
+            images.push(GeneratedImageResult {
+                url: None,
+                data_url: Some(format!("data:image/png;base64,{raw}")),
+            });
+        }
+    }
+
+    let revised_prompt = template
+        .response_revised_prompt_path
+        .as_deref()
+        .and_then(|path| collect_json_path(&response_json, path).into_iter().next())
+        .and_then(|value| value.as_str().map(str::to_string));
+
+    GenerationResult {
+        images,
+        parameter_snapshot: ParameterSnapshot {
+            requested_width: Some(request.width),
+            requested_height: Some(request.height),
+            actual_width: Some(request.width),
+            actual_height: Some(request.height),
+            requested_quality: request.quality.clone(),
+            actual_quality: request.quality.clone(),
+            revised_prompt,
+            duration_ms: Some(duration_ms),
+        },
+        raw_response_json: Some(response_json),
+    }
+}
+
+async fn gather_data_urls(
+    state: &AppState,
+    assets: &[ImageAssetRef],
+) -> Result<Vec<String>, AppError> {
+    let mut results = Vec::with_capacity(assets.len());
+    for asset in assets {
+        if let Some(data_url) = &asset.data_url {
+            results.push(data_url.clone());
+            continue;
+        }
+        let (mime, bytes) = resolve_asset_bytes(state, asset).await?;
+        results.push(format!("data:{mime};base64,{}", BASE64.encode(bytes)));
+    }
+    Ok(results)
+}
+
+async fn build_gemini_payload(
+    state: &AppState,
+    payload: &GenerateViaProxyRequest,
+) -> Result<serde_json::Value, AppError> {
+    let mut parts = vec![json!({
+        "text": payload.request.prompt.clone(),
+    })];
+    let data_urls = gather_data_urls(state, &payload.request.reference_assets).await?;
+    for data_url in data_urls {
+        if let Some((mime_type, data)) = split_data_url_payload(&data_url) {
+            parts.push(json!({
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": data,
+                }
+            }));
+        }
+    }
+
+    Ok(json!({
+        "contents": [{
+            "role": "user",
+            "parts": parts,
+        }],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"],
+        }
+    }))
+}
+
+async fn resolve_asset_bytes(
+    state: &AppState,
+    asset: &ImageAssetRef,
+) -> Result<(String, Vec<u8>), AppError> {
+    if let Some(data_url) = &asset.data_url {
+        return decode_data_url(data_url);
+    }
+    let object_key = asset
+        .remote_object_key
+        .as_ref()
+        .ok_or_else(|| AppError::bad_request("资源缺少可读取的图像数据"))?;
+    let Some(client) = state.s3.as_ref() else {
+        return Err(AppError::internal_message("对象存储未配置"));
+    };
+    let output = client
+        .get_object()
+        .bucket(&state.config.s3_bucket)
+        .key(object_key)
+        .send()
+        .await
+        .map_err(AppError::internal)?;
+    let bytes = output
+        .body
+        .collect()
+        .await
+        .map_err(AppError::internal)?
+        .into_bytes()
+        .to_vec();
+    Ok((asset.mime_type.clone(), bytes))
+}
+
+fn set_json_path(target: &mut serde_json::Value, path: &str, value: serde_json::Value) {
+    let mut current = target;
+    let segments: Vec<&str> = path.split('.').collect();
+    for (index, segment) in segments.iter().enumerate() {
+        let is_last = index == segments.len() - 1;
+        if is_last {
+            if let Some(object) = current.as_object_mut() {
+                object.insert((*segment).to_string(), value.clone());
+            }
+            return;
+        }
+        if current.get(segment).is_none() {
+            current[segment] = json!({});
+        }
+        current = &mut current[segment];
+    }
+}
+
+fn collect_json_path(value: &serde_json::Value, path: &str) -> Vec<serde_json::Value> {
+    fn walk(current: &serde_json::Value, parts: &[&str], output: &mut Vec<serde_json::Value>) {
+        if parts.is_empty() {
+            output.push(current.clone());
+            return;
+        }
+        let part = parts[0];
+        if let Some(key) = part.strip_suffix("[]") {
+            if let Some(array) = current.get(key).and_then(|value| value.as_array()) {
+                for item in array {
+                    walk(item, &parts[1..], output);
+                }
+            }
+            return;
+        }
+        if let Some((key, raw_index)) = part.split_once('[') {
+            let index = raw_index
+                .trim_end_matches(']')
+                .parse::<usize>()
+                .unwrap_or(0);
+            if let Some(item) = current
+                .get(key)
+                .and_then(|value| value.as_array())
+                .and_then(|array| array.get(index))
+            {
+                walk(item, &parts[1..], output);
+            }
+            return;
+        }
+        if let Some(next) = current.get(part) {
+            walk(next, &parts[1..], output);
+        }
+    }
+
+    let mut values = Vec::new();
+    walk(value, &path.split('.').collect::<Vec<_>>(), &mut values);
+    values
+}
+
+#[derive(Debug)]
+struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn bad_gateway(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+        }
+    }
+
+    fn internal_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn internal(error: impl std::error::Error) -> Self {
+        error!("internal error: {}", error);
+        Self::internal_message("服务器内部错误")
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "error": self.message,
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mew_image_shared::{GenerationRequest, ProviderEndpointMode};
+
+    #[test]
+    fn data_url_can_be_decoded() {
+        let (mime, bytes) = decode_data_url("data:text/plain;base64,aGVsbG8=").unwrap();
+        assert_eq!(mime, "text/plain");
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn forbidden_headers_are_filtered() {
+        assert!(is_forbidden_header("Host"));
+        assert!(!is_forbidden_header("Authorization"));
+    }
+
+    #[test]
+    fn responses_result_can_find_nested_base64() {
+        let request = GenerationRequest {
+            prompt: "test".into(),
+            model: "gpt-5.5".into(),
+            width: 1024,
+            height: 1024,
+            quality: Some("high".into()),
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            reference_assets: Vec::new(),
+        };
+        let response_json = serde_json::json!({
+            "output": [{
+                "type": "image_generation_call",
+                "result": {
+                    "payload": {
+                        "items": [{
+                            "base64": "aGVsbG8="
+                        }]
+                    }
+                },
+                "revised_prompt": "better prompt",
+                "size": "1024x1024",
+                "quality": "high"
+            }]
+        });
+
+        let result = extract_openai_responses_result(&request, response_json, Some("png")).unwrap();
+        assert_eq!(result.images.len(), 1);
+        assert!(result.images[0].data_url.as_ref().unwrap().starts_with("data:image/png;base64,"));
+        assert_eq!(
+            result.parameter_snapshot.revised_prompt.as_deref(),
+            Some("better prompt")
+        );
+    }
+}

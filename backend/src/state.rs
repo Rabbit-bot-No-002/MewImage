@@ -1,0 +1,46 @@
+use aws_sdk_s3::Client as S3Client;
+use mew_image_shared::ProviderTemplate;
+use sqlx::SqlitePool;
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub listen_addr: String,
+    pub database_url: String,
+    pub frontend_dist: String,
+    pub session_secure: bool,
+    pub s3_bucket: String,
+    pub s3_region: String,
+    pub s3_endpoint: Option<String>,
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
+}
+
+impl AppConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            listen_addr: std::env::var("MEW_IMAGE_LISTEN")
+                .unwrap_or_else(|_| "127.0.0.1:3000".into()),
+            database_url: std::env::var("MEW_IMAGE_DATABASE_URL")
+                .unwrap_or_else(|_| "sqlite://./data/mew-image.db?mode=rwc".into()),
+            frontend_dist: std::env::var("MEW_IMAGE_FRONTEND_DIST")
+                .unwrap_or_else(|_| "./frontend/dist".into()),
+            session_secure: std::env::var("MEW_IMAGE_SESSION_SECURE")
+                .map(|value| value == "true")
+                .unwrap_or(false),
+            s3_bucket: std::env::var("MEW_IMAGE_S3_BUCKET").unwrap_or_default(),
+            s3_region: std::env::var("MEW_IMAGE_S3_REGION").unwrap_or_else(|_| "auto".into()),
+            s3_endpoint: std::env::var("MEW_IMAGE_S3_ENDPOINT").ok(),
+            s3_access_key: std::env::var("MEW_IMAGE_S3_ACCESS_KEY").ok(),
+            s3_secret_key: std::env::var("MEW_IMAGE_S3_SECRET_KEY").ok(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: AppConfig,
+    pub db: SqlitePool,
+    pub s3: Option<S3Client>,
+    pub http: reqwest::Client,
+    pub provider_builtins: Vec<ProviderTemplate>,
+}
