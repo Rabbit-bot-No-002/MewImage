@@ -1,11 +1,13 @@
 use gloo_net::http::Request;
 use mew_image_shared::{
-    EncryptedApiConfig, GenerateViaProxyRequest, GenerationRequest, GenerationResult,
-    ImageAssetRef, LocalAppState, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
-    ProviderTemplate, SyncCheckpoint, SyncEnvelope, aspect_ratio_from_dimensions,
-    extract_gemini_generation_result, extract_nano_banana_result,
-    extract_openai_responses_result, nano_banana_image_size_from_dimensions,
-    merge_envelopes, merge_records, new_id, now_rfc3339,
+    BUILTIN_NANO_BANANA_TEMPLATE_ID, BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
+    BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, EncryptedApiConfig, GenerateViaProxyRequest,
+    GenerationRequest, GenerationResult, ImageAssetRef, LocalAppState, ProviderAccessMode,
+    ProviderEndpointMode, ProviderKind, ProviderTemplate, SyncCheckpoint, SyncEnvelope,
+    aspect_ratio_from_dimensions, extract_gemini_generation_result,
+    extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes,
+    merge_records, nano_banana_image_size_from_dimensions, new_id, normalize_api_config,
+    now_rfc3339,
 };
 use serde_json::json;
 
@@ -24,38 +26,14 @@ struct TransportAsset {
 }
 
 pub fn default_config(template_id: &str) -> EncryptedApiConfig {
-    let is_gemini = template_id.contains("gemini");
-    let is_nano_banana = template_id.contains("banana") && !is_gemini;
-    EncryptedApiConfig {
+    let mut config = EncryptedApiConfig {
         id: new_id(),
         name: "默认配置".into(),
         provider_template_id: template_id.into(),
-        provider_kind: if template_id.contains("custom") {
-            ProviderKind::CustomHttp
-        } else if is_nano_banana {
-            ProviderKind::NanoBanana
-        } else if is_gemini {
-            ProviderKind::Gemini
-        } else {
-            ProviderKind::OpenAiCompatible
-        },
-        endpoint_mode: if is_gemini {
-            ProviderEndpointMode::CustomJson
-        } else {
-            ProviderEndpointMode::ImagesApi
-        },
-        base_url: if is_gemini {
-            "https://generativelanguage.googleapis.com".into()
-        } else {
-            "https://api.openai.com".into()
-        },
-        model: if is_gemini {
-            "gemini-2.5-flash-image".into()
-        } else if is_nano_banana {
-            "gemini-2.5-flash-image".into()
-        } else {
-            "gpt-image-1".into()
-        },
+        provider_kind: ProviderKind::OpenAiImage,
+        endpoint_mode: ProviderEndpointMode::ImagesApi,
+        base_url: String::new(),
+        model: String::new(),
         access_mode: ProviderAccessMode::Smart,
         known_requires_proxy: true,
         output_format: Some("png".into()),
@@ -67,7 +45,33 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
         prompt_guard_enabled: true,
         created_at: now_rfc3339(),
         updated_at: now_rfc3339(),
+    };
+    match template_id {
+        BUILTIN_NANO_BANANA_TEMPLATE_ID => {
+            config.provider_kind = ProviderKind::NanoBanana;
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+            config.base_url = "https://generativelanguage.googleapis.com".into();
+            config.model = "gemini-2.5-flash-image".into();
+        }
+        BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID => {
+            config.provider_kind = ProviderKind::OpenAiCompatible;
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+            config.base_url = String::new();
+            config.model = "gemini-2.5-flash-image".into();
+        }
+        BUILTIN_OPENAI_IMAGE_TEMPLATE_ID => {
+            config.provider_kind = ProviderKind::OpenAiImage;
+            config.endpoint_mode = ProviderEndpointMode::ImagesApi;
+            config.base_url = "https://api.openai.com".into();
+            config.model = "gpt-image-1".into();
+        }
+        _ => {
+            config.provider_kind = ProviderKind::CustomHttp;
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+        }
     }
+    normalize_api_config(&mut config);
+    config
 }
 
 pub async fn load_templates() -> Result<Vec<ProviderTemplate>, String> {
@@ -86,6 +90,7 @@ pub async fn load_templates() -> Result<Vec<ProviderTemplate>, String> {
     Ok(vec![
         ProviderTemplate::builtin_openai(),
         ProviderTemplate::builtin_nano_banana(),
+        ProviderTemplate::builtin_openai_compatible(),
     ])
 }
 
@@ -137,6 +142,7 @@ pub fn hydrate_local_state(
     let merged = merge_envelopes(&local_envelope, &remote);
     let mut configs = merge_records(&local.configs, &merged.configs);
     for config in &mut configs {
+        normalize_api_config(config);
         if config.api_key_plaintext.is_some() {
             continue;
         }
@@ -185,7 +191,7 @@ pub async fn generate_with_strategy(
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
 ) -> Result<(GenerationResult, bool), String> {
-    if matches!(config.provider_kind, ProviderKind::Gemini | ProviderKind::NanoBanana) {
+    if config.provider_kind == ProviderKind::NanoBanana {
         return match config.access_mode {
             ProviderAccessMode::Proxy => proxy_generate(template, config, request)
                 .await
@@ -252,17 +258,33 @@ async fn direct_generate(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| "请先填写 API Key。".to_string())?;
-    let url = join_api_url(
-        &config.base_url,
-        direct_endpoint_path(template, config, request),
-    );
+    let url = if config.provider_kind == ProviderKind::NanoBanana {
+        let model = normalize_google_image_model(&request.model);
+        join_api_url(&config.base_url, &format!("/v1beta/models/{model}:generateContent"))
+    } else {
+        join_api_url(
+            &config.base_url,
+            direct_endpoint_path(template, config, request),
+        )
+    };
     let response = if config.provider_kind == ProviderKind::NanoBanana {
+        let body = build_gemini_json(config, request);
+        Request::post(&url)
+            .header("x-goog-api-key", &api_key)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&body)
+            .map_err(|error| error.to_string())?
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+    } else if config.provider_kind == ProviderKind::OpenAiCompatible {
         if request.reference_assets.is_empty() {
             Request::post(&url)
                 .header("Authorization", &format!("Bearer {api_key}"))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
-                .json(&build_nano_banana_json(config, request))
+                .json(&build_openai_compatible_json(config, request))
                 .map_err(|error| error.to_string())?
                 .send()
                 .await
@@ -279,8 +301,11 @@ async fn direct_generate(
                 &aspect_ratio_from_dimensions(request.width, request.height),
             )
             .map_err(|error| format!("{error:?}"))?;
-            form.append_with_str("response_format", "url")
-                .map_err(|error| format!("{error:?}"))?;
+            form.append_with_str(
+                "response_format",
+                openai_compatible_response_format(request),
+            )
+            .map_err(|error| format!("{error:?}"))?;
             form.append_with_str(
                 "image_size",
                 &nano_banana_image_size_from_dimensions(request.width, request.height),
@@ -306,17 +331,15 @@ async fn direct_generate(
         }
     } else {
         let body = match config.provider_kind {
-            ProviderKind::OpenAiCompatible => build_openai_json(config, request),
-            ProviderKind::Gemini => build_gemini_json(config, request),
+            ProviderKind::OpenAiImage => build_openai_json(config, request),
             ProviderKind::CustomHttp => build_custom_json(template, request),
-            ProviderKind::NanoBanana => build_nano_banana_json(config, request),
+            ProviderKind::NanoBanana | ProviderKind::OpenAiCompatible => {
+                unreachable!("该服务商类型在上游分支已提前处理")
+            }
         };
 
         let builder = Request::post(&url).header("Content-Type", "application/json");
-        let builder = match config.provider_kind {
-            ProviderKind::Gemini => builder.header("x-goog-api-key", &api_key),
-            _ => builder.header("Authorization", &format!("Bearer {api_key}")),
-        };
+        let builder = builder.header("Authorization", &format!("Bearer {api_key}"));
         builder
             .json(&body)
             .map_err(|error| error.to_string())?
@@ -466,7 +489,7 @@ fn build_openai_json(
     }
 }
 
-fn build_nano_banana_json(
+fn build_openai_compatible_json(
     _config: &EncryptedApiConfig,
     request: &GenerationRequest,
 ) -> serde_json::Value {
@@ -477,6 +500,41 @@ fn build_nano_banana_json(
         "response_format": "url",
         "image_size": nano_banana_image_size_from_dimensions(request.width, request.height),
     })
+}
+
+fn openai_compatible_response_format(request: &GenerationRequest) -> &'static str {
+    if request.reference_assets.is_empty() {
+        "url"
+    } else {
+        // 中转站编辑接口实测更稳定地返回 base64，前端和后端都能直接解析。
+        "b64_json"
+    }
+}
+
+fn normalize_google_image_model(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return "gemini-2.5-flash-image".into();
+    }
+    if trimmed.starts_with("gemini-3.1-flash-image") && !trimmed.ends_with("-preview") {
+        return format!("{trimmed}-preview");
+    }
+    if trimmed.starts_with("gemini-3-pro-image") && !trimmed.ends_with("-preview") {
+        return format!("{trimmed}-preview");
+    }
+    trimmed.to_string()
+}
+
+fn google_image_size_value(model: &str, request: &GenerationRequest) -> Option<String> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.contains("gemini-3") {
+        Some(nano_banana_image_size_from_dimensions(
+            request.width,
+            request.height,
+        ))
+    } else {
+        None
+    }
 }
 
 fn build_openai_responses_json(
@@ -545,6 +603,7 @@ fn build_gemini_json(
     _config: &EncryptedApiConfig,
     request: &GenerationRequest,
 ) -> serde_json::Value {
+    let model = normalize_google_image_model(&request.model);
     let mut parts = vec![json!({
         "text": request.prompt,
     })];
@@ -561,14 +620,22 @@ fn build_gemini_json(
         }
     }
 
+    let mut generation_config = json!({
+        "responseModalities": ["TEXT", "IMAGE"],
+        "imageConfig": {
+            "aspectRatio": aspect_ratio_from_dimensions(request.width, request.height),
+        }
+    });
+    if let Some(image_size) = google_image_size_value(&model, request) {
+        generation_config["imageConfig"]["imageSize"] = json!(image_size);
+    }
+
     json!({
         "contents": [{
             "role": "user",
             "parts": parts,
         }],
-        "generationConfig": {
-            "responseModalities": ["TEXT", "IMAGE"],
-        }
+        "generationConfig": generation_config,
     })
 }
 
@@ -631,21 +698,23 @@ fn extract_result(
     request: &GenerationRequest,
     response_json: serde_json::Value,
 ) -> Result<GenerationResult, String> {
-    if config.provider_kind == ProviderKind::Gemini {
+    if config.provider_kind == ProviderKind::NanoBanana {
         return extract_gemini_generation_result(
             request,
             response_json,
             config.output_format.as_deref(),
         );
     }
-    if config.provider_kind == ProviderKind::NanoBanana {
-        return extract_nano_banana_result(
+    if config.provider_kind == ProviderKind::OpenAiCompatible {
+        return extract_openai_compatible_result(
             request,
             response_json,
             config.output_format.as_deref(),
         );
     }
-    if request.endpoint_mode == ProviderEndpointMode::ResponsesApi {
+    if config.provider_kind == ProviderKind::OpenAiImage
+        && request.endpoint_mode == ProviderEndpointMode::ResponsesApi
+    {
         return extract_openai_responses_result(
             request,
             response_json,
@@ -710,19 +779,22 @@ fn direct_endpoint_path<'a>(
     request: &GenerationRequest,
 ) -> &'a str {
     match config.provider_kind {
-        ProviderKind::Gemini => template.endpoint_path.as_str(),
+        ProviderKind::OpenAiImage => match config.endpoint_mode {
+            ProviderEndpointMode::ImagesApi => openai_images_endpoint(request),
+            ProviderEndpointMode::ResponsesApi => "/v1/responses",
+            ProviderEndpointMode::CustomJson => template.endpoint_path.as_str(),
+        },
         ProviderKind::NanoBanana => {
+            let _ = request;
+            template.endpoint_path.as_str()
+        }
+        ProviderKind::OpenAiCompatible => {
             if request.reference_assets.is_empty() {
                 "/v1/images/generations"
             } else {
                 "/v1/images/edits"
             }
         }
-        ProviderKind::OpenAiCompatible => match config.endpoint_mode {
-            ProviderEndpointMode::ImagesApi => openai_images_endpoint(request),
-            ProviderEndpointMode::ResponsesApi => "/v1/responses",
-            ProviderEndpointMode::CustomJson => template.endpoint_path.as_str(),
-        },
         ProviderKind::CustomHttp => template.endpoint_path.as_str(),
     }
 }

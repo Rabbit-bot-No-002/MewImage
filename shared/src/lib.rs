@@ -15,14 +15,21 @@ pub fn new_id() -> String {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     #[default]
-    OpenAiCompatible,
-    Gemini,
+    #[serde(rename = "openai_image", alias = "open_ai_compatible")]
+    OpenAiImage,
+    #[serde(rename = "nano_banana", alias = "gemini")]
     NanoBanana,
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+    #[serde(rename = "custom_http")]
     CustomHttp,
 }
+
+pub const BUILTIN_OPENAI_IMAGE_TEMPLATE_ID: &str = "builtin-openai-compatible";
+pub const BUILTIN_NANO_BANANA_TEMPLATE_ID: &str = "builtin-nano-banana";
+pub const BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID: &str = "builtin-openai-compatible-gateway";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -95,9 +102,9 @@ impl ProviderTemplate {
     pub fn builtin_openai() -> Self {
         let now = now_rfc3339();
         Self {
-            id: "builtin-openai-compatible".into(),
-            name: "OpenAI Compatible".into(),
-            kind: ProviderKind::OpenAiCompatible,
+            id: BUILTIN_OPENAI_IMAGE_TEMPLATE_ID.into(),
+            name: "OpenAI-Image".into(),
+            kind: ProviderKind::OpenAiImage,
             base_url: "https://api.openai.com".into(),
             endpoint_path: "/v1/images/generations".into(),
             method: "POST".into(),
@@ -112,7 +119,7 @@ impl ProviderTemplate {
             response_image_base64_path: Some("data[].b64_json".into()),
             response_revised_prompt_path: Some("data[0].revised_prompt".into()),
             known_requires_proxy: true,
-            notes: Some("内置 OpenAI 兼容模板，支持 Images API 与 Responses API。".into()),
+            notes: Some("内置 OpenAI-Image 模板，用于 gpt-image 模型，支持 Images API 与 Responses API。".into()),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -121,10 +128,36 @@ impl ProviderTemplate {
     pub fn builtin_nano_banana() -> Self {
         let now = now_rfc3339();
         Self {
-            id: "builtin-nano-banana".into(),
-            name: "nano banana".into(),
+            id: BUILTIN_NANO_BANANA_TEMPLATE_ID.into(),
+            name: "Nano Banana".into(),
             kind: ProviderKind::NanoBanana,
-            base_url: "https://api.openai.com".into(),
+            base_url: "https://generativelanguage.googleapis.com".into(),
+            endpoint_path: "/v1beta/models/gemini-2.5-flash-image:generateContent".into(),
+            method: "POST".into(),
+            auth_header: "x-goog-api-key".into(),
+            prompt_field: Some("prompt".into()),
+            model_field: Some("model".into()),
+            size_field: None,
+            quality_field: None,
+            count_field: None,
+            reference_images_field: Some("image".into()),
+            response_image_url_path: None,
+            response_image_base64_path: None,
+            response_revised_prompt_path: None,
+            known_requires_proxy: true,
+            notes: Some("内置 Nano Banana 模板，使用谷歌官方图像接口。".into()),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    pub fn builtin_openai_compatible() -> Self {
+        let now = now_rfc3339();
+        Self {
+            id: BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into(),
+            name: "OpenAI 兼容".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: String::new(),
             endpoint_path: "/v1/images/generations".into(),
             method: "POST".into(),
             auth_header: "Authorization".into(),
@@ -138,7 +171,7 @@ impl ProviderTemplate {
             response_image_base64_path: Some("data[].b64_json".into()),
             response_revised_prompt_path: None,
             known_requires_proxy: true,
-            notes: Some("内置 nano banana 预设，使用 OpenAI 兼容图像接口。".into()),
+            notes: Some("内置 OpenAI 兼容模板，用于第三方中转站图像接口。".into()),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -224,6 +257,103 @@ pub fn image_mime_from_output_format(output_format: Option<&str>) -> &'static st
     }
 }
 
+pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
+    let base_url = config.base_url.trim();
+    let is_google_official = base_url.contains("generativelanguage.googleapis.com");
+    let is_default_openai = base_url.is_empty()
+        || base_url.contains("api.openai.com");
+
+    if config.provider_template_id == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID {
+        if config.endpoint_mode == ProviderEndpointMode::CustomJson || !is_default_openai {
+            config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
+            config.provider_kind = ProviderKind::OpenAiCompatible;
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+            if config.model.trim().is_empty() {
+                config.model = "gemini-2.5-flash-image".into();
+            }
+            return;
+        }
+        config.provider_kind = ProviderKind::OpenAiImage;
+        config.endpoint_mode = match config.endpoint_mode {
+            ProviderEndpointMode::ResponsesApi => ProviderEndpointMode::ResponsesApi,
+            _ => ProviderEndpointMode::ImagesApi,
+        };
+        if config.base_url.trim().is_empty() {
+            config.base_url = "https://api.openai.com".into();
+        }
+        if config.model.trim().is_empty() {
+            config.model = "gpt-image-1".into();
+        }
+        return;
+    }
+
+    if config.provider_template_id == BUILTIN_NANO_BANANA_TEMPLATE_ID {
+        if is_google_official {
+            config.provider_kind = ProviderKind::NanoBanana;
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+            if config.model.trim().is_empty() {
+                config.model = "gemini-2.5-flash-image".into();
+            }
+        } else {
+            config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
+            config.provider_kind = ProviderKind::OpenAiCompatible;
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+            if config.model.trim().is_empty() {
+                config.model = "gemini-2.5-flash-image".into();
+            }
+        }
+        return;
+    }
+
+    if config.provider_template_id == BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID {
+        config.provider_kind = ProviderKind::OpenAiCompatible;
+        config.endpoint_mode = ProviderEndpointMode::CustomJson;
+        if config.model.trim().is_empty() {
+            config.model = "gemini-2.5-flash-image".into();
+        }
+        return;
+    }
+
+    match config.provider_kind {
+        ProviderKind::OpenAiImage => {
+            config.provider_template_id = BUILTIN_OPENAI_IMAGE_TEMPLATE_ID.into();
+            if config.base_url.trim().is_empty() {
+                config.base_url = "https://api.openai.com".into();
+            }
+            if config.model.trim().is_empty() {
+                config.model = "gpt-image-1".into();
+            }
+            if config.endpoint_mode == ProviderEndpointMode::CustomJson {
+                config.endpoint_mode = ProviderEndpointMode::ImagesApi;
+            }
+        }
+        ProviderKind::NanoBanana => {
+            if is_google_official {
+                config.provider_template_id = BUILTIN_NANO_BANANA_TEMPLATE_ID.into();
+                config.endpoint_mode = ProviderEndpointMode::CustomJson;
+                if config.model.trim().is_empty() {
+                    config.model = "gemini-2.5-flash-image".into();
+                }
+            } else {
+                config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
+                config.provider_kind = ProviderKind::OpenAiCompatible;
+                config.endpoint_mode = ProviderEndpointMode::CustomJson;
+                if config.model.trim().is_empty() {
+                    config.model = "gemini-2.5-flash-image".into();
+                }
+            }
+        }
+        ProviderKind::OpenAiCompatible => {
+            config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+            if config.model.trim().is_empty() {
+                config.model = "gemini-2.5-flash-image".into();
+            }
+        }
+        ProviderKind::CustomHttp => {}
+    }
+}
+
 pub fn aspect_ratio_from_dimensions(width: u32, height: u32) -> String {
     if width == 0 || height == 0 {
         return "1:1".into();
@@ -277,38 +407,7 @@ pub fn extract_gemini_generation_result(
     let mut seen = HashSet::new();
     let revised_prompt = find_first_string(&response_json, "text");
 
-    if let Some(candidates) = response_json.get("candidates").and_then(|value| value.as_array()) {
-        for candidate in candidates {
-            let Some(parts) = candidate
-                .get("content")
-                .and_then(|value| value.get("parts"))
-                .and_then(|value| value.as_array())
-            else {
-                continue;
-            };
-
-            for part in parts {
-                let Some(inline_data) = part.get("inline_data").or_else(|| part.get("inlineData")) else {
-                    continue;
-                };
-                let Some(data) = inline_data.get("data").and_then(|value| value.as_str()) else {
-                    continue;
-                };
-                let mime_type = inline_data
-                    .get("mime_type")
-                    .or_else(|| inline_data.get("mimeType"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(fallback_mime);
-                let data_url = format!("data:{mime_type};base64,{data}");
-                if seen.insert(data_url.clone()) {
-                    images.push(GeneratedImageResult {
-                        url: None,
-                        data_url: Some(data_url),
-                    });
-                }
-            }
-        }
-    }
+    collect_gemini_image_payloads(&response_json, fallback_mime, &mut images, &mut seen);
 
     if images.is_empty() {
         return Err("接口返回里没有解析到 Gemini 图片结果。".into());
@@ -328,6 +427,46 @@ pub fn extract_gemini_generation_result(
         },
         raw_response_json: Some(response_json),
     })
+}
+
+fn collect_gemini_image_payloads(
+    value: &serde_json::Value,
+    fallback_mime: &str,
+    images: &mut Vec<GeneratedImageResult>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(inline_data) = map
+                .get("inline_data")
+                .or_else(|| map.get("inlineData"))
+            {
+                if let Some(data) = inline_data.get("data").and_then(|value| value.as_str()) {
+                    let mime_type = inline_data
+                        .get("mime_type")
+                        .or_else(|| inline_data.get("mimeType"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(fallback_mime);
+                    let data_url = format!("data:{mime_type};base64,{data}");
+                    if seen.insert(data_url.clone()) {
+                        images.push(GeneratedImageResult {
+                            url: None,
+                            data_url: Some(data_url),
+                        });
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_gemini_image_payloads(child, fallback_mime, images, seen);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_gemini_image_payloads(item, fallback_mime, images, seen);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn extract_openai_responses_result(
@@ -452,6 +591,16 @@ pub fn extract_nano_banana_result(
             duration_ms: None,
         },
         raw_response_json: Some(response_json),
+    })
+}
+
+pub fn extract_openai_compatible_result(
+    request: &GenerationRequest,
+    response_json: serde_json::Value,
+    output_format: Option<&str>,
+) -> Result<GenerationResult, String> {
+    extract_nano_banana_result(request, response_json, output_format).map_err(|error| {
+        error.replace("nano banana", "OpenAI 兼容")
     })
 }
 
@@ -1040,5 +1189,63 @@ mod tests {
             result.parameter_snapshot.actual_quality.as_deref(),
             Some("medium")
         );
+    }
+
+    #[test]
+    fn normalize_legacy_openai_config_to_openai_image() {
+        let mut config = EncryptedApiConfig {
+            id: "config-1".into(),
+            name: "旧 OpenAI".into(),
+            provider_template_id: BUILTIN_OPENAI_IMAGE_TEMPLATE_ID.into(),
+            provider_kind: ProviderKind::OpenAiImage,
+            endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            base_url: "https://api.openai.com".into(),
+            model: "gpt-image-1".into(),
+            access_mode: ProviderAccessMode::Smart,
+            known_requires_proxy: true,
+            output_format: Some("png".into()),
+            output_compression: Some(100),
+            moderation: Some("auto".into()),
+            api_key_plaintext: None,
+            api_key_encrypted: None,
+            api_key_hint: None,
+            prompt_guard_enabled: true,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        normalize_api_config(&mut config);
+        assert_eq!(config.provider_kind, ProviderKind::OpenAiImage);
+        assert_eq!(config.endpoint_mode, ProviderEndpointMode::ResponsesApi);
+    }
+
+    #[test]
+    fn normalize_gateway_config_to_openai_compatible() {
+        let mut config = EncryptedApiConfig {
+            id: "config-2".into(),
+            name: "旧香蕉中转".into(),
+            provider_template_id: BUILTIN_NANO_BANANA_TEMPLATE_ID.into(),
+            provider_kind: ProviderKind::NanoBanana,
+            endpoint_mode: ProviderEndpointMode::CustomJson,
+            base_url: "https://example.com".into(),
+            model: String::new(),
+            access_mode: ProviderAccessMode::Smart,
+            known_requires_proxy: true,
+            output_format: Some("png".into()),
+            output_compression: Some(100),
+            moderation: Some("auto".into()),
+            api_key_plaintext: None,
+            api_key_encrypted: None,
+            api_key_hint: None,
+            prompt_guard_enabled: true,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        normalize_api_config(&mut config);
+        assert_eq!(config.provider_kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(
+            config.provider_template_id,
+            BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID
+        );
+        assert_eq!(config.model, "gemini-2.5-flash-image");
     }
 }

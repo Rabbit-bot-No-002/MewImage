@@ -11,11 +11,11 @@ use gloo_net::http::Request;
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use leptos::{html, prelude::*, task::spawn_local};
 use mew_image_shared::{
-    AppPreferences, AuthRequest, AuthResponse, ConversationThread, EncryptedApiConfig,
-    ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse, ProviderAccessMode,
-    ProviderEndpointMode, ProviderKind, ProviderTemplate, ProxyInvokeRequest, ProxyInvokeResponse,
-    SyncCheckpoint, SyncPullResponse, TaskStatus, ThemePreference, UserSummary, clamp_size, new_id,
-    now_rfc3339,
+    AppPreferences, AuthRequest, AuthResponse, BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
+    ConversationThread, EncryptedApiConfig, ImageAssetRef, LocalAppState, LocalTaskRecord,
+    MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind, ProviderTemplate,
+    ProxyInvokeRequest, ProxyInvokeResponse, SyncCheckpoint, SyncPullResponse, TaskStatus,
+    ThemePreference, UserSummary, clamp_size, new_id, normalize_api_config, now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -124,6 +124,7 @@ fn App() -> impl IntoView {
     let templates = RwSignal::new(vec![
         ProviderTemplate::builtin_openai(),
         ProviderTemplate::builtin_nano_banana(),
+        ProviderTemplate::builtin_openai_compatible(),
     ]);
     let auth_user = RwSignal::new(None::<UserSummary>);
     let login_username = RwSignal::new(String::new());
@@ -304,7 +305,7 @@ fn App() -> impl IntoView {
                 let mut next = LocalAppState::default();
                 next.threads = vec![default_thread()];
                 next.configs
-                    .push(default_config("builtin-openai-compatible"));
+                    .push(default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID));
                 next
             });
             let mut state = state;
@@ -314,7 +315,10 @@ fn App() -> impl IntoView {
             if state.configs.is_empty() {
                 state
                     .configs
-                    .push(default_config("builtin-openai-compatible"));
+                    .push(default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID));
+            }
+            for config in &mut state.configs {
+                normalize_api_config(config);
             }
             state
                 .assets
@@ -747,6 +751,7 @@ fn App() -> impl IntoView {
             config.base_url = template.base_url.clone();
             config.provider_kind = template.kind;
             config.known_requires_proxy = template.known_requires_proxy;
+            normalize_api_config(&mut config);
             items.push(config);
             if let Some(last) = items.last() {
                 current_config_id.set(last.id.clone());
@@ -2589,10 +2594,20 @@ fn ConfigEditor(
                                 config.provider_kind = template.kind;
                                 config.base_url = template.base_url;
                                 config.known_requires_proxy = template.known_requires_proxy;
-                                config.endpoint_mode = ProviderEndpointMode::ImagesApi;
-                                if matches!(template.kind, ProviderKind::Gemini | ProviderKind::NanoBanana) {
-                                    config.model = "gemini-2.5-flash-image".into();
+                                match template.kind {
+                                    ProviderKind::OpenAiImage => {
+                                        config.endpoint_mode = ProviderEndpointMode::ImagesApi;
+                                        config.model = "gpt-image-1".into();
+                                    }
+                                    ProviderKind::NanoBanana | ProviderKind::OpenAiCompatible => {
+                                        config.endpoint_mode = ProviderEndpointMode::CustomJson;
+                                        config.model = "gemini-2.5-flash-image".into();
+                                    }
+                                    ProviderKind::CustomHttp => {
+                                        config.endpoint_mode = ProviderEndpointMode::CustomJson;
+                                    }
                                 }
+                                normalize_api_config(config);
                             }
                             config.updated_at = now_rfc3339();
                         }
@@ -2653,28 +2668,39 @@ fn ConfigEditor(
                     <option value="Direct">"优先直连"</option>
                     <option value="Proxy">"固定代理"</option>
                 </select>
-                <select
-                    class="select-input"
-                    prop:value=move || current_config.get().map(|config| format!("{:?}", config.endpoint_mode)).unwrap_or_default()
-                    on:change=move |ev| {
-                        let value = event_target_value(&ev);
-                        configs.update(|items| {
-                            if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                                config.endpoint_mode = match value.as_str() {
-                                    "ResponsesApi" => ProviderEndpointMode::ResponsesApi,
-                                    "CustomJson" => ProviderEndpointMode::CustomJson,
-                                    _ => ProviderEndpointMode::ImagesApi,
-                                };
-                                config.updated_at = now_rfc3339();
-                            }
-                        });
-                        has_pending_changes.set(true);
+                {move || {
+                    let is_openai_image = current_config
+                        .get()
+                        .map(|config| config.provider_kind == ProviderKind::OpenAiImage)
+                        .unwrap_or(false);
+                    if is_openai_image {
+                        view! {
+                            <select
+                                class="select-input"
+                                prop:value=move || current_config.get().map(|config| format!("{:?}", config.endpoint_mode)).unwrap_or_default()
+                                on:change=move |ev| {
+                                    let value = event_target_value(&ev);
+                                    configs.update(|items| {
+                                        if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
+                                            config.endpoint_mode = match value.as_str() {
+                                                "ResponsesApi" => ProviderEndpointMode::ResponsesApi,
+                                                _ => ProviderEndpointMode::ImagesApi,
+                                            };
+                                            config.updated_at = now_rfc3339();
+                                        }
+                                    });
+                                    has_pending_changes.set(true);
+                                }
+                            >
+                                <option value="ImagesApi">"Images API"</option>
+                                <option value="ResponsesApi">"Responses API"</option>
+                            </select>
+                        }
+                        .into_any()
+                    } else {
+                        ().into_any()
                     }
-                >
-                    <option value="ImagesApi">"Images API"</option>
-                    <option value="ResponsesApi">"Responses API"</option>
-                    <option value="CustomJson">"Custom JSON"</option>
-                </select>
+                }}
             </div>
         </div>
     }
@@ -2908,7 +2934,7 @@ fn snapshot_local_state(
 }
 
 fn apply_local_state(
-    state: LocalAppState,
+    mut state: LocalAppState,
     configs: RwSignal<Vec<EncryptedApiConfig>>,
     tasks: RwSignal<Vec<LocalTaskRecord>>,
     threads: RwSignal<Vec<ConversationThread>>,
@@ -2916,6 +2942,9 @@ fn apply_local_state(
     preferences: RwSignal<AppPreferences>,
     checkpoint: RwSignal<SyncCheckpoint>,
 ) {
+    for config in &mut state.configs {
+        normalize_api_config(config);
+    }
     configs.set(state.configs);
     tasks.set(state.tasks);
     threads.set(state.threads);
@@ -3022,7 +3051,7 @@ fn summarize_prompt(prompt: &str) -> String {
 }
 
 fn is_openai_image_model(config: &EncryptedApiConfig) -> bool {
-    config.provider_kind == ProviderKind::OpenAiCompatible
+    config.provider_kind == ProviderKind::OpenAiImage
         && config.model.to_ascii_lowercase().contains("image")
 }
 

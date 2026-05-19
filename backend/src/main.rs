@@ -26,7 +26,7 @@ use mew_image_shared::{
     ProxyInvokeResponse, SyncEnvelope, SyncPullResponse, SyncPushRequest, UploadCompleteRequest,
     UploadCompleteResponse, UploadInitRequest, UploadInitResponse, UserSummary,
     aspect_ratio_from_dimensions, extract_gemini_generation_result,
-    extract_nano_banana_result, extract_openai_responses_result, merge_envelopes, new_id,
+    extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes, new_id,
     nano_banana_image_size_from_dimensions, now_rfc3339,
 };
 use rand::distr::{Alphanumeric, SampleString};
@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let builtins = vec![
         ProviderTemplate::builtin_openai(),
         ProviderTemplate::builtin_nano_banana(),
+        ProviderTemplate::builtin_openai_compatible(),
     ];
 
     let state = Arc::new(AppState {
@@ -638,9 +639,9 @@ async fn generate_via_proxy(
     let payload = parse_generate_multipart(multipart).await?;
     let started_at = Utc::now();
     let response_json = match payload.template.kind {
-        ProviderKind::OpenAiCompatible => invoke_openai_compatible(&state, &payload).await?,
-        ProviderKind::Gemini => invoke_gemini(&state, &payload).await?,
-        ProviderKind::NanoBanana => invoke_nano_banana(&state, &payload).await?,
+        ProviderKind::OpenAiImage => invoke_openai_image(&state, &payload).await?,
+        ProviderKind::NanoBanana => invoke_nano_banana_google(&state, &payload).await?,
+        ProviderKind::OpenAiCompatible => invoke_openai_compatible_image(&state, &payload).await?,
         ProviderKind::CustomHttp => invoke_custom_http(&state, &payload).await?,
     };
 
@@ -937,6 +938,52 @@ fn join_api_url(base_url: &str, endpoint_path: &str) -> String {
     format!("{base}/{endpoint}")
 }
 
+fn openai_compatible_endpoint(request: &mew_image_shared::GenerationRequest) -> &'static str {
+    if request.reference_assets.is_empty() {
+        "/v1/images/generations"
+    } else {
+        "/v1/images/edits"
+    }
+}
+
+fn openai_compatible_response_format(request: &mew_image_shared::GenerationRequest) -> &'static str {
+    if request.reference_assets.is_empty() {
+        "url"
+    } else {
+        // 编辑接口优先请求 base64，兼容中转站直接返回图像数据。
+        "b64_json"
+    }
+}
+
+fn google_image_size_value(
+    model: &str,
+    request: &mew_image_shared::GenerationRequest,
+) -> Option<String> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.contains("gemini-3") {
+        Some(nano_banana_image_size_from_dimensions(
+            request.width,
+            request.height,
+        ))
+    } else {
+        None
+    }
+}
+
+fn normalize_google_image_model(model: &str) -> String {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return "gemini-2.5-flash-image".into();
+    }
+    if trimmed.starts_with("gemini-3.1-flash-image") && !trimmed.ends_with("-preview") {
+        return format!("{trimmed}-preview");
+    }
+    if trimmed.starts_with("gemini-3-pro-image") && !trimmed.ends_with("-preview") {
+        return format!("{trimmed}-preview");
+    }
+    trimmed.to_string()
+}
+
 fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
     let (prefix, payload) = data_url.split_once(',')?;
     let mime_type = prefix
@@ -945,7 +992,7 @@ fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
     Some((mime_type, payload))
 }
 
-async fn invoke_openai_compatible(
+async fn invoke_openai_image(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
 ) -> Result<serde_json::Value, AppError> {
@@ -1005,8 +1052,8 @@ async fn invoke_openai_compatible(
             form = form.text("input_fidelity", "high");
         }
         request.multipart(form).send().await.map_err(|error| {
-            warn!("openai compatible multipart request failed: {}", error);
-            AppError::bad_gateway("图像编辑请求失败")
+            warn!("openai image multipart request failed: {}", error);
+            AppError::bad_gateway("OpenAI-Image 图像编辑请求失败")
         })?
     } else if payload.config.endpoint_mode == ProviderEndpointMode::ResponsesApi {
         let mut content = vec![json!({
@@ -1063,7 +1110,7 @@ async fn invoke_openai_compatible(
             "tool_choice": "required",
         });
         request.json(&body).send().await.map_err(|error| {
-            warn!("openai compatible responses request failed: {}", error);
+            warn!("openai image responses request failed: {}", error);
             AppError::bad_gateway("Responses API 请求失败")
         })?
     } else {
@@ -1078,7 +1125,7 @@ async fn invoke_openai_compatible(
             "moderation": payload.config.moderation,
         });
         request.json(&body).send().await.map_err(|error| {
-            warn!("openai compatible json request failed: {}", error);
+            warn!("openai image json request failed: {}", error);
             AppError::bad_gateway("Images API 请求失败")
         })?
     };
@@ -1086,7 +1133,7 @@ async fn invoke_openai_compatible(
     response.json().await.map_err(AppError::internal)
 }
 
-async fn invoke_nano_banana(
+async fn invoke_openai_compatible_image(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
 ) -> Result<serde_json::Value, AppError> {
@@ -1095,7 +1142,10 @@ async fn invoke_nano_banana(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let url = join_api_url(&payload.config.base_url, payload.template.endpoint_path.as_str());
+    let url = join_api_url(
+        &payload.config.base_url,
+        openai_compatible_endpoint(&payload.request),
+    );
 
     let response = if payload.request.reference_assets.is_empty() {
         state
@@ -1113,8 +1163,8 @@ async fn invoke_nano_banana(
             .send()
             .await
             .map_err(|error| {
-                warn!("nano banana request failed: {}", error);
-                AppError::bad_gateway("nano banana 请求失败")
+                warn!("openai compatible request failed: {}", error);
+                AppError::bad_gateway("OpenAI 兼容请求失败")
             })?
     } else {
         let mut form = reqwest::multipart::Form::new()
@@ -1124,7 +1174,10 @@ async fn invoke_nano_banana(
                 "aspect_ratio",
                 aspect_ratio_from_dimensions(payload.request.width, payload.request.height),
             )
-            .text("response_format", "url")
+            .text(
+                "response_format",
+                openai_compatible_response_format(&payload.request),
+            )
             .text(
                 "image_size",
                 nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
@@ -1146,15 +1199,15 @@ async fn invoke_nano_banana(
             .send()
             .await
             .map_err(|error| {
-                warn!("nano banana multipart request failed: {}", error);
-                AppError::bad_gateway("nano banana 请求失败")
+                warn!("openai compatible multipart request failed: {}", error);
+                AppError::bad_gateway("OpenAI 兼容请求失败")
             })?
     };
 
     response.json().await.map_err(AppError::internal)
 }
 
-async fn invoke_gemini(
+async fn invoke_nano_banana_google(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
 ) -> Result<serde_json::Value, AppError> {
@@ -1163,7 +1216,11 @@ async fn invoke_gemini(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let url = join_api_url(&payload.config.base_url, payload.template.endpoint_path.as_str());
+    let model = normalize_google_image_model(&payload.request.model);
+    let url = join_api_url(
+        &payload.config.base_url,
+        &format!("/v1beta/models/{model}:generateContent"),
+    );
     let body = build_gemini_payload(state, payload).await?;
     let response = state
         .http
@@ -1173,8 +1230,8 @@ async fn invoke_gemini(
         .send()
         .await
         .map_err(|error| {
-            warn!("gemini request failed: {}", error);
-            AppError::bad_gateway("Gemini 图像请求失败")
+            warn!("nano banana request failed: {}", error);
+            AppError::bad_gateway("Nano Banana 请求失败")
         })?;
 
     response.json().await.map_err(AppError::internal)
@@ -1262,7 +1319,7 @@ fn extract_generation_result(
     response_json: serde_json::Value,
     duration_ms: u64,
 ) -> GenerationResult {
-    if template.kind == ProviderKind::Gemini {
+    if template.kind == ProviderKind::NanoBanana {
         let mut result = extract_gemini_generation_result(request, response_json, output_format)
             .unwrap_or_else(|error| GenerationResult {
                 images: Vec::new(),
@@ -1281,8 +1338,8 @@ fn extract_generation_result(
         result.parameter_snapshot.duration_ms = Some(duration_ms);
         return result;
     }
-    if template.kind == ProviderKind::NanoBanana {
-        let mut result = extract_nano_banana_result(request, response_json, output_format)
+    if template.kind == ProviderKind::OpenAiCompatible {
+        let mut result = extract_openai_compatible_result(request, response_json, output_format)
             .unwrap_or_else(|error| GenerationResult {
                 images: Vec::new(),
                 parameter_snapshot: ParameterSnapshot {
@@ -1394,6 +1451,7 @@ async fn build_gemini_payload(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
 ) -> Result<serde_json::Value, AppError> {
+    let model = normalize_google_image_model(&payload.request.model);
     let mut parts = vec![json!({
         "text": payload.request.prompt.clone(),
     })];
@@ -1409,14 +1467,25 @@ async fn build_gemini_payload(
         }
     }
 
+    let mut generation_config = json!({
+        "responseModalities": ["TEXT", "IMAGE"],
+        "imageConfig": {
+            "aspectRatio": aspect_ratio_from_dimensions(
+                payload.request.width,
+                payload.request.height,
+            ),
+        }
+    });
+    if let Some(image_size) = google_image_size_value(&model, &payload.request) {
+        generation_config["imageConfig"]["imageSize"] = json!(image_size);
+    }
+
     Ok(json!({
         "contents": [{
             "role": "user",
             "parts": parts,
         }],
-        "generationConfig": {
-            "responseModalities": ["TEXT", "IMAGE"],
-        }
+        "generationConfig": generation_config,
     }))
 }
 
