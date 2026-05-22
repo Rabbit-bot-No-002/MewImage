@@ -58,10 +58,15 @@ trunk serve --open
 ```bash
 cargo build -p mew-image-backend --release
 cd frontend
-trunk build --release --dist dist
+trunk build --release --dist dist-app
 ```
 
-然后让后端通过 `MEW_IMAGE_FRONTEND_DIST` 指向 `frontend/dist`。
+然后让后端通过 `MEW_IMAGE_FRONTEND_DIST` 指向 `frontend/dist-app`。
+
+说明：
+
+- `trunk serve` 默认会使用开发态静态目录，建议不要和后端正在服务的发布目录共用。
+- 当前项目默认让后端服务 `frontend/dist-app`，这样就算本地同时开着 `trunk serve`，也不会污染后端页面。
 
 ## Docker
 
@@ -78,4 +83,3 @@ docker compose up --build
 ## 说明
 
 - 当前环境里没有安装 Docker，因此仓库内提供了 Docker 产物，但未在本机完成容器实跑验证
-

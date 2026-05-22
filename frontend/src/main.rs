@@ -3,7 +3,7 @@ mod crypto;
 mod providers;
 mod storage;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gloo_file::{File, futures::read_as_bytes, futures::read_as_data_url};
@@ -22,7 +22,10 @@ use providers::{
     prepare_sync_envelope,
 };
 use sha2::{Digest, Sha256};
-use storage::{load_snapshot, save_snapshot};
+use storage::{
+    delete_asset_payloads, load_asset_payloads, load_snapshot, save_asset_payloads, save_configs,
+    save_snapshot,
+};
 use wasm_bindgen::{JsCast, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -112,6 +115,7 @@ fn MaterialSymbolIcon(name: &'static str, filled: bool) -> impl IntoView {
 
 const THUMBNAIL_DATA_URL_KEY: &str = "thumbnail_data_url";
 const THUMBNAIL_MAX_EDGE: u32 = 320;
+const GALLERY_PAGE_SIZE: usize = 10;
 
 #[component]
 fn App() -> impl IntoView {
@@ -150,7 +154,12 @@ fn App() -> impl IntoView {
     let generating = RwSignal::new(false);
     let syncing = RwSignal::new(false);
     let show_favorites_only = RwSignal::new(false);
+    let gallery_page = RwSignal::new(1usize);
+    let show_gallery_page_picker = RwSignal::new(false);
+    let gallery_page_candidate = RwSignal::new(1usize);
+    let gallery_page_picker_thread_marker = RwSignal::new(String::new());
     let show_settings = RwSignal::new(false);
+    let show_settings_menu = RwSignal::new(false);
     let show_resolution_menu = RwSignal::new(false);
     let preview_state = RwSignal::new(None::<PreviewState>);
     let preview_panel_state = RwSignal::new(None::<PreviewPanelState>);
@@ -186,8 +195,12 @@ fn App() -> impl IntoView {
                 persist_timer_id.set(None);
                 let snapshot =
                     snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
+                let payloads = asset_payload_pairs(&snapshot.assets);
+                let mut metadata_snapshot = snapshot.clone();
+                metadata_snapshot.assets = strip_asset_payloads_for_snapshot(&snapshot.assets);
                 spawn_local(async move {
-                    let _ = save_snapshot(&snapshot).await;
+                    let _ = save_asset_payloads(&payloads).await;
+                    let _ = save_snapshot(&metadata_snapshot).await;
                 });
             });
             if let Ok(timer_id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -300,6 +313,8 @@ fn App() -> impl IntoView {
         let current_config_id = current_config_id;
         let draft_prompt = draft_prompt;
         let status_text = status_text;
+        let tasks_signal = tasks;
+        let assets_signal = assets;
         async move {
             let state = load_snapshot().await.unwrap_or_else(|_| {
                 let mut next = LocalAppState::default();
@@ -323,26 +338,14 @@ fn App() -> impl IntoView {
             state
                 .assets
                 .retain(|asset| !asset.metadata.contains_key("mask_base_asset_id"));
-            for asset in &mut state.assets {
-                if asset.metadata.contains_key(THUMBNAIL_DATA_URL_KEY) {
-                    continue;
-                }
-                if let Ok(thumbnail) =
-                    thumbnail_data_url_from_asset(asset, THUMBNAIL_MAX_EDGE).await
-                {
-                    asset
-                        .metadata
-                        .insert(THUMBNAIL_DATA_URL_KEY.into(), thumbnail);
-                }
-            }
+            let had_embedded_payloads = state.assets.iter().any(|asset| asset.data_url.is_some());
             reconcile_task_integrity(&mut state.tasks, &state.assets, true);
-            current_thread_id.set(
-                state
-                    .threads
-                    .first()
-                    .map(|thread| thread.id.clone())
-                    .unwrap_or_default(),
-            );
+            let initial_thread_id = state
+                .threads
+                .first()
+                .map(|thread| thread.id.clone())
+                .unwrap_or_default();
+            current_thread_id.set(initial_thread_id.clone());
             current_config_id.set(
                 state
                     .configs
@@ -360,13 +363,69 @@ fn App() -> impl IntoView {
             apply_local_state(
                 state.clone(),
                 configs,
-                tasks,
+                tasks_signal,
                 threads,
-                assets,
+                assets_signal,
                 preferences,
                 checkpoint,
             );
-            let _ = save_snapshot(&state).await;
+            status_text.set("本地工作台已恢复，缩略图正在后台补全……".into());
+
+            let tasks_for_thumbs = state.tasks.clone();
+            let mut assets_for_thumbs = state.assets.clone();
+            let mut snapshot_for_thumbs = state.clone();
+            let initial_payloads = asset_payload_pairs(&state.assets);
+            if had_embedded_payloads {
+                let mut stripped_snapshot = state.clone();
+                stripped_snapshot.assets = strip_asset_payloads_for_snapshot(&state.assets);
+                spawn_local(async move {
+                    let _ = save_asset_payloads(&initial_payloads).await;
+                    let _ = save_snapshot(&stripped_snapshot).await;
+                });
+            }
+            let thumb_order = prioritized_asset_indexes_for_thread(
+                &assets_for_thumbs,
+                &tasks_for_thumbs,
+                &initial_thread_id,
+            );
+            let assets_signal_for_thumbs = assets_signal;
+            let status_text_for_thumbs = status_text;
+            spawn_local(async move {
+                let mut changed = false;
+                let mut first_batch_changed = false;
+                for (position, asset_index) in thumb_order.into_iter().enumerate() {
+                    let Some(asset) = assets_for_thumbs.get_mut(asset_index) else {
+                        continue;
+                    };
+                    if asset.metadata.contains_key(THUMBNAIL_DATA_URL_KEY) {
+                        continue;
+                    }
+                    if let Ok(thumbnail) =
+                        thumbnail_data_url_from_asset(asset, THUMBNAIL_MAX_EDGE).await
+                    {
+                        asset
+                            .metadata
+                            .insert(THUMBNAIL_DATA_URL_KEY.into(), thumbnail);
+                        changed = true;
+                        if position < 6 {
+                            first_batch_changed = true;
+                        }
+                    }
+                    if first_batch_changed && position == 5 {
+                        assets_signal_for_thumbs.set(assets_for_thumbs.clone());
+                    }
+                }
+                if changed {
+                    assets_signal_for_thumbs.set(assets_for_thumbs.clone());
+                    snapshot_for_thumbs.assets = assets_for_thumbs;
+                    let payloads = asset_payload_pairs(&snapshot_for_thumbs.assets);
+                    snapshot_for_thumbs.assets =
+                        strip_asset_payloads_for_snapshot(&snapshot_for_thumbs.assets);
+                    let _ = save_asset_payloads(&payloads).await;
+                    let _ = save_snapshot(&snapshot_for_thumbs).await;
+                }
+                status_text_for_thumbs.set("本地工作台已恢复，可以直接开始生成或继续修改。".into());
+            });
 
             if let Ok(remote_templates) = load_templates().await {
                 if !remote_templates.is_empty() {
@@ -384,7 +443,9 @@ fn App() -> impl IntoView {
                 }
             }
 
-            status_text.set("本地工作台已恢复，可以直接开始生成或继续修改。".into());
+            if !status_text.get_untracked().contains("可以直接开始生成") {
+                status_text.set("本地工作台已恢复，可以直接开始生成或继续修改。".into());
+            }
         }
     });
 
@@ -417,6 +478,12 @@ fn App() -> impl IntoView {
         });
         visible.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         visible
+    });
+
+    Effect::new(move |_| {
+        let _ = current_thread_id.get();
+        let _ = show_favorites_only.get();
+        gallery_page.set(1);
     });
 
     let reference_assets = Memo::new(move |_| {
@@ -572,7 +639,89 @@ fn App() -> impl IntoView {
 
     let gallery_entries = Memo::new(move |_| {
         let visible = visible_tasks.get();
-        assets.with(|asset_list| gallery_items(&visible, asset_list))
+        let config_list = configs.get();
+        assets.with(|asset_list| gallery_items(&visible, &config_list, asset_list))
+    });
+    let gallery_page_count = Memo::new(move |_| {
+        let total = gallery_entries.get().len();
+        total.max(1).div_ceil(GALLERY_PAGE_SIZE)
+    });
+    let paged_gallery_entries = Memo::new(move |_| {
+        let entries = gallery_entries.get();
+        let page = gallery_page.get().max(1);
+        let start = page.saturating_sub(1) * GALLERY_PAGE_SIZE;
+        if start >= entries.len() {
+            return Vec::new();
+        }
+        let end = (start + GALLERY_PAGE_SIZE).min(entries.len());
+        entries[start..end].to_vec()
+    });
+    let gallery_page_label = Memo::new(move |_| {
+        format!("{}/{}", gallery_page.get(), gallery_page_count.get())
+    });
+    let gallery_page_picker_rows = Memo::new(move |_| {
+        let total = gallery_page_count.get().max(1);
+        let current = gallery_page_candidate.get().clamp(1, total) as isize;
+        (-2..=2)
+            .filter_map(|offset| {
+                let page = current + offset;
+                if !(1..=total as isize).contains(&page) {
+                    return None;
+                }
+                Some((page as usize, offset))
+            })
+            .collect::<Vec<_>>()
+    });
+    let can_prev_gallery_page = Memo::new(move |_| gallery_page.get() > 1);
+    let can_next_gallery_page = Memo::new(move |_| gallery_page.get() < gallery_page_count.get());
+
+    let jump_gallery_page = move |_| {
+        if show_gallery_page_picker.get_untracked() {
+            show_gallery_page_picker.set(false);
+            return;
+        }
+        let current = gallery_page.get_untracked().max(1);
+        gallery_page_candidate.set(current);
+        show_gallery_page_picker.set(true);
+    };
+    let close_gallery_page_picker = move || {
+        show_gallery_page_picker.set(false);
+    };
+    let submit_gallery_page_picker = move || {
+        let total = gallery_page_count.get_untracked().max(1);
+        gallery_page.set(gallery_page_candidate.get_untracked().clamp(1, total));
+        show_gallery_page_picker.set(false);
+    };
+    let go_prev_gallery_page = move |_| {
+        gallery_page.update(|page| *page = page.saturating_sub(1).max(1));
+    };
+    let go_next_gallery_page = move |_| {
+        let total = gallery_page_count.get_untracked();
+        gallery_page.update(|page| *page = (*page + 1).min(total));
+    };
+    let step_gallery_page_candidate = move |delta: isize| {
+        let total = gallery_page_count.get_untracked().max(1);
+        let current = gallery_page_candidate.get_untracked().clamp(1, total) as isize;
+        let next = (current + delta).clamp(1, total as isize);
+        gallery_page_candidate.set(next as usize);
+    };
+
+    Effect::new(move |_| {
+        let total_pages = gallery_page_count.get().max(1);
+        if gallery_page.get() > total_pages {
+            gallery_page.set(total_pages);
+        }
+    });
+
+    Effect::new(move |_| {
+        let thread_id = current_thread_id.get();
+        if gallery_page_picker_thread_marker.get_untracked() == thread_id {
+            return;
+        }
+        gallery_page_picker_thread_marker.set(thread_id);
+        if show_gallery_page_picker.get_untracked() {
+            show_gallery_page_picker.set(false);
+        }
     });
 
     let update_current_config = move |updater: fn(&mut EncryptedApiConfig, String),
@@ -747,7 +896,7 @@ fn App() -> impl IntoView {
             .unwrap_or_else(ProviderTemplate::builtin_openai);
         configs.update(|items| {
             let mut config = default_config(&template.id);
-            config.name = format!("{} 配置", template.name);
+            config.name = "新配置001".into();
             config.base_url = template.base_url.clone();
             config.provider_kind = template.kind;
             config.known_requires_proxy = template.known_requires_proxy;
@@ -757,7 +906,37 @@ fn App() -> impl IntoView {
                 current_config_id.set(last.id.clone());
             }
         });
-        persist_state();
+        let configs_snapshot = configs.get_untracked();
+        spawn_local(async move {
+            let _ = save_configs(&configs_snapshot).await;
+        });
+    };
+
+    let delete_config = move |_| {
+        let Some(current) = configs.with_untracked(|items| {
+            items
+                .iter()
+                .find(|config| config.id == current_config_id.get_untracked())
+                .cloned()
+        }) else {
+            return;
+        };
+        if !confirm_action(&format!("删除配置「{}」后无法恢复，是否继续？", current.name)) {
+            return;
+        }
+        configs.update(|items| {
+            items.retain(|config| config.id != current.id);
+        });
+        let next_id = configs
+            .get_untracked()
+            .first()
+            .map(|config| config.id.clone())
+            .unwrap_or_default();
+        current_config_id.set(next_id);
+        let configs_snapshot = configs.get_untracked();
+        spawn_local(async move {
+            let _ = save_configs(&configs_snapshot).await;
+        });
     };
 
     let new_thread = move |_| {
@@ -836,13 +1015,19 @@ fn App() -> impl IntoView {
                     .get("thread_id")
                     .map(|id| id == &thread_id)
                     .unwrap_or(false)
-                    || asset
+                || asset
                         .source_task_id
                         .as_ref()
                         .map(|task_id| removed_task_ids.contains(task_id))
                         .unwrap_or(false))
             });
         });
+        if !removed_asset_ids.is_empty() {
+            let removed_asset_ids_for_store = removed_asset_ids.clone();
+            spawn_local(async move {
+                let _ = delete_asset_payloads(&removed_asset_ids_for_store).await;
+            });
+        }
         threads.update(|items| {
             items.retain(|thread| thread.id != thread_id);
             if items.is_empty() {
@@ -883,15 +1068,36 @@ fn App() -> impl IntoView {
         spawn_local(async move {
             match import_file_list(files).await {
                 Ok(mut imported) => {
-                    let existing_hashes = assets_signal.with_untracked(|items| {
-                        items
-                            .iter()
-                            .map(|asset| asset.sha256.clone())
-                            .collect::<std::collections::HashSet<_>>()
+                    let existing_thread_assets = assets_signal.with_untracked(|items| {
+                        let mut by_hash = HashMap::new();
+                        for asset in items.iter().filter(|asset| {
+                            asset.source_task_id.is_none()
+                                && !asset.metadata.contains_key("mask_base_asset_id")
+                        }) {
+                            let belongs_to_current_thread = asset
+                                .metadata
+                                .get("thread_id")
+                                .map(|value| value == &thread_id)
+                                .unwrap_or(false);
+                            if belongs_to_current_thread {
+                                by_hash
+                                    .entry(asset.sha256.clone())
+                                    .or_insert_with(|| asset.id.clone());
+                            }
+                        }
+                        by_hash
                     });
-                    imported.retain(|asset| !existing_hashes.contains(&asset.sha256));
-                    if imported.is_empty() {
-                        status_text.set("已自动去重，未导入重复参考图。".into());
+                    let mut reused_ids = Vec::new();
+                    imported.retain(|asset| {
+                        if let Some(existing_id) = existing_thread_assets.get(&asset.sha256) {
+                            reused_ids.push(existing_id.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if imported.is_empty() && reused_ids.is_empty() {
+                        status_text.set("没有可导入的参考图。".into());
                         return;
                     }
                     for asset in &mut imported {
@@ -904,17 +1110,31 @@ fn App() -> impl IntoView {
                                 .insert(THUMBNAIL_DATA_URL_KEY.into(), thumbnail);
                         }
                     }
-                    let ids: Vec<String> = imported.iter().map(|asset| asset.id.clone()).collect();
+                    let payloads = asset_payload_pairs(&imported);
+                    let imported_ids: Vec<String> =
+                        imported.iter().map(|asset| asset.id.clone()).collect();
                     assets_signal.update(|items| items.extend(imported));
+                    let _ = save_asset_payloads(&payloads).await;
                     selected_reference_ids.update(|current| {
-                        for id in ids {
+                        for id in reused_ids.iter().chain(imported_ids.iter()) {
                             if !current.contains(&id) {
-                                current.push(id);
+                                current.push(id.clone());
                             }
                         }
                     });
                     persist();
-                    status_text.set("图片已导入，可点击缩略图打开参考图操作菜单。".into());
+                    let message = match (imported_ids.len(), reused_ids.len()) {
+                        (0, reused_count) => {
+                            format!("检测到 {reused_count} 张重复参考图，已自动加入当前参考列表。")
+                        }
+                        (imported_count, 0) => format!(
+                            "已导入 {imported_count} 张参考图，可点击缩略图打开参考图操作菜单。"
+                        ),
+                        (imported_count, reused_count) => format!(
+                            "已导入 {imported_count} 张参考图，并复用 {reused_count} 张重复参考图。"
+                        ),
+                    };
+                    status_text.set(message);
                 }
                 Err(error) => status_text.set(format!("导入图片失败：{error}")),
             }
@@ -922,7 +1142,12 @@ fn App() -> impl IntoView {
     };
 
     let open_reference_menu = move |asset_id: String| {
+        let assets_signal = assets;
+        let preload_asset_id = asset_id.clone();
         reference_menu_asset_id.set(Some(asset_id));
+        spawn_local(async move {
+            let _ = ensure_asset_payloads_loaded(assets_signal, &[preload_asset_id]).await;
+        });
     };
 
     let reorder_selected_references = move |dragged_id: String, target_id: String| {
@@ -960,6 +1185,10 @@ fn App() -> impl IntoView {
         if continuation_asset_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
             continuation_asset_id.set(None);
         }
+        let removed_asset_ids = vec![asset_id.clone()];
+        spawn_local(async move {
+            let _ = delete_asset_payloads(&removed_asset_ids).await;
+        });
         persist_state();
         status_text.set("参考图已删除。".into());
     };
@@ -992,13 +1221,19 @@ fn App() -> impl IntoView {
         current_thread_id.set(task.thread_id.clone());
         draft_prompt.set(task.prompt.clone());
         selected_reference_ids.set(task.reference_asset_ids.clone());
-        continuation_asset_id.set(Some(asset_id));
+        continuation_asset_id.set(Some(asset_id.clone()));
         reference_menu_asset_id.set(None);
         threads.update(|items| {
             if let Some(thread) = items.iter_mut().find(|thread| thread.id == task.thread_id) {
                 thread.draft_prompt = task.prompt.clone();
                 thread.updated_at = now_rfc3339();
             }
+        });
+        let assets_signal = assets;
+        let mut preload_asset_ids = task.reference_asset_ids.clone();
+        preload_asset_ids.push(asset_id);
+        spawn_local(async move {
+            let _ = ensure_asset_payloads_loaded(assets_signal, &preload_asset_ids).await;
         });
         persist_state();
         status_text.set("已进入连续修改模式。".into());
@@ -1030,11 +1265,22 @@ fn App() -> impl IntoView {
                 continuation_asset_id.set(None);
             }
         }
+        if !removed_asset_ids.is_empty() {
+            let removed_asset_ids_for_store = removed_asset_ids.clone();
+            spawn_local(async move {
+                let _ = delete_asset_payloads(&removed_asset_ids_for_store).await;
+            });
+        }
         persist_state();
         status_text.set("历史记录已删除。".into());
     };
 
     let open_preview = move |task_id: String, asset_id: String| {
+        let preview_asset_id = asset_id.clone();
+        let assets_signal = assets;
+        spawn_local(async move {
+            let _ = ensure_asset_payloads_loaded(assets_signal, &[preview_asset_id]).await;
+        });
         preview_panel_state.set(build_preview_panel_state(&task_id, &asset_id));
         preview_state.set(Some(PreviewState { task_id, asset_id }));
         preview_fullscreen.set(false);
@@ -1190,7 +1436,47 @@ fn App() -> impl IntoView {
         let persist = persist_state;
         let quality_value = quality.get_untracked();
         let count_value = count.get_untracked();
+        let selected_ids_for_request = selected_ids.clone();
+        let continuation_asset_id_for_request = continuation_asset_id.get_untracked();
         spawn_local(async move {
+            let mut required_asset_ids = selected_ids_for_request.clone();
+            if let Some(asset_id) = continuation_asset_id_for_request.clone() {
+                required_asset_ids.push(asset_id);
+            }
+            if let Err(error) = ensure_asset_payloads_loaded(assets_signal, &required_asset_ids).await
+            {
+                tasks_signal.update(|items| {
+                    if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
+                        task.status = TaskStatus::Failed;
+                        task.updated_at = now_rfc3339();
+                        task.error_message = Some(error.clone());
+                    }
+                });
+                persist();
+                status_signal.set(format!("生成失败：{error}"));
+                generating_signal.set(false);
+                return;
+            }
+            let references = assets_signal.with_untracked(|items| {
+                let mut references =
+                    selected_thread_reference_assets(items, &thread_id, &selected_ids_for_request);
+                references.truncate(16);
+                if let Some(asset_id) = continuation_asset_id_for_request.clone() {
+                    if let Some(asset) = items
+                        .iter()
+                        .find(|asset| {
+                            asset.id == asset_id
+                                && !asset.metadata.contains_key("mask_base_asset_id")
+                        })
+                        .cloned()
+                    {
+                        references.retain(|item| item.id != asset.id);
+                        references.insert(0, asset);
+                        references.truncate(16);
+                    }
+                }
+                references
+            });
             let request = mew_image_shared::GenerationRequest {
                 prompt: prompt.clone(),
                 model: config.model.clone(),
@@ -1335,6 +1621,8 @@ fn App() -> impl IntoView {
                         .find_map(|asset| asset.width.zip(asset.height))
                         .unwrap_or((resolved_width, resolved_height));
                     let first_generated_id = produced_assets.first().map(|asset| asset.id.clone());
+                    let produced_payloads = asset_payload_pairs(&produced_assets);
+                    let _ = save_asset_payloads(&produced_payloads).await;
                     assets_signal.update(|items| {
                         items.extend(produced_assets);
                     });
@@ -1405,73 +1693,81 @@ fn App() -> impl IntoView {
                     }>
                         {move || if preferences.get().theme == ThemePreference::Day { "夜间模式" } else { "白天模式" }}
                     </button>
-                    <button class="button secondary" on:click=move |_| show_settings.update(|value| *value = !*value)>
-                        {move || if show_settings.get() { "收起设置" } else { "打开设置" }}
+                    <button class="button secondary" on:click=move |_| show_settings_menu.update(|value| *value = !*value)>
+                        {move || if show_settings_menu.get() { "收起设置" } else { "打开设置" }}
                     </button>
                 </div>
             </header>
 
-            {move || if show_settings.get() {
+            {move || if show_settings_menu.get() {
                 view! {
-                    <section class="panel settings-panel">
-                        <div class="settings-grid">
-                            <section class="stack">
-                                <div class="row">
-                                    <h2>"账号与同步"</h2>
-                                    <span class="tag">{move || auth_user.get().map(|user| user.username).unwrap_or_else(|| "游客模式".into())}</span>
-                                </div>
-                                <input
-                                    class="text-input"
-                                    placeholder="用户名"
-                                    prop:value=move || login_username.get()
-                                    on:input=move |ev| login_username.set(event_target_value(&ev))
-                                />
-                                <input
-                                    class="text-input"
-                                    type="password"
-                                    placeholder="密码 / 同步口令"
-                                    prop:value=move || login_password.get()
-                                    on:input=move |ev| login_password.set(event_target_value(&ev))
-                                />
-                                <div class="row">
-                                    <button class="button" on:click=move |_| submit_auth("login")>"登录"</button>
-                                    <button class="button secondary" on:click=move |_| submit_auth("register")>"注册"</button>
-                                    <button class="button ghost" on:click=move |_| sync_action() disabled=move || syncing.get()>
-                                        {move || if syncing.get() { "同步中…" } else { "立即同步" }}
-                                    </button>
-                                </div>
-                                <span class="status">
-                                    {move || auth_user.get().map(|user| format!("当前账号：{}", user.username)).unwrap_or_else(|| "未登录时所有数据仍保存在当前浏览器。".into())}
-                                </span>
-                            </section>
+                    <div class="settings-overlay" on:click=move |_| show_settings_menu.set(false)>
+                        <div class="settings-popover" on:click=move |ev: MouseEvent| ev.stop_propagation()>
+                            <div class="settings-grid">
+                                <section class="stack">
+                                    <div class="row">
+                                        <h2>"账号与同步"</h2>
+                                        <span class="tag">{move || auth_user.get().map(|user| user.username).unwrap_or_else(|| "游客模式".into())}</span>
+                                    </div>
+                                    <input
+                                        class="text-input"
+                                        placeholder="用户名"
+                                        prop:value=move || login_username.get()
+                                        on:input=move |ev| login_username.set(event_target_value(&ev))
+                                    />
+                                    <input
+                                        class="text-input"
+                                        type="password"
+                                        placeholder="密码 / 同步口令"
+                                        prop:value=move || login_password.get()
+                                        on:input=move |ev| login_password.set(event_target_value(&ev))
+                                    />
+                                    <div class="row">
+                                        <button class="button" on:click=move |_| submit_auth("login")>"登录"</button>
+                                        <button class="button secondary" on:click=move |_| submit_auth("register")>"注册"</button>
+                                        <button class="button ghost" on:click=move |_| sync_action() disabled=move || syncing.get()>
+                                            {move || if syncing.get() { "同步中…" } else { "立即同步" }}
+                                        </button>
+                                    </div>
+                                </section>
 
-                            <section class="stack">
-                                <div class="row">
-                                    <h2>"服务商配置"</h2>
-                                    <button class="button ghost" on:click=add_config>"新增配置"</button>
-                                </div>
-                                <select
-                                    class="select-input"
-                                    prop:value=move || current_config_id.get()
-                                    on:change=move |ev| current_config_id.set(event_target_value(&ev))
-                                >
-                                    <For
-                                        each=move || configs.get()
-                                        key=|config| config.id.clone()
-                                        children=move |config| view! {
-                                            <option value=config.id.clone()>{config.name}</option>
+                                <section class="stack">
+                                    <div class="row">
+                                        <h2>"服务商配置"</h2>
+                                        <div class="row">
+                                            <button class="button ghost" on:click=add_config>"新增配置"</button>
+                                            <button class="button ghost danger" on:click=delete_config>"删除配置"</button>
+                                        </div>
+                                    </div>
+                                    <select
+                                        class="select-input"
+                                        prop:value=move || current_config_id.get()
+                                        on:change=move |ev| current_config_id.set(event_target_value(&ev))
+                                    >
+                                        <For
+                                            each=move || configs.get()
+                                            key=|config| config.id.clone()
+                                            children=move |config| view! {
+                                                <option value=config.id.clone()>{config.name}</option>
+                                            }
+                                        />
+                                    </select>
+                                    <ConfigEditor
+                                        configs=configs
+                                        current_config_id=current_config_id
+                                        current_config_snapshot=current_config
+                                        templates=templates
+                                        save_configs_only=move || {
+                                            let configs_snapshot = configs.get_untracked();
+                                            spawn_local(async move {
+                                                let _ = save_configs(&configs_snapshot).await;
+                                            });
                                         }
                                     />
-                                </select>
-                                <ConfigEditor
-                                    configs=configs
-                                    current_config_id=current_config_id
-                                    templates=templates
-                                    persist=persist_state
-                                />
-                            </section>
+                                </section>
+                            </div>
                         </div>
-                    </section>
+                    </div>
                 }.into_any()
             } else {
                 ().into_any()
@@ -1485,14 +1781,15 @@ fn App() -> impl IntoView {
                             <button class="button ghost" on:click=move |_| show_favorites_only.update(|value| *value = !*value)>
                                 {move || if show_favorites_only.get() { "显示全部" } else { "仅收藏" }}
                             </button>
-                            <span class="tag">{move || format!("{} 条任务", visible_tasks.get().len())}</span>
+                            <span class="tag">{move || format!("{} 张", gallery_entries.get().len())}</span>
                         </div>
                     </div>
                     <div class="gallery sidebar-gallery">
-                        <For
-                            each=move || gallery_entries.get()
-                            key=|item| item.key.clone()
-                                children=move |item| {
+                        {move || {
+                            paged_gallery_entries
+                                .get()
+                                .into_iter()
+                                .map(|item| {
                                     let asset_id = item.asset_id.clone();
                                     let task_id = item.task_id.clone();
                                     let show_failure_log = tasks.with_untracked(|items| {
@@ -1530,6 +1827,15 @@ fn App() -> impl IntoView {
                                                         on:contextmenu=move |ev: MouseEvent| {
                                                             ev.prevent_default();
                                                             if let Some(asset_id) = context_asset_id.clone() {
+                                                                let assets_signal = assets;
+                                                                let preload_asset_id = asset_id.clone();
+                                                                spawn_local(async move {
+                                                                    let _ = ensure_asset_payloads_loaded(
+                                                                        assets_signal,
+                                                                        &[preload_asset_id],
+                                                                    )
+                                                                    .await;
+                                                                });
                                                                 context_menu_state.set(Some(ContextMenuState {
                                                                     task_id: context_task_id.clone(),
                                                                     asset_id,
@@ -1549,9 +1855,15 @@ fn App() -> impl IntoView {
                                             }).unwrap_or_else(|| view! { <div class="compact-preview-fallback muted">"无预览"</div> }.into_any())}
                                             <div class="card-body stack compact-card-body">
                                                 <p class="gallery-card-title">{item.prompt.clone()}</p>
-                                                <div class="gallery-meta">
-                                                    <span class="gallery-badge">{item.model.clone()}</span>
-                                                </div>
+                                                {
+                                                    let meta_label =
+                                                        format!("{} · {}", item.config_name, item.model);
+                                                    view! {
+                                                        <div class="gallery-meta">
+                                                            <span class="gallery-badge" title=meta_label.clone()>{meta_label.clone()}</span>
+                                                        </div>
+                                                    }
+                                                }
                                                 <div class="row compact-actions">
                                                     <button class="button ghost mini-action icon-action" title="重新生成" on:click=move |_| rerun_task(rerun_task_id.clone())><MaterialSymbolIcon name="restart_alt" filled=false /></button>
                                                     <button class="button ghost mini-action icon-action" title="继续修改" on:click=move |_| {
@@ -1619,9 +1931,116 @@ fn App() -> impl IntoView {
                                                 </div>
                                             </div>
                                         </article>
-                                    }
-                                }
-                            />
+                                    }.into_any()
+                                })
+                                .collect::<Vec<_>>()
+                        }}
+                    </div>
+                    <div class="gallery-pagination-footer">
+                        <div class="gallery-pagination-anchor">
+                            {move || if show_gallery_page_picker.get() {
+                                view! {
+                                    <>
+                                    <button class="gallery-page-dismiss-layer" aria-label="关闭页码选择" on:click=move |_| close_gallery_page_picker()></button>
+                                    <div class="gallery-page-popover-layer">
+                                        <div
+                                            class="gallery-page-popover"
+                                            on:wheel=move |ev: WheelEvent| {
+                                                ev.prevent_default();
+                                                if ev.delta_y() < 0.0 {
+                                                    step_gallery_page_candidate(-1);
+                                                } else if ev.delta_y() > 0.0 {
+                                                    step_gallery_page_candidate(1);
+                                                }
+                                            }
+                                        >
+                                            <div class="gallery-page-popover-body">
+                                                <div
+                                                    class="gallery-page-wheel"
+                                                    tabindex="0"
+                                                    on:keydown=move |ev: KeyboardEvent| {
+                                                        match ev.key().as_str() {
+                                                            "ArrowUp" => {
+                                                                ev.prevent_default();
+                                                                step_gallery_page_candidate(-1);
+                                                            }
+                                                            "ArrowDown" => {
+                                                                ev.prevent_default();
+                                                                step_gallery_page_candidate(1);
+                                                            }
+                                                            "Enter" => submit_gallery_page_picker(),
+                                                            "Escape" => close_gallery_page_picker(),
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                >
+                                                    <For
+                                                        each=move || gallery_page_picker_rows.get()
+                                                        key=|(page, offset)| format!("{page}-{offset}")
+                                                        children=move |(page, offset)| {
+                                                            let target_page = page;
+                                                            let is_focused = offset == 0;
+                                                            let is_near = offset.abs() == 1;
+                                                            let is_far = offset.abs() >= 2;
+                                                            view! {
+                                                                <button
+                                                                    class="gallery-page-wheel-item"
+                                                                    class:is-focused=is_focused
+                                                                    class:is-near=is_near
+                                                                    class:is-far=is_far
+                                                                    on:click=move |_| gallery_page_candidate.set(target_page)
+                                                                    on:wheel=move |ev: WheelEvent| {
+                                                                        ev.prevent_default();
+                                                                        if ev.delta_y() < 0.0 {
+                                                                            step_gallery_page_candidate(-1);
+                                                                        } else if ev.delta_y() > 0.0 {
+                                                                            step_gallery_page_candidate(1);
+                                                                        }
+                                                                    }
+                                                                >
+                                                                    {page.to_string()}
+                                                                </button>
+                                                            }
+                                                        }
+                                                    />
+                                                </div>
+                                                <button class="button secondary gallery-page-confirm" on:click=move |_| submit_gallery_page_picker()>
+                                                    <MaterialSymbolIcon name="check" filled=false />
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    </>
+                                }.into_any()
+                            } else {
+                                ().into_any()
+                            }}
+                        <div class="gallery-pagination-cluster">
+                            <button
+                                class="button ghost icon-button pagination-icon-button"
+                                title="上一页"
+                                disabled=move || !can_prev_gallery_page.get()
+                                on:click=go_prev_gallery_page
+                            >
+                                <MaterialSymbolIcon name="chevron_left" filled=false />
+                            </button>
+                            <button
+                                class="button ghost pagination-page-button"
+                                title="跳转页码"
+                                on:click=jump_gallery_page
+                            >
+                                {move || gallery_page_label.get()}
+                            </button>
+                            <button
+                                class="button ghost icon-button pagination-icon-button"
+                                title="下一页"
+                                disabled=move || !can_next_gallery_page.get()
+                                on:click=go_next_gallery_page
+                            >
+                                <MaterialSymbolIcon name="chevron_right" filled=false />
+                            </button>
+                        </div>
+                        </div>
                     </div>
                 </aside>
 
@@ -1719,7 +2138,7 @@ fn App() -> impl IntoView {
                             <div class="continuation-banner">
                                 <div class="row">
                                     <div class="row">
-                                        <img class="continuation-thumb" src=asset_src(&asset) alt="连续修改底图" />
+                                        <img class="continuation-thumb" src=asset_display_src(&asset) alt="连续修改底图" />
                                         <div class="stack">
                                             <strong>"连续修改模式"</strong>
                                             <span class="status">"下一次会基于上一张输出继续生成，不会加入参考图队列。"</span>
@@ -1728,8 +2147,7 @@ fn App() -> impl IntoView {
                                     <button class="button ghost" on:click=move |_| {
                                         if continuation_asset_id.get_untracked().as_deref() == Some(clear_asset.as_str()) {
                                             continuation_asset_id.set(None);
-                                            selected_reference_ids.set(Vec::new());
-                                            status_text.set("已退出连续修改模式。".into());
+                                            status_text.set("已退出连续修改模式，当前参考图选择已保留。".into());
                                         }
                                     }>"清除上下文"</button>
                                 </div>
@@ -2072,7 +2490,7 @@ fn App() -> impl IntoView {
                                 <button class="button ghost icon-button" on:click=move |_| reference_menu_asset_id.set(None)><MaterialSymbolIcon name="close" filled=false /></button>
                             </div>
                             <div class="reference-menu-preview">
-                                <img src=asset_src(&asset) alt="参考图预览" />
+                                <img src=asset_full_preview_src(&asset) alt="参考图预览" />
                             </div>
                             <div class="row reference-menu-actions">
                                 <button class="button ghost" on:click=move |_| {
@@ -2103,7 +2521,14 @@ fn App() -> impl IntoView {
                 let delete_task_id = panel.task_id.clone();
                 let edit_task_id = panel.task_id.clone();
                 let edit_asset_id = panel.asset_id.clone();
-                let fullscreen_src = asset_src(&asset);
+                let fullscreen_src = {
+                    let source = asset_src(&asset);
+                    if source.is_empty() {
+                        panel.display_src.clone()
+                    } else {
+                        source
+                    }
+                };
                 let preview_image_src = fullscreen_src.clone();
                 let copy_src = fullscreen_src.clone();
                 let toolbar_download_src = fullscreen_src.clone();
@@ -2272,7 +2697,9 @@ fn App() -> impl IntoView {
                                                 <MaterialSymbolIcon name="content_copy" filled=false />
                                             </button>
                                         </div>
-                                        <p class="preview-prompt">{panel.prompt.clone()}</p>
+                                        <div class="preview-prompt-box">
+                                            <p class="preview-prompt">{panel.prompt.clone()}</p>
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="stack">
@@ -2325,29 +2752,29 @@ fn App() -> impl IntoView {
                                     </div>
                                 </div>
                                 <div class="preview-details-grid">
-                                    <div class="detail-card">
-                                        <span class="status">"来源"</span>
-                                        <strong>{format!("{} · {}", panel.source_label, panel.requested_model)}</strong>
+                                    <div class="detail-card is-source">
+                                        <span class="detail-label">"来源"</span>
+                                        <strong class="detail-value detail-value-wrap">{format!("{} · {}", panel.source_label, panel.requested_model)}</strong>
                                     </div>
                                     <div class="detail-card">
-                                        <span class="status">"尺寸"</span>
-                                        <strong>{format!("{}x{}", panel.width, panel.height)}</strong>
+                                        <span class="detail-label">"质量"</span>
+                                        <strong class="detail-value detail-value-wrap">{format!("请求 {} / 实际 {}", panel.requested_quality_label, panel.actual_quality_label)}</strong>
                                     </div>
-                                    <div class="detail-card">
-                                        <span class="status">"质量"</span>
-                                        <strong>{format!("请求 {} / 实际 {}", panel.requested_quality_label, panel.actual_quality_label)}</strong>
+                                    <div class="detail-card is-inline">
+                                        <span class="detail-label">"尺寸"</span>
+                                        <strong class="detail-value">{format!("{}x{}", panel.width, panel.height)}</strong>
                                     </div>
-                                    <div class="detail-card">
-                                        <span class="status">"格式"</span>
-                                        <strong>{panel.format_label.clone()}</strong>
+                                    <div class="detail-card is-inline">
+                                        <span class="detail-label">"格式"</span>
+                                        <strong class="detail-value">{panel.format_label.clone()}</strong>
                                     </div>
-                                    <div class="detail-card">
-                                        <span class="status">"审核"</span>
-                                        <strong>{panel.moderation_label.clone()}</strong>
+                                    <div class="detail-card is-inline">
+                                        <span class="detail-label">"审核"</span>
+                                        <strong class="detail-value">{panel.moderation_label.clone()}</strong>
                                     </div>
-                                    <div class="detail-card">
-                                        <span class="status">"数量"</span>
-                                        <strong>{panel.image_count.to_string()}</strong>
+                                    <div class="detail-card is-inline">
+                                        <span class="detail-label">"数量"</span>
+                                        <strong class="detail-value">{panel.image_count.to_string()}</strong>
                                     </div>
                                 </div>
                                 <div class="preview-time-meta">
@@ -2498,82 +2925,114 @@ fn ConfigEditor(
     configs: RwSignal<Vec<EncryptedApiConfig>>,
     current_config_id: RwSignal<String>,
     templates: RwSignal<Vec<ProviderTemplate>>,
-    persist: impl Fn() + Copy + 'static,
+    current_config_snapshot: Memo<Option<EncryptedApiConfig>>,
+    save_configs_only: impl Fn() + Copy + 'static,
 ) -> impl IntoView {
-    let current_config = Memo::new(move |_| {
-        configs
-            .get()
-            .into_iter()
-            .find(|config| config.id == current_config_id.get())
-    });
+    let current_config = current_config_snapshot;
+    let template_id_draft = RwSignal::new(String::new());
     let name_draft = RwSignal::new(String::new());
     let base_url_draft = RwSignal::new(String::new());
     let model_draft = RwSignal::new(String::new());
     let api_key_draft = RwSignal::new(String::new());
+    let access_mode_draft = RwSignal::new(String::from("Smart"));
+    let endpoint_mode_draft = RwSignal::new(String::from("ImagesApi"));
     let has_pending_changes = RwSignal::new(false);
+    let save_feedback = RwSignal::new(false);
+    let loaded_config_id = RwSignal::new(String::new());
 
     Effect::new(move |_| {
-        if let Some(config) = current_config.get() {
+        if let Some(config) = current_config_snapshot.get() {
+            let should_reset_feedback = loaded_config_id.get_untracked() != config.id;
+            loaded_config_id.set(config.id.clone());
+            template_id_draft.set(config.provider_template_id);
             name_draft.set(config.name);
             base_url_draft.set(config.base_url);
             model_draft.set(config.model);
             api_key_draft.set(config.api_key_plaintext.unwrap_or_default());
+            access_mode_draft.set(format!("{:?}", config.access_mode));
+            endpoint_mode_draft.set(format!("{:?}", config.endpoint_mode));
+            has_pending_changes.set(false);
+            if should_reset_feedback {
+                save_feedback.set(false);
+            }
         }
     });
 
-    let update_current = move |mutator: fn(&mut EncryptedApiConfig, String), value: String| {
-        configs.update(|items| {
-            if let Some(config) = items
-                .iter_mut()
-                .find(|config| config.id == current_config_id.get_untracked())
-            {
-                mutator(config, value.clone());
-                config.updated_at = now_rfc3339();
-            }
-        });
-    };
-
-    let flush_changes = move || {
-        if has_pending_changes.get_untracked() {
-            persist();
-            has_pending_changes.set(false);
-        }
-    };
-
     let commit_name = move || {
-        update_current(
-            |config, value| config.name = value,
-            name_draft.get_untracked(),
-        );
         has_pending_changes.set(true);
     };
     let commit_base_url = move || {
-        update_current(
-            |config, value| config.base_url = value,
-            base_url_draft.get_untracked(),
-        );
         has_pending_changes.set(true);
     };
     let commit_model = move || {
-        update_current(
-            |config, value| config.model = value,
-            model_draft.get_untracked(),
-        );
         has_pending_changes.set(true);
     };
     let commit_api_key = move || {
-        update_current(
-            |config, value| {
-                config.api_key_plaintext = Some(value.clone());
-                config.api_key_hint = Some(mask_key(&value));
-            },
-            api_key_draft.get_untracked(),
-        );
         has_pending_changes.set(true);
     };
 
+    let save_config = move |_| {
+        let current_id = current_config_id.get_untracked();
+        if current_id.is_empty() {
+            return;
+        }
+        let template_id = template_id_draft.get_untracked();
+        let selected_template = templates
+            .get_untracked()
+            .into_iter()
+            .find(|template| template.id == template_id);
+        configs.update(|items| {
+            if let Some(config) = items.iter_mut().find(|config| config.id == current_id) {
+                config.provider_template_id = template_id.clone();
+                if let Some(template) = selected_template.clone() {
+                    config.provider_kind = template.kind;
+                    config.known_requires_proxy = template.known_requires_proxy;
+                }
+                config.name = name_draft
+                    .get_untracked()
+                    .trim()
+                    .to_string();
+                config.base_url = base_url_draft.get_untracked().trim().to_string();
+                config.model = model_draft.get_untracked().trim().to_string();
+                config.access_mode = match access_mode_draft.get_untracked().as_str() {
+                    "Proxy" => ProviderAccessMode::Proxy,
+                    "Direct" => ProviderAccessMode::Direct,
+                    _ => ProviderAccessMode::Smart,
+                };
+                config.endpoint_mode = match endpoint_mode_draft.get_untracked().as_str() {
+                    "ResponsesApi" => ProviderEndpointMode::ResponsesApi,
+                    "CustomJson" => ProviderEndpointMode::CustomJson,
+                    _ => ProviderEndpointMode::ImagesApi,
+                };
+                let api_key = api_key_draft.get_untracked().trim().to_string();
+                if api_key.is_empty() {
+                    config.api_key_plaintext = None;
+                    config.api_key_hint = None;
+                } else {
+                    config.api_key_plaintext = Some(api_key.clone());
+                    config.api_key_hint = Some(mask_key(&api_key));
+                }
+                normalize_api_config(config);
+                config.updated_at = now_rfc3339();
+            }
+        });
+        has_pending_changes.set(false);
+        save_feedback.set(true);
+        save_configs_only();
+        if let Some(window) = web_sys::window() {
+            let callback = Closure::<dyn FnMut()>::once(move || {
+                save_feedback.set(false);
+            });
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.as_ref().unchecked_ref(),
+                1200,
+            );
+            callback.forget();
+        }
+    };
+
     view! {
-        <div class="stack" on:focusout=move |_| flush_changes()>
+        <div class="stack">
             <input
                 class="text-input"
                 placeholder="配置名称"
@@ -2583,36 +3042,30 @@ fn ConfigEditor(
             />
             <select
                 class="select-input"
-                prop:value=move || current_config.get().map(|config| config.provider_template_id).unwrap_or_default()
+                prop:value=move || template_id_draft.get()
                 on:change=move |ev| {
                     let value = event_target_value(&ev);
                     let template = templates.get_untracked().into_iter().find(|template| template.id == value);
-                    configs.update(|items| {
-                        if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                            config.provider_template_id = value.clone();
-                            if let Some(template) = template.clone() {
-                                config.provider_kind = template.kind;
-                                config.base_url = template.base_url;
-                                config.known_requires_proxy = template.known_requires_proxy;
-                                match template.kind {
-                                    ProviderKind::OpenAiImage => {
-                                        config.endpoint_mode = ProviderEndpointMode::ImagesApi;
-                                        config.model = "gpt-image-1".into();
-                                    }
-                                    ProviderKind::NanoBanana | ProviderKind::OpenAiCompatible => {
-                                        config.endpoint_mode = ProviderEndpointMode::CustomJson;
-                                        config.model = "gemini-2.5-flash-image".into();
-                                    }
-                                    ProviderKind::CustomHttp => {
-                                        config.endpoint_mode = ProviderEndpointMode::CustomJson;
-                                    }
-                                }
-                                normalize_api_config(config);
-                            }
-                            config.updated_at = now_rfc3339();
-                        }
-                    });
+                    template_id_draft.set(value.clone());
                     has_pending_changes.set(true);
+                    if let Some(template) = template {
+                        base_url_draft.set(template.base_url.clone());
+                        access_mode_draft.set("Smart".into());
+                        endpoint_mode_draft.set(match template.kind {
+                            ProviderKind::OpenAiImage => "ImagesApi".into(),
+                            ProviderKind::NanoBanana | ProviderKind::OpenAiCompatible => {
+                                "CustomJson".into()
+                            }
+                            ProviderKind::CustomHttp => "CustomJson".into(),
+                        });
+                        model_draft.set(match template.kind {
+                            ProviderKind::OpenAiImage => "gpt-image-2".into(),
+                            ProviderKind::NanoBanana | ProviderKind::OpenAiCompatible => {
+                                "gemini-2.5-flash-image".into()
+                            }
+                            ProviderKind::CustomHttp => String::new(),
+                        });
+                    }
                 }
             >
                 <For
@@ -2645,22 +3098,12 @@ fn ConfigEditor(
                 on:input=move |ev| api_key_draft.set(event_target_value(&ev))
                 on:blur=move |_| commit_api_key()
             />
-            <div class="grid compact-grid">
+            <div class="row settings-config-actions">
                 <select
                     class="select-input"
-                    prop:value=move || current_config.get().map(|config| format!("{:?}", config.access_mode)).unwrap_or_default()
+                    prop:value=move || access_mode_draft.get()
                     on:change=move |ev| {
-                        let value = event_target_value(&ev);
-                        configs.update(|items| {
-                            if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                                config.access_mode = match value.as_str() {
-                                    "Proxy" => ProviderAccessMode::Proxy,
-                                    "Direct" => ProviderAccessMode::Direct,
-                                    _ => ProviderAccessMode::Smart,
-                                };
-                                config.updated_at = now_rfc3339();
-                            }
-                        });
+                        access_mode_draft.set(event_target_value(&ev));
                         has_pending_changes.set(true);
                     }
                 >
@@ -2677,18 +3120,9 @@ fn ConfigEditor(
                         view! {
                             <select
                                 class="select-input"
-                                prop:value=move || current_config.get().map(|config| format!("{:?}", config.endpoint_mode)).unwrap_or_default()
+                                prop:value=move || endpoint_mode_draft.get()
                                 on:change=move |ev| {
-                                    let value = event_target_value(&ev);
-                                    configs.update(|items| {
-                                        if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                                            config.endpoint_mode = match value.as_str() {
-                                                "ResponsesApi" => ProviderEndpointMode::ResponsesApi,
-                                                _ => ProviderEndpointMode::ImagesApi,
-                                            };
-                                            config.updated_at = now_rfc3339();
-                                        }
-                                    });
+                                    endpoint_mode_draft.set(event_target_value(&ev));
                                     has_pending_changes.set(true);
                                 }
                             >
@@ -2701,6 +3135,14 @@ fn ConfigEditor(
                         ().into_any()
                     }
                 }}
+                <button
+                    class="button secondary"
+                    class:save-success=move || save_feedback.get()
+                    on:click=save_config
+                    disabled=move || !has_pending_changes.get()
+                >
+                    {move || if save_feedback.get() { "已保存" } else { "保存" }}
+                </button>
             </div>
         </div>
     }
@@ -2763,14 +3205,23 @@ struct GalleryItem {
     asset_id: Option<String>,
     prompt: String,
     src: Option<String>,
+    config_name: String,
     model: String,
     size_label: String,
     ratio_label: String,
     favorite: bool,
 }
 
-fn gallery_items(tasks: &[LocalTaskRecord], assets: &[ImageAssetRef]) -> Vec<GalleryItem> {
+fn gallery_items(
+    tasks: &[LocalTaskRecord],
+    configs: &[EncryptedApiConfig],
+    assets: &[ImageAssetRef],
+) -> Vec<GalleryItem> {
     let mut assets_by_task: HashMap<&str, Vec<&ImageAssetRef>> = HashMap::new();
+    let config_names: HashMap<&str, &str> = configs
+        .iter()
+        .map(|config| (config.id.as_str(), config.name.as_str()))
+        .collect();
     for asset in assets {
         if let Some(task_id) = asset.source_task_id.as_deref() {
             assets_by_task.entry(task_id).or_default().push(asset);
@@ -2786,6 +3237,11 @@ fn gallery_items(tasks: &[LocalTaskRecord], assets: &[ImageAssetRef]) -> Vec<Gal
                     asset_id: Some(asset.id.clone()),
                     prompt: task.prompt.clone(),
                     src: Some(asset_display_src(asset)),
+                    config_name: config_names
+                        .get(task.config_id.as_str())
+                        .copied()
+                        .unwrap_or("默认配置")
+                        .to_string(),
                     model: task.requested_model.clone(),
                     size_label: format!(
                         "{}x{}",
@@ -2806,6 +3262,11 @@ fn gallery_items(tasks: &[LocalTaskRecord], assets: &[ImageAssetRef]) -> Vec<Gal
                 asset_id: None,
                 prompt: format!("失败：{error}"),
                 src: None,
+                config_name: config_names
+                    .get(task.config_id.as_str())
+                    .copied()
+                    .unwrap_or("默认配置")
+                    .to_string(),
                 model: task.requested_model.clone(),
                 size_label: "-".into(),
                 ratio_label: "失败".into(),
@@ -2913,6 +3374,121 @@ fn selected_thread_reference_assets(
         }
     }
     selected_assets
+}
+
+fn prioritized_asset_indexes_for_thread(
+    assets: &[ImageAssetRef],
+    tasks: &[LocalTaskRecord],
+    thread_id: &str,
+) -> Vec<usize> {
+    let task_ids: HashSet<&str> = tasks
+        .iter()
+        .filter(|task| task.thread_id == thread_id)
+        .map(|task| task.id.as_str())
+        .collect();
+    let mut prioritized = Vec::with_capacity(assets.len());
+    let mut deferred = Vec::with_capacity(assets.len());
+    for (index, asset) in assets.iter().enumerate() {
+        let is_current_thread_asset = asset
+            .metadata
+            .get("thread_id")
+            .map(|value| value == thread_id)
+            .unwrap_or(false)
+            || asset
+                .source_task_id
+                .as_deref()
+                .map(|task_id| task_ids.contains(task_id))
+                .unwrap_or(false);
+        if is_current_thread_asset {
+            prioritized.push(index);
+        } else {
+            deferred.push(index);
+        }
+    }
+    prioritized.extend(deferred);
+    prioritized
+}
+
+fn asset_payload_pairs(assets: &[ImageAssetRef]) -> Vec<(String, String)> {
+    assets
+        .iter()
+        .filter_map(|asset| {
+            asset.data_url.as_ref().and_then(|data_url| {
+                if data_url.trim().is_empty() {
+                    None
+                } else {
+                    Some((asset.id.clone(), data_url.clone()))
+                }
+            })
+        })
+        .collect()
+}
+
+fn strip_asset_payloads_for_snapshot(assets: &[ImageAssetRef]) -> Vec<ImageAssetRef> {
+    assets
+        .iter()
+        .cloned()
+        .map(|mut asset| {
+            asset.data_url = None;
+            asset
+        })
+        .collect()
+}
+
+fn merge_asset_payloads(
+    assets: &mut [ImageAssetRef],
+    payloads: &HashMap<String, String>,
+) -> bool {
+    let mut changed = false;
+    for asset in assets {
+        if asset.data_url.is_some() {
+            continue;
+        }
+        if let Some(data_url) = payloads.get(&asset.id) {
+            asset.data_url = Some(data_url.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+async fn ensure_asset_payloads_loaded(
+    assets_signal: RwSignal<Vec<ImageAssetRef>>,
+    asset_ids: &[String],
+) -> Result<(), String> {
+    if asset_ids.is_empty() {
+        return Ok(());
+    }
+    let mut unique_ids = HashSet::new();
+    let missing_asset_ids = assets_signal.with_untracked(|items| {
+        asset_ids
+            .iter()
+            .filter(|asset_id| unique_ids.insert((*asset_id).clone()))
+            .filter(|asset_id| {
+                items.iter()
+                    .find(|asset| asset.id == **asset_id)
+                    .map(|asset| {
+                        asset.data_url
+                            .as_deref()
+                            .map(|value| value.trim().is_empty())
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    if missing_asset_ids.is_empty() {
+        return Ok(());
+    }
+    let payloads = load_asset_payloads(&missing_asset_ids).await?;
+    if payloads.is_empty() {
+        return Ok(());
+    }
+    assets_signal.update(|items| {
+        let _ = merge_asset_payloads(items, &payloads);
+    });
+    Ok(())
 }
 
 fn snapshot_local_state(
@@ -3187,6 +3763,15 @@ pub(crate) fn asset_src(asset: &ImageAssetRef) -> String {
         .data_url
         .clone()
         .or_else(|| asset.remote_url.clone())
+        .unwrap_or_default()
+}
+
+fn asset_full_preview_src(asset: &ImageAssetRef) -> String {
+    asset
+        .data_url
+        .clone()
+        .or_else(|| asset.remote_url.clone())
+        .or_else(|| asset.metadata.get(THUMBNAIL_DATA_URL_KEY).cloned())
         .unwrap_or_default()
 }
 

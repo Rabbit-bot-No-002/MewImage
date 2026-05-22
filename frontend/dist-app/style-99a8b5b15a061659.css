@@ -1324,18 +1324,6 @@ body[data-theme="night"] .resolution-sheet {
   margin: 0;
   line-height: 1.7;
   white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.preview-prompt-box {
-  margin-top: 2px;
-  padding: 12px 14px;
-  max-height: min(28vh, 240px);
-  overflow: auto;
-  border-radius: 18px;
-  border: 1px solid rgba(24, 26, 38, 0.08);
-  background: rgba(255, 255, 255, 0.5);
-  scrollbar-gutter: stable;
 }
 
 .icon-button {
@@ -1413,7 +1401,7 @@ body[data-theme="day"] .floating-tip {
 .preview-details-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
 }
 
 .preview-time-meta {
@@ -1426,49 +1414,13 @@ body[data-theme="day"] .floating-tip {
 }
 
 .detail-card {
-  padding: 12px 14px;
-  border-radius: 16px;
+  padding: 16px;
+  border-radius: 18px;
   background: rgba(255, 255, 255, 0.4);
   border: 1px solid var(--line);
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  min-width: 0;
-}
-
-.detail-card.is-inline {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 48px;
-}
-
-.detail-label {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.25;
-  flex: 0 0 auto;
-}
-
-.detail-value {
-  font-size: 13px;
-  line-height: 1.35;
-  color: var(--text);
-  margin: 0;
-  min-width: 0;
-}
-
-.detail-card.is-inline .detail-value {
-  white-space: nowrap;
-}
-
-.detail-value-wrap {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  gap: 8px;
 }
 
 .preview-actions {

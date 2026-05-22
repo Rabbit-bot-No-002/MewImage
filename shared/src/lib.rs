@@ -103,7 +103,7 @@ impl ProviderTemplate {
         let now = now_rfc3339();
         Self {
             id: BUILTIN_OPENAI_IMAGE_TEMPLATE_ID.into(),
-            name: "OpenAI-Image".into(),
+            name: "OpenAI Image".into(),
             kind: ProviderKind::OpenAiImage,
             base_url: "https://api.openai.com".into(),
             endpoint_path: "/v1/images/generations".into(),
@@ -119,7 +119,7 @@ impl ProviderTemplate {
             response_image_base64_path: Some("data[].b64_json".into()),
             response_revised_prompt_path: Some("data[0].revised_prompt".into()),
             known_requires_proxy: true,
-            notes: Some("内置 OpenAI-Image 模板，用于 gpt-image 模型，支持 Images API 与 Responses API。".into()),
+            notes: Some("内置 OpenAI Image 模板，用于 gpt-image 模型，支持 Images API 与 Responses API。".into()),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -260,11 +260,9 @@ pub fn image_mime_from_output_format(output_format: Option<&str>) -> &'static st
 pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
     let base_url = config.base_url.trim();
     let is_google_official = base_url.contains("generativelanguage.googleapis.com");
-    let is_default_openai = base_url.is_empty()
-        || base_url.contains("api.openai.com");
 
     if config.provider_template_id == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID {
-        if config.endpoint_mode == ProviderEndpointMode::CustomJson || !is_default_openai {
+        if config.endpoint_mode == ProviderEndpointMode::CustomJson {
             config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
             config.provider_kind = ProviderKind::OpenAiCompatible;
             config.endpoint_mode = ProviderEndpointMode::CustomJson;
@@ -282,7 +280,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
             config.base_url = "https://api.openai.com".into();
         }
         if config.model.trim().is_empty() {
-            config.model = "gpt-image-1".into();
+            config.model = "gpt-image-2".into();
         }
         return;
     }
@@ -321,7 +319,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
                 config.base_url = "https://api.openai.com".into();
             }
             if config.model.trim().is_empty() {
-                config.model = "gpt-image-1".into();
+                config.model = "gpt-image-2".into();
             }
             if config.endpoint_mode == ProviderEndpointMode::CustomJson {
                 config.endpoint_mode = ProviderEndpointMode::ImagesApi;
@@ -1200,7 +1198,7 @@ mod tests {
             provider_kind: ProviderKind::OpenAiImage,
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
             base_url: "https://api.openai.com".into(),
-            model: "gpt-image-1".into(),
+            model: "gpt-image-2".into(),
             access_mode: ProviderAccessMode::Smart,
             known_requires_proxy: true,
             output_format: Some("png".into()),

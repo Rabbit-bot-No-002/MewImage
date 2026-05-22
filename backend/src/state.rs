@@ -23,7 +23,7 @@ impl AppConfig {
             database_url: std::env::var("MEW_IMAGE_DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://./data/mew-image.db?mode=rwc".into()),
             frontend_dist: std::env::var("MEW_IMAGE_FRONTEND_DIST")
-                .unwrap_or_else(|_| "./frontend/dist".into()),
+                .unwrap_or_else(|_| "./frontend/dist-app".into()),
             session_secure: std::env::var("MEW_IMAGE_SESSION_SECURE")
                 .map(|value| value == "true")
                 .unwrap_or(false),

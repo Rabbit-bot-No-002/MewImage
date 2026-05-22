@@ -63,7 +63,7 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
             config.provider_kind = ProviderKind::OpenAiImage;
             config.endpoint_mode = ProviderEndpointMode::ImagesApi;
             config.base_url = "https://api.openai.com".into();
-            config.model = "gpt-image-1".into();
+            config.model = "gpt-image-2".into();
         }
         _ => {
             config.provider_kind = ProviderKind::CustomHttp;
@@ -499,6 +499,7 @@ fn build_openai_compatible_json(
         "aspect_ratio": aspect_ratio_from_dimensions(request.width, request.height),
         "response_format": "url",
         "image_size": nano_banana_image_size_from_dimensions(request.width, request.height),
+        "size": format!("{}x{}", request.width, request.height),
     })
 }
 

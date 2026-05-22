@@ -1159,6 +1159,7 @@ async fn invoke_openai_compatible_image(
                 "aspect_ratio": aspect_ratio_from_dimensions(payload.request.width, payload.request.height),
                 "response_format": "url",
                 "image_size": nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
+                "size": format!("{}x{}", payload.request.width, payload.request.height),
             }))
             .send()
             .await
