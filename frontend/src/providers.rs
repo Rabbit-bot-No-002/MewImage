@@ -426,7 +426,7 @@ async fn proxy_generate(
         }
     }
     Err(format!(
-        "代理不可用。带参考图生成必须经过 Rust 后端代理，请先启动后端：`cargo run -p mew-image-backend`。默认地址是 http://127.0.0.1:3000 。如果你当前只开了 `trunk serve` 或直接打开静态文件，那么纯文本生图还能直连，但带参考图的请求一定会失败。请求尝试记录：{}",
+        "代理不可用。当前版本的游客代理只允许访问受信任图像上游；带参考图生成也必须经过 Rust 后端。请先启动后端：`cargo run -p mew-image-backend`，并优先通过 http://127.0.0.1:3000 访问页面。如果你使用的是第三方中转站，还需要让部署者把域名加入受信任白名单。请求尝试记录：{}",
         if errors.is_empty() {
             "未知网络错误".into()
         } else {

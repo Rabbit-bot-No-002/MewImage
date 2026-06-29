@@ -8,6 +8,11 @@ pub struct AppConfig {
     pub database_url: String,
     pub frontend_dist: String,
     pub session_secure: bool,
+    pub allowed_web_origins: Vec<String>,
+    pub trusted_provider_hosts: Vec<String>,
+    pub enforce_provider_host_whitelist: bool,
+    pub enable_guest_proxy: bool,
+    pub require_login_for_custom_provider: bool,
     pub s3_bucket: String,
     pub s3_region: String,
     pub s3_endpoint: Option<String>,
@@ -27,6 +32,21 @@ impl AppConfig {
             session_secure: std::env::var("MEW_IMAGE_SESSION_SECURE")
                 .map(|value| value == "true")
                 .unwrap_or(false),
+            allowed_web_origins: parse_csv_env("MEW_IMAGE_ALLOWED_WEB_ORIGINS"),
+            trusted_provider_hosts: parse_csv_env("MEW_IMAGE_TRUSTED_PROVIDER_HOSTS"),
+            enforce_provider_host_whitelist: std::env::var(
+                "MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST",
+            )
+            .map(|value| value == "true")
+            .unwrap_or(false),
+            enable_guest_proxy: std::env::var("MEW_IMAGE_ENABLE_GUEST_PROXY")
+                .map(|value| value != "false")
+                .unwrap_or(true),
+            require_login_for_custom_provider: std::env::var(
+                "MEW_IMAGE_REQUIRE_LOGIN_FOR_CUSTOM_PROVIDER",
+            )
+            .map(|value| value != "false")
+            .unwrap_or(true),
             s3_bucket: std::env::var("MEW_IMAGE_S3_BUCKET").unwrap_or_default(),
             s3_region: std::env::var("MEW_IMAGE_S3_REGION").unwrap_or_else(|_| "auto".into()),
             s3_endpoint: std::env::var("MEW_IMAGE_S3_ENDPOINT").ok(),
@@ -43,4 +63,17 @@ pub struct AppState {
     pub s3: Option<S3Client>,
     pub http: reqwest::Client,
     pub provider_builtins: Vec<ProviderTemplate>,
+}
+
+fn parse_csv_env(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }

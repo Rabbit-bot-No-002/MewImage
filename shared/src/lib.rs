@@ -262,19 +262,11 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
     let is_google_official = base_url.contains("generativelanguage.googleapis.com");
 
     if config.provider_template_id == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID {
-        if config.endpoint_mode == ProviderEndpointMode::CustomJson {
-            config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
-            config.provider_kind = ProviderKind::OpenAiCompatible;
-            config.endpoint_mode = ProviderEndpointMode::CustomJson;
-            if config.model.trim().is_empty() {
-                config.model = "gemini-2.5-flash-image".into();
-            }
-            return;
-        }
         config.provider_kind = ProviderKind::OpenAiImage;
         config.endpoint_mode = match config.endpoint_mode {
             ProviderEndpointMode::ResponsesApi => ProviderEndpointMode::ResponsesApi,
-            _ => ProviderEndpointMode::ImagesApi,
+            ProviderEndpointMode::CustomJson => ProviderEndpointMode::ImagesApi,
+            ProviderEndpointMode::ImagesApi => ProviderEndpointMode::ImagesApi,
         };
         if config.base_url.trim().is_empty() {
             config.base_url = "https://api.openai.com".into();
@@ -321,9 +313,10 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
             if config.model.trim().is_empty() {
                 config.model = "gpt-image-2".into();
             }
-            if config.endpoint_mode == ProviderEndpointMode::CustomJson {
-                config.endpoint_mode = ProviderEndpointMode::ImagesApi;
-            }
+            config.endpoint_mode = match config.endpoint_mode {
+                ProviderEndpointMode::ResponsesApi => ProviderEndpointMode::ResponsesApi,
+                _ => ProviderEndpointMode::ImagesApi,
+            };
         }
         ProviderKind::NanoBanana => {
             if is_google_official {
@@ -939,22 +932,6 @@ pub struct UploadCompleteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UploadCompleteResponse {
     pub asset: ImageAssetRef,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProxyInvokeRequest {
-    pub url: String,
-    pub method: String,
-    pub headers: BTreeMap<String, String>,
-    pub body_base64: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProxyInvokeResponse {
-    pub status: u16,
-    pub content_type: Option<String>,
-    pub headers: BTreeMap<String, String>,
-    pub body_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

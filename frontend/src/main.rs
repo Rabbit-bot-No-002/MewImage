@@ -3,7 +3,11 @@ mod crypto;
 mod providers;
 mod storage;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet},
+    rc::Rc,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gloo_file::{File, futures::read_as_bytes, futures::read_as_data_url};
@@ -14,17 +18,18 @@ use mew_image_shared::{
     AppPreferences, AuthRequest, AuthResponse, BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
     ConversationThread, EncryptedApiConfig, ImageAssetRef, LocalAppState, LocalTaskRecord,
     MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind, ProviderTemplate,
-    ProxyInvokeRequest, ProxyInvokeResponse, SyncCheckpoint, SyncPullResponse, TaskStatus,
-    ThemePreference, UserSummary, clamp_size, new_id, normalize_api_config, now_rfc3339,
+    SyncCheckpoint, SyncPullResponse, TaskStatus, ThemePreference, UserSummary, clamp_size,
+    new_id, normalize_api_config, now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
     prepare_sync_envelope,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use storage::{
-    delete_asset_payloads, load_asset_payloads, load_snapshot, save_asset_payloads, save_configs,
-    save_snapshot,
+    apply_asset_payload_changes, load_asset_payloads, load_snapshot, save_ui_state,
+    save_workspace_snapshot,
 };
 use wasm_bindgen::{JsCast, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
@@ -100,6 +105,12 @@ struct FloatingTipState {
     persistent: bool,
 }
 
+#[derive(Deserialize)]
+struct FetchImageResponse {
+    mime_type: String,
+    body_base64: String,
+}
+
 #[component]
 fn MaterialSymbolIcon(name: &'static str, filled: bool) -> impl IntoView {
     view! {
@@ -150,7 +161,10 @@ fn App() -> impl IntoView {
     let aspect_ratio = RwSignal::new("1:1".to_string());
     let quality = RwSignal::new("high".to_string());
     let count = RwSignal::new(1u32);
-    let status_text = RwSignal::new("准备就绪，默认会优先使用代理兜底跨域问题。".to_string());
+    let status_text = RwSignal::new(
+        "准备就绪，当前默认是游客本地 + 受限代理模式：数据留在浏览器，本服务仅对受信任图像上游做临时中转。"
+            .to_string(),
+    );
     let generating = RwSignal::new(false);
     let syncing = RwSignal::new(false);
     let show_favorites_only = RwSignal::new(false);
@@ -176,40 +190,91 @@ fn App() -> impl IntoView {
     let failure_log_state = RwSignal::new(None::<FailureLogState>);
     let floating_tip_state = RwSignal::new(None::<FloatingTipState>);
     let floating_tip_token = RwSignal::new(0u64);
-    let persist_timer_id = RwSignal::new(None::<i32>);
+    let workspace_persist_scheduled = RwSignal::new(false);
+    let workspace_persist_inflight = RwSignal::new(false);
+    let workspace_persist_pending = RwSignal::new(false);
+    let ui_persist_scheduled = RwSignal::new(false);
+    let ui_persist_inflight = RwSignal::new(false);
+    let ui_persist_pending = RwSignal::new(false);
+    let payload_write_queue = RwSignal::new(HashMap::<String, String>::new());
+    let payload_delete_queue = RwSignal::new(HashSet::<String>::new());
+    let payload_flush_scheduled = RwSignal::new(false);
+    let payload_flush_inflight = RwSignal::new(false);
+    let payload_flush_pending = RwSignal::new(false);
     let persist_state = {
-        let configs = configs;
         let tasks = tasks;
         let threads = threads;
         let assets = assets;
-        let preferences = preferences;
         let checkpoint = checkpoint;
         move || {
-            if persist_timer_id.get_untracked().is_some() {
+            request_workspace_persist(
+                tasks,
+                threads,
+                assets,
+                checkpoint,
+                workspace_persist_scheduled,
+                workspace_persist_inflight,
+                workspace_persist_pending,
+            );
+        }
+    };
+    let persist_ui_state = {
+        let configs = configs;
+        let preferences = preferences;
+        move || {
+            request_ui_state_persist(
+                configs,
+                preferences,
+                ui_persist_scheduled,
+                ui_persist_inflight,
+                ui_persist_pending,
+            );
+        }
+    };
+    let enqueue_payload_writes = {
+        move |payloads: Vec<(String, String)>| {
+            if payloads.is_empty() {
                 return;
             }
-            let Some(window) = web_sys::window() else {
-                return;
-            };
-            let callback = Closure::<dyn FnMut()>::once(move || {
-                persist_timer_id.set(None);
-                let snapshot =
-                    snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
-                let payloads = asset_payload_pairs(&snapshot.assets);
-                let mut metadata_snapshot = snapshot.clone();
-                metadata_snapshot.assets = strip_asset_payloads_for_snapshot(&snapshot.assets);
-                spawn_local(async move {
-                    let _ = save_asset_payloads(&payloads).await;
-                    let _ = save_snapshot(&metadata_snapshot).await;
-                });
+            payload_write_queue.update(|queued| {
+                for (asset_id, data_url) in payloads {
+                    payload_delete_queue.update(|deletes| {
+                        deletes.remove(&asset_id);
+                    });
+                    queued.insert(asset_id, data_url);
+                }
             });
-            if let Ok(timer_id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                callback.as_ref().unchecked_ref(),
-                480,
-            ) {
-                persist_timer_id.set(Some(timer_id));
-                callback.forget();
+            request_payload_flush(
+                payload_write_queue,
+                payload_delete_queue,
+                payload_flush_scheduled,
+                payload_flush_inflight,
+                payload_flush_pending,
+            );
+        }
+    };
+    let enqueue_payload_deletes = {
+        move |asset_ids: Vec<String>| {
+            if asset_ids.is_empty() {
+                return;
             }
+            payload_write_queue.update(|queued| {
+                for asset_id in &asset_ids {
+                    queued.remove(asset_id);
+                }
+            });
+            payload_delete_queue.update(|queued| {
+                for asset_id in asset_ids {
+                    queued.insert(asset_id);
+                }
+            });
+            request_payload_flush(
+                payload_write_queue,
+                payload_delete_queue,
+                payload_flush_scheduled,
+                payload_flush_inflight,
+                payload_flush_pending,
+            );
         }
     };
 
@@ -315,6 +380,14 @@ fn App() -> impl IntoView {
         let status_text = status_text;
         let tasks_signal = tasks;
         let assets_signal = assets;
+        let payload_write_queue = payload_write_queue;
+        let payload_delete_queue = payload_delete_queue;
+        let payload_flush_scheduled = payload_flush_scheduled;
+        let payload_flush_inflight = payload_flush_inflight;
+        let payload_flush_pending = payload_flush_pending;
+        let workspace_persist_scheduled = workspace_persist_scheduled;
+        let workspace_persist_inflight = workspace_persist_inflight;
+        let workspace_persist_pending = workspace_persist_pending;
         async move {
             let state = load_snapshot().await.unwrap_or_else(|_| {
                 let mut next = LocalAppState::default();
@@ -373,15 +446,29 @@ fn App() -> impl IntoView {
 
             let tasks_for_thumbs = state.tasks.clone();
             let mut assets_for_thumbs = state.assets.clone();
-            let mut snapshot_for_thumbs = state.clone();
             let initial_payloads = asset_payload_pairs(&state.assets);
             if had_embedded_payloads {
-                let mut stripped_snapshot = state.clone();
-                stripped_snapshot.assets = strip_asset_payloads_for_snapshot(&state.assets);
-                spawn_local(async move {
-                    let _ = save_asset_payloads(&initial_payloads).await;
-                    let _ = save_snapshot(&stripped_snapshot).await;
+                payload_write_queue.update(|queued| {
+                    for (asset_id, data_url) in initial_payloads {
+                        queued.insert(asset_id, data_url);
+                    }
                 });
+                request_payload_flush(
+                    payload_write_queue,
+                    payload_delete_queue,
+                    payload_flush_scheduled,
+                    payload_flush_inflight,
+                    payload_flush_pending,
+                );
+                request_workspace_persist(
+                    tasks_signal,
+                    threads,
+                    assets_signal,
+                    checkpoint,
+                    workspace_persist_scheduled,
+                    workspace_persist_inflight,
+                    workspace_persist_pending,
+                );
             }
             let thumb_order = prioritized_asset_indexes_for_thread(
                 &assets_for_thumbs,
@@ -417,12 +504,28 @@ fn App() -> impl IntoView {
                 }
                 if changed {
                     assets_signal_for_thumbs.set(assets_for_thumbs.clone());
-                    snapshot_for_thumbs.assets = assets_for_thumbs;
-                    let payloads = asset_payload_pairs(&snapshot_for_thumbs.assets);
-                    snapshot_for_thumbs.assets =
-                        strip_asset_payloads_for_snapshot(&snapshot_for_thumbs.assets);
-                    let _ = save_asset_payloads(&payloads).await;
-                    let _ = save_snapshot(&snapshot_for_thumbs).await;
+                    let payloads = asset_payload_pairs(&assets_for_thumbs);
+                    payload_write_queue.update(|queued| {
+                        for (asset_id, data_url) in payloads {
+                            queued.insert(asset_id, data_url);
+                        }
+                    });
+                    request_payload_flush(
+                        payload_write_queue,
+                        payload_delete_queue,
+                        payload_flush_scheduled,
+                        payload_flush_inflight,
+                        payload_flush_pending,
+                    );
+                    request_workspace_persist(
+                        tasks_signal,
+                        threads,
+                        assets_signal_for_thumbs,
+                        checkpoint,
+                        workspace_persist_scheduled,
+                        workspace_persist_inflight,
+                        workspace_persist_pending,
+                    );
                 }
                 status_text_for_thumbs.set("本地工作台已恢复，可以直接开始生成或继续修改。".into());
             });
@@ -735,7 +838,7 @@ fn App() -> impl IntoView {
                 config.updated_at = now_rfc3339();
             }
         });
-        persist_state();
+        persist_ui_state();
     };
 
     let commit_current_thread_draft = move || {
@@ -829,6 +932,7 @@ fn App() -> impl IntoView {
                             checkpoint_signal,
                         );
                         persist();
+                        persist_ui_state();
                         status_signal.set(format!("已完成与 {} 的云端同步。", user.username));
                     }
                     Err(error) => status_signal.set(format!("同步响应解析失败：{error}")),
@@ -874,7 +978,7 @@ fn App() -> impl IntoView {
                         sync_secret.set(password);
                         auth_user.set(Some(auth.user.clone()));
                         status_text.set(format!(
-                            "欢迎，{}。现在可以进行跨设备同步。",
+                            "欢迎，{}。现在可以手动进行跨设备同步。",
                             auth.user.username
                         ));
                     }
@@ -906,10 +1010,7 @@ fn App() -> impl IntoView {
                 current_config_id.set(last.id.clone());
             }
         });
-        let configs_snapshot = configs.get_untracked();
-        spawn_local(async move {
-            let _ = save_configs(&configs_snapshot).await;
-        });
+        persist_ui_state();
     };
 
     let delete_config = move |_| {
@@ -933,10 +1034,7 @@ fn App() -> impl IntoView {
             .map(|config| config.id.clone())
             .unwrap_or_default();
         current_config_id.set(next_id);
-        let configs_snapshot = configs.get_untracked();
-        spawn_local(async move {
-            let _ = save_configs(&configs_snapshot).await;
-        });
+        persist_ui_state();
     };
 
     let new_thread = move |_| {
@@ -1023,10 +1121,7 @@ fn App() -> impl IntoView {
             });
         });
         if !removed_asset_ids.is_empty() {
-            let removed_asset_ids_for_store = removed_asset_ids.clone();
-            spawn_local(async move {
-                let _ = delete_asset_payloads(&removed_asset_ids_for_store).await;
-            });
+            enqueue_payload_deletes(removed_asset_ids.clone());
         }
         threads.update(|items| {
             items.retain(|thread| thread.id != thread_id);
@@ -1114,7 +1209,7 @@ fn App() -> impl IntoView {
                     let imported_ids: Vec<String> =
                         imported.iter().map(|asset| asset.id.clone()).collect();
                     assets_signal.update(|items| items.extend(imported));
-                    let _ = save_asset_payloads(&payloads).await;
+                    enqueue_payload_writes(payloads);
                     selected_reference_ids.update(|current| {
                         for id in reused_ids.iter().chain(imported_ids.iter()) {
                             if !current.contains(&id) {
@@ -1164,7 +1259,6 @@ fn App() -> impl IntoView {
             let item = ids.remove(from_index);
             ids.insert(to_index, item);
         });
-        persist_state();
     };
 
     let delete_asset = move |asset_id: String| {
@@ -1186,9 +1280,7 @@ fn App() -> impl IntoView {
             continuation_asset_id.set(None);
         }
         let removed_asset_ids = vec![asset_id.clone()];
-        spawn_local(async move {
-            let _ = delete_asset_payloads(&removed_asset_ids).await;
-        });
+        enqueue_payload_deletes(removed_asset_ids);
         persist_state();
         status_text.set("参考图已删除。".into());
     };
@@ -1266,10 +1358,7 @@ fn App() -> impl IntoView {
             }
         }
         if !removed_asset_ids.is_empty() {
-            let removed_asset_ids_for_store = removed_asset_ids.clone();
-            spawn_local(async move {
-                let _ = delete_asset_payloads(&removed_asset_ids_for_store).await;
-            });
+            enqueue_payload_deletes(removed_asset_ids.clone());
         }
         persist_state();
         status_text.set("历史记录已删除。".into());
@@ -1622,7 +1711,7 @@ fn App() -> impl IntoView {
                         .unwrap_or((resolved_width, resolved_height));
                     let first_generated_id = produced_assets.first().map(|asset| asset.id.clone());
                     let produced_payloads = asset_payload_pairs(&produced_assets);
-                    let _ = save_asset_payloads(&produced_payloads).await;
+                    enqueue_payload_writes(produced_payloads);
                     assets_signal.update(|items| {
                         items.extend(produced_assets);
                     });
@@ -1678,7 +1767,7 @@ fn App() -> impl IntoView {
             <header class="panel topbar">
                 <div class="brand brand-inline">
                     <h1>"MewImage"</h1>
-                    <span class="muted">"本地优先、同步增强、代理兜底"</span>
+                    <span class="muted">"游客本地、登录手动同步、代理兜底"</span>
                 </div>
                 <div class="row topbar-actions">
                     <button class="button ghost" on:click=move |_| {
@@ -1689,7 +1778,7 @@ fn App() -> impl IntoView {
                                 ThemePreference::Day
                             };
                         });
-                        persist_state();
+                        persist_ui_state();
                     }>
                         {move || if preferences.get().theme == ThemePreference::Day { "夜间模式" } else { "白天模式" }}
                     </button>
@@ -1707,8 +1796,17 @@ fn App() -> impl IntoView {
                                 <section class="stack">
                                     <div class="row">
                                         <h2>"账号与同步"</h2>
-                                        <span class="tag">{move || auth_user.get().map(|user| user.username).unwrap_or_else(|| "游客模式".into())}</span>
+                                        <span class="tag">{move || auth_user.get().map(|user| user.username).unwrap_or_else(|| "游客本地 + 受限代理模式".into())}</span>
                                     </div>
+                                    <p class="status">
+                                        {move || {
+                                            if auth_user.get().is_some() {
+                                                "已登录：本地继续优先，只有点击“立即同步”才会上云。".to_string()
+                                            } else {
+                                                "未登录：会话、历史、参考图和配置都保存在当前浏览器；代理仅临时中转请求，不写入云端同步或对象存储。".to_string()
+                                            }
+                                        }}
+                                    </p>
                                     <input
                                         class="text-input"
                                         placeholder="用户名"
@@ -1757,12 +1855,7 @@ fn App() -> impl IntoView {
                                         current_config_id=current_config_id
                                         current_config_snapshot=current_config
                                         templates=templates
-                                        save_configs_only=move || {
-                                            let configs_snapshot = configs.get_untracked();
-                                            spawn_local(async move {
-                                                let _ = save_configs(&configs_snapshot).await;
-                                            });
-                                        }
+                                        save_configs_only=move || persist_ui_state()
                                     />
                                 </section>
                             </div>
@@ -2207,7 +2300,7 @@ fn App() -> impl IntoView {
                                                     config.updated_at = now_rfc3339();
                                                 }
                                             });
-                                            persist_state();
+                                            persist_ui_state();
                                         }
                                     />
                                     <select
@@ -2234,7 +2327,7 @@ fn App() -> impl IntoView {
                                                     config.updated_at = now_rfc3339();
                                                 }
                                             });
-                                            persist_state();
+                                            persist_ui_state();
                                         }
                                     >
                                         <option value="on">"Codex 兼容：开"</option>
@@ -2455,7 +2548,6 @@ fn App() -> impl IntoView {
                                                             ids.push(toggle_reference_id.clone());
                                                         }
                                                     });
-                                                    persist_state();
                                                 }>
                                                     {move || if selected_reference_ids.get().contains(&toggle_reference_label_id) { "取消参考" } else { "设为参考" }}
                                                 </button>
@@ -2789,8 +2881,8 @@ fn App() -> impl IntoView {
                                     }>"复用配置"</button>
                                     <button class="button secondary" on:click=move |_| edit_output_asset(edit_task_id.clone(), edit_asset_id.clone())>"编辑输出"</button>
                                     <button class="button ghost danger" on:click=move |_| {
-                                        delete_task(delete_task_id.clone());
                                         close_preview();
+                                        delete_task(delete_task_id.clone());
                                     }>"删除记录"</button>
                                     <button class="button ghost" on:click=move |_| {
                                         tasks.update(|items| {
@@ -3491,6 +3583,188 @@ async fn ensure_asset_payloads_loaded(
     Ok(())
 }
 
+fn schedule_background_task(callback: impl FnOnce() + 'static) {
+    let Some(window) = web_sys::window() else {
+        callback();
+        return;
+    };
+    let callback = Rc::new(RefCell::new(Some(
+        Box::new(callback) as Box<dyn FnOnce()>,
+    )));
+    if let Ok(idle_callback) = Reflect::get(
+        window.as_ref(),
+        &wasm_bindgen::JsValue::from_str("requestIdleCallback"),
+    ) {
+        if idle_callback.is_function() {
+            let idle_callback: Function = idle_callback.unchecked_into();
+            let callback_for_idle = callback.clone();
+            let idle_closure = Closure::<dyn FnMut(wasm_bindgen::JsValue)>::once(move |_| {
+                if let Some(callback) = callback_for_idle.borrow_mut().take() {
+                    callback();
+                }
+            });
+            if idle_callback
+                .call1(window.as_ref(), idle_closure.as_ref().unchecked_ref())
+                .is_ok()
+            {
+                idle_closure.forget();
+                return;
+            }
+        }
+    }
+    let callback_for_timeout = callback.clone();
+    let timeout_closure = Closure::<dyn FnMut()>::once(move || {
+        if let Some(callback) = callback_for_timeout.borrow_mut().take() {
+            callback();
+        }
+    });
+    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        timeout_closure.as_ref().unchecked_ref(),
+        900,
+    );
+    timeout_closure.forget();
+}
+
+fn request_workspace_persist(
+    tasks: RwSignal<Vec<LocalTaskRecord>>,
+    threads: RwSignal<Vec<ConversationThread>>,
+    assets: RwSignal<Vec<ImageAssetRef>>,
+    checkpoint: RwSignal<SyncCheckpoint>,
+    scheduled: RwSignal<bool>,
+    inflight: RwSignal<bool>,
+    pending: RwSignal<bool>,
+) {
+    pending.set(true);
+    if scheduled.get_untracked() || inflight.get_untracked() {
+        return;
+    }
+    scheduled.set(true);
+    schedule_background_task(move || {
+        scheduled.set(false);
+        if inflight.get_untracked() {
+            pending.set(true);
+            return;
+        }
+        if !pending.get_untracked() {
+            return;
+        }
+        pending.set(false);
+        inflight.set(true);
+        let snapshot = snapshot_workspace_state(tasks, threads, assets, checkpoint);
+        spawn_local(async move {
+            let _ = save_workspace_snapshot(&snapshot).await;
+            inflight.set(false);
+            if pending.get_untracked() {
+                request_workspace_persist(
+                    tasks, threads, assets, checkpoint, scheduled, inflight, pending,
+                );
+            }
+        });
+    });
+}
+
+fn request_ui_state_persist(
+    configs: RwSignal<Vec<EncryptedApiConfig>>,
+    preferences: RwSignal<AppPreferences>,
+    scheduled: RwSignal<bool>,
+    inflight: RwSignal<bool>,
+    pending: RwSignal<bool>,
+) {
+    pending.set(true);
+    if scheduled.get_untracked() || inflight.get_untracked() {
+        return;
+    }
+    scheduled.set(true);
+    schedule_background_task(move || {
+        scheduled.set(false);
+        if inflight.get_untracked() {
+            pending.set(true);
+            return;
+        }
+        if !pending.get_untracked() {
+            return;
+        }
+        pending.set(false);
+        inflight.set(true);
+        let configs_snapshot = configs.get_untracked();
+        let preferences_snapshot = preferences.get_untracked();
+        spawn_local(async move {
+            let _ = save_ui_state(&configs_snapshot, &preferences_snapshot).await;
+            inflight.set(false);
+            if pending.get_untracked() {
+                request_ui_state_persist(configs, preferences, scheduled, inflight, pending);
+            }
+        });
+    });
+}
+
+fn request_payload_flush(
+    payload_write_queue: RwSignal<HashMap<String, String>>,
+    payload_delete_queue: RwSignal<HashSet<String>>,
+    scheduled: RwSignal<bool>,
+    inflight: RwSignal<bool>,
+    pending: RwSignal<bool>,
+) {
+    pending.set(true);
+    if scheduled.get_untracked() || inflight.get_untracked() {
+        return;
+    }
+    scheduled.set(true);
+    schedule_background_task(move || {
+        scheduled.set(false);
+        if inflight.get_untracked() {
+            pending.set(true);
+            return;
+        }
+        if !pending.get_untracked() {
+            return;
+        }
+        let writes = payload_write_queue.with_untracked(|queued| {
+            queued
+                .iter()
+                .map(|(asset_id, data_url)| (asset_id.clone(), data_url.clone()))
+                .collect::<Vec<_>>()
+        });
+        let deletes = payload_delete_queue.with_untracked(|queued| {
+            queued.iter().cloned().collect::<Vec<_>>()
+        });
+        if writes.is_empty() && deletes.is_empty() {
+            pending.set(false);
+            return;
+        }
+        pending.set(false);
+        inflight.set(true);
+        spawn_local(async move {
+            let _ = apply_asset_payload_changes(&writes, &deletes).await;
+            payload_write_queue.update(|queued| {
+                for (asset_id, data_url) in &writes {
+                    if queued.get(asset_id) == Some(data_url) {
+                        queued.remove(asset_id);
+                    }
+                }
+            });
+            payload_delete_queue.update(|queued| {
+                for asset_id in &deletes {
+                    queued.remove(asset_id);
+                }
+            });
+            inflight.set(false);
+            if pending.get_untracked()
+                || !payload_write_queue.with_untracked(|queued| queued.is_empty())
+                || !payload_delete_queue.with_untracked(|queued| queued.is_empty())
+            {
+                request_payload_flush(
+                    payload_write_queue,
+                    payload_delete_queue,
+                    scheduled,
+                    inflight,
+                    pending,
+                );
+            }
+        });
+    });
+}
+
 fn snapshot_local_state(
     configs: RwSignal<Vec<EncryptedApiConfig>>,
     tasks: RwSignal<Vec<LocalTaskRecord>>,
@@ -3500,11 +3774,27 @@ fn snapshot_local_state(
     checkpoint: RwSignal<SyncCheckpoint>,
 ) -> LocalAppState {
     LocalAppState {
-        configs: configs.get_untracked(),
-        tasks: tasks.get_untracked(),
-        threads: threads.get_untracked(),
-        assets: assets.get_untracked(),
+        configs: configs.with_untracked(|items| items.clone()),
+        tasks: tasks.with_untracked(|items| items.clone()),
+        threads: threads.with_untracked(|items| items.clone()),
+        assets: assets.with_untracked(|items| items.clone()),
         preferences: preferences.get_untracked(),
+        checkpoint: checkpoint.get_untracked(),
+    }
+}
+
+fn snapshot_workspace_state(
+    tasks: RwSignal<Vec<LocalTaskRecord>>,
+    threads: RwSignal<Vec<ConversationThread>>,
+    assets: RwSignal<Vec<ImageAssetRef>>,
+    checkpoint: RwSignal<SyncCheckpoint>,
+) -> LocalAppState {
+    LocalAppState {
+        configs: Vec::new(),
+        tasks: tasks.with_untracked(|items| items.clone()),
+        threads: threads.with_untracked(|items| items.clone()),
+        assets: assets.with_untracked(|items| strip_asset_payloads_for_snapshot(items)),
+        preferences: AppPreferences::default(),
         checkpoint: checkpoint.get_untracked(),
     }
 }
@@ -3938,43 +4228,6 @@ async fn thumbnail_data_url_from_asset(
         .map_err(|error| format!("生成缩略图失败：{error:?}"))
 }
 
-async fn fetch_image_bytes_via_proxy(src: &str) -> Result<(Vec<u8>, String), String> {
-    let mut headers = BTreeMap::new();
-    headers.insert("Accept".into(), "image/*".into());
-    let response = Request::post(&api_url("/api/proxy/forward"))
-        .credentials(web_sys::RequestCredentials::Include)
-        .json(&ProxyInvokeRequest {
-            url: src.to_string(),
-            method: "GET".into(),
-            headers,
-            body_base64: None,
-        })
-        .map_err(|error| error.to_string())?
-        .send()
-        .await
-        .map_err(|error| format!("代理下载图片失败：{error}"))?;
-    if !response.ok() {
-        return Err(response
-            .text()
-            .await
-            .unwrap_or_else(|_| "代理下载图片失败".into()));
-    }
-    let payload = response
-        .json::<ProxyInvokeResponse>()
-        .await
-        .map_err(|error| format!("代理下载图片响应解析失败：{error}"))?;
-    if payload.status >= 400 {
-        return Err(format!("代理下载图片失败：上游返回 {}", payload.status));
-    }
-    let bytes = BASE64
-        .decode(payload.body_base64)
-        .map_err(|error| format!("代理图片 Base64 解码失败：{error}"))?;
-    Ok((
-        bytes,
-        payload.content_type.unwrap_or_else(|| "image/png".into()),
-    ))
-}
-
 pub(crate) async fn fetch_image_bytes(src: &str) -> Result<(Vec<u8>, String), String> {
     if let Some((prefix, payload)) = src.split_once(',') {
         let mime_type = prefix
@@ -3990,7 +4243,7 @@ pub(crate) async fn fetch_image_bytes(src: &str) -> Result<(Vec<u8>, String), St
         return Ok((bytes, mime_type));
     }
     if src.starts_with("http://") || src.starts_with("https://") {
-        return fetch_image_bytes_via_proxy(src).await;
+        return fetch_remote_image_bytes(src).await;
     }
     let request_url = if src.starts_with("/api/") {
         api_url(src)
@@ -4001,6 +4254,52 @@ pub(crate) async fn fetch_image_bytes(src: &str) -> Result<(Vec<u8>, String), St
         .send()
         .await
         .map_err(|error| format!("下载图片失败：{error}"))?;
+    let mime_type = response
+        .headers()
+        .get("content-type")
+        .unwrap_or_else(|| "image/png".into());
+    let bytes = response
+        .binary()
+        .await
+        .map_err(|error| format!("读取图片失败：{error}"))?;
+    Ok((bytes, mime_type))
+}
+
+async fn fetch_remote_image_bytes(src: &str) -> Result<(Vec<u8>, String), String> {
+    if let Ok(result) = fetch_image_bytes_direct(src).await {
+        return Ok(result);
+    }
+    let response = Request::post(&api_url("/api/images/fetch"))
+        .credentials(web_sys::RequestCredentials::Include)
+        .json(&serde_json::json!({ "url": src }))
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| format!("代理下载图片失败：{error}"))?;
+    if !response.ok() {
+        return Err(response
+            .text()
+            .await
+            .unwrap_or_else(|_| "代理下载图片失败".into()));
+    }
+    let payload = response
+        .json::<FetchImageResponse>()
+        .await
+        .map_err(|error| format!("代理下载图片响应解析失败：{error}"))?;
+    let bytes = BASE64
+        .decode(payload.body_base64)
+        .map_err(|error| format!("代理图片 Base64 解码失败：{error}"))?;
+    Ok((bytes, payload.mime_type))
+}
+
+async fn fetch_image_bytes_direct(src: &str) -> Result<(Vec<u8>, String), String> {
+    let response = Request::get(src)
+        .send()
+        .await
+        .map_err(|error| format!("下载图片失败：{error}"))?;
+    if !response.ok() {
+        return Err(format!("下载图片失败：HTTP {}", response.status()));
+    }
     let mime_type = response
         .headers()
         .get("content-type")

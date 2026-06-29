@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mew_image_shared::{EncryptedApiConfig, LocalAppState};
+use mew_image_shared::{AppPreferences, EncryptedApiConfig, LocalAppState};
 use rexie::{ObjectStore, Rexie, TransactionMode};
 use wasm_bindgen::JsValue;
 
@@ -9,6 +9,7 @@ const STORE_NAME: &str = "kv";
 const ASSET_STORE_NAME: &str = "asset_payloads";
 const SNAPSHOT_KEY: &str = "app_state";
 const CONFIGS_KEY: &str = "configs_state";
+const PREFERENCES_KEY: &str = "preferences_state";
 
 async fn open_db() -> Result<Rexie, String> {
     Rexie::builder(DB_NAME)
@@ -36,6 +37,10 @@ pub async fn load_snapshot() -> Result<LocalAppState, String> {
         .get(JsValue::from_str(CONFIGS_KEY))
         .await
         .map_err(|error| error.to_string())?;
+    let preferences_value = store
+        .get(JsValue::from_str(PREFERENCES_KEY))
+        .await
+        .map_err(|error| error.to_string())?;
     transaction
         .done()
         .await
@@ -48,10 +53,14 @@ pub async fn load_snapshot() -> Result<LocalAppState, String> {
     if let Some(value) = configs_value {
         state.configs = serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())?;
     }
+    if let Some(value) = preferences_value {
+        state.preferences =
+            serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())?;
+    }
     Ok(state)
 }
 
-pub async fn save_snapshot(state: &LocalAppState) -> Result<(), String> {
+pub async fn save_workspace_snapshot(state: &LocalAppState) -> Result<(), String> {
     let db = open_db().await?;
     let transaction = db
         .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
@@ -73,7 +82,10 @@ pub async fn save_snapshot(state: &LocalAppState) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn save_configs(configs: &[EncryptedApiConfig]) -> Result<(), String> {
+pub async fn save_ui_state(
+    configs: &[EncryptedApiConfig],
+    preferences: &AppPreferences,
+) -> Result<(), String> {
     let db = open_db().await?;
     let transaction = db
         .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
@@ -88,6 +100,13 @@ pub async fn save_configs(configs: &[EncryptedApiConfig]) -> Result<(), String> 
         )
         .await
         .map_err(|error| error.to_string())?;
+    store
+        .put(
+            &serde_wasm_bindgen::to_value(preferences).map_err(|error| error.to_string())?,
+            Some(&JsValue::from_str(PREFERENCES_KEY)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     transaction
         .done()
         .await
@@ -95,8 +114,11 @@ pub async fn save_configs(configs: &[EncryptedApiConfig]) -> Result<(), String> 
     Ok(())
 }
 
-pub async fn save_asset_payloads(payloads: &[(String, String)]) -> Result<(), String> {
-    if payloads.is_empty() {
+pub async fn apply_asset_payload_changes(
+    payload_writes: &[(String, String)],
+    payload_deletes: &[String],
+) -> Result<(), String> {
+    if payload_writes.is_empty() && payload_deletes.is_empty() {
         return Ok(());
     }
     let db = open_db().await?;
@@ -106,7 +128,13 @@ pub async fn save_asset_payloads(payloads: &[(String, String)]) -> Result<(), St
     let store = transaction
         .store(ASSET_STORE_NAME)
         .map_err(|error| error.to_string())?;
-    for (asset_id, data_url) in payloads {
+    for asset_id in payload_deletes {
+        store
+            .delete(JsValue::from_str(asset_id))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    for (asset_id, data_url) in payload_writes {
         store
             .put(
                 &JsValue::from_str(data_url),
@@ -148,28 +176,4 @@ pub async fn load_asset_payloads(asset_ids: &[String]) -> Result<HashMap<String,
         .await
         .map_err(|error| error.to_string())?;
     Ok(loaded)
-}
-
-pub async fn delete_asset_payloads(asset_ids: &[String]) -> Result<(), String> {
-    if asset_ids.is_empty() {
-        return Ok(());
-    }
-    let db = open_db().await?;
-    let transaction = db
-        .transaction(&[ASSET_STORE_NAME], TransactionMode::ReadWrite)
-        .map_err(|error| error.to_string())?;
-    let store = transaction
-        .store(ASSET_STORE_NAME)
-        .map_err(|error| error.to_string())?;
-    for asset_id in asset_ids {
-        store
-            .delete(JsValue::from_str(asset_id))
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    transaction
-        .done()
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(())
 }

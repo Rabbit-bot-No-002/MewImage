@@ -1,6 +1,11 @@
 mod state;
 
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::Arc,
+};
 
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
@@ -22,9 +27,9 @@ use chrono::{Duration, Utc};
 use mew_image_shared::{
     AuthRequest, AuthResponse, GenerateViaProxyRequest, GeneratedImageResult, GenerationResult,
     ImageAssetRef, MeResponse, MergePreviewResponse, ParameterSnapshot, ProviderEndpointMode,
-    ProviderKind, ProviderTemplate, ProviderTemplateImportRequest, ProxyInvokeRequest,
-    ProxyInvokeResponse, SyncEnvelope, SyncPullResponse, SyncPushRequest, UploadCompleteRequest,
-    UploadCompleteResponse, UploadInitRequest, UploadInitResponse, UserSummary,
+    ProviderKind, ProviderTemplate, ProviderTemplateImportRequest, SyncEnvelope,
+    SyncPullResponse, SyncPushRequest, UploadCompleteRequest, UploadCompleteResponse,
+    UploadInitRequest, UploadInitResponse, UserSummary,
     aspect_ratio_from_dimensions, extract_gemini_generation_result,
     extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes, new_id,
     nano_banana_image_size_from_dimensions, now_rfc3339,
@@ -40,11 +45,13 @@ use sqlx::{
 use state::{AppConfig, AppState};
 use tokio::net::TcpListener;
 use tower_http::{
-    cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer},
+    cors::{AllowHeaders, AllowOrigin, CorsLayer},
     services::ServeDir,
     trace::TraceLayer,
 };
-use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+use tower_sessions::{ExpiredDeletion, Session, SessionManagerLayer};
+use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
+use tower_sessions_sqlx_store::SqliteStore;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -80,9 +87,22 @@ async fn main() -> anyhow::Result<()> {
         provider_builtins: builtins,
     });
 
-    let session_layer = SessionManagerLayer::new(MemoryStore::default())
+    let session_pool = SessionSqlitePool::connect(&config.database_url).await?;
+    let session_store = SqliteStore::new(session_pool)
+        .with_table_name("mew_image_sessions")
+        .map_err(anyhow::Error::msg)?;
+    session_store.migrate().await?;
+    tokio::spawn(
+        session_store
+            .clone()
+            .continuously_delete_expired(std::time::Duration::from_secs(900)),
+    );
+
+    let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(config.session_secure)
         .with_same_site(tower_sessions::cookie::SameSite::Lax);
+
+    let cors_layer = build_cors_layer(&config)?;
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -102,19 +122,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/assets/upload/{token}", put(upload_bytes))
         .route("/api/assets/complete", post(upload_complete))
         .route("/api/assets/{asset_id}", get(get_asset))
-        .route("/api/proxy/forward", post(proxy_forward))
+        .route("/api/images/fetch", post(fetch_image_via_proxy))
         .fallback_service(
             ServeDir::new(&config.frontend_dist).append_index_html_on_directories(true),
         )
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_credentials(true)
-                .allow_headers(AllowHeaders::mirror_request())
-                .allow_methods(AllowMethods::mirror_request())
-                .allow_origin(AllowOrigin::mirror_request()),
-        )
+        .layer(cors_layer)
         .layer(session_layer)
         .with_state(state);
 
@@ -203,6 +217,35 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query(statement).execute(db).await?;
     }
     Ok(())
+}
+
+fn build_cors_layer(config: &AppConfig) -> anyhow::Result<CorsLayer> {
+    let origins = if config.allowed_web_origins.is_empty() {
+        vec![
+            "http://127.0.0.1:3000".to_string(),
+            "http://localhost:3000".to_string(),
+            "http://127.0.0.1:8080".to_string(),
+            "http://localhost:8080".to_string(),
+        ]
+    } else {
+        config.allowed_web_origins.clone()
+    };
+
+    let origin_headers = origins
+        .into_iter()
+        .map(|origin| HeaderValue::from_str(&origin))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(CorsLayer::new()
+        .allow_credentials(true)
+        .allow_headers(AllowHeaders::mirror_request())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::OPTIONS,
+        ])
+        .allow_origin(AllowOrigin::list(origin_headers)))
 }
 
 async fn health() -> impl IntoResponse {
@@ -300,7 +343,7 @@ async fn sync_push(
 ) -> Result<Json<SyncPullResponse>, AppError> {
     let user = require_user(&state, &session).await?;
     let existing = load_sync_envelope(&state.db, &user.id).await?;
-    let normalized = normalize_envelope_assets(&state, Some(&user.id), payload.envelope).await?;
+    let normalized = normalize_envelope_assets(&state, &user.id, payload.envelope).await?;
     let merged = merge_envelopes(&existing, &normalized);
     let updated_at = now_rfc3339();
 
@@ -389,23 +432,25 @@ async fn import_provider_template(
     session: Session,
     Json(payload): Json<ProviderTemplateImportRequest>,
 ) -> Result<Json<ProviderTemplate>, AppError> {
-    validate_template(&payload.template)?;
+    let user = current_user(&state, &session).await?;
+    let user = user.ok_or_else(|| {
+        AppError::unauthorized("游客模式仅可使用内置模板；导入自定义服务商前请先登录。")
+    })?;
+    validate_template(&state, &payload.template, true)?;
 
-    if let Some(user) = current_user(&state, &session).await? {
-        let serialized = serde_json::to_string(&payload.template).map_err(AppError::internal)?;
-        sqlx::query(
-            "INSERT INTO provider_templates (id, user_id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
-        )
-        .bind(&payload.template.id)
-        .bind(&user.id)
-        .bind(serialized)
-        .bind(&payload.template.created_at)
-        .bind(&payload.template.updated_at)
-        .execute(&state.db)
-        .await
-        .map_err(AppError::internal)?;
-    }
+    let serialized = serde_json::to_string(&payload.template).map_err(AppError::internal)?;
+    sqlx::query(
+        "INSERT INTO provider_templates (id, user_id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+    )
+    .bind(&payload.template.id)
+    .bind(&user.id)
+    .bind(serialized)
+    .bind(&payload.template.created_at)
+    .bind(&payload.template.updated_at)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
 
     Ok(Json(payload.template))
 }
@@ -415,14 +460,12 @@ async fn upload_init(
     session: Session,
     Json(payload): Json<UploadInitRequest>,
 ) -> Result<Json<UploadInitResponse>, AppError> {
-    let user = current_user(&state, &session).await?;
+    let user = require_user(&state, &session).await?;
+    ensure_object_storage_ready(&state)?;
+    cleanup_expired_upload_tokens(&state.db).await?;
     let asset_id = new_id();
     let token = random_token();
-    let prefix = user
-        .as_ref()
-        .map(|user| user.id.clone())
-        .unwrap_or_else(|| "guest".into());
-    let object_key = format!("assets/{prefix}/{}-{}", payload.sha256, payload.file_name);
+    let object_key = format!("assets/{}/{}-{}", user.id, payload.sha256, payload.file_name);
     let expires_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
 
     sqlx::query(
@@ -431,7 +474,7 @@ async fn upload_init(
     )
     .bind(&token)
     .bind(&asset_id)
-    .bind(user.as_ref().map(|user| user.id.clone()))
+    .bind(&user.id)
     .bind(&object_key)
     .bind(&payload.mime_type)
     .bind(payload.byte_len as i64)
@@ -451,9 +494,13 @@ async fn upload_init(
 
 async fn upload_bytes(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Path(token): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &session).await?;
+    ensure_object_storage_ready(&state)?;
+    cleanup_expired_upload_tokens(&state.db).await?;
     let row = sqlx::query(
         "SELECT asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at FROM upload_tokens WHERE token = ?",
     )
@@ -464,6 +511,11 @@ async fn upload_bytes(
     let Some(row) = row else {
         return Err(AppError::not_found("上传凭证不存在"));
     };
+    let owner_id = row.get::<Option<String>, _>("user_id");
+    if owner_id.as_deref() != Some(user.id.as_str()) {
+        return Err(AppError::unauthorized("上传凭证不属于当前登录用户"));
+    }
+    ensure_upload_token_not_expired(&row)?;
 
     let expected_len = row.get::<i64, _>("byte_len") as usize;
     if expected_len != body.len() {
@@ -489,10 +541,14 @@ async fn upload_bytes(
 
 async fn upload_complete(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Json(payload): Json<UploadCompleteRequest>,
 ) -> Result<Json<UploadCompleteResponse>, AppError> {
+    let user = require_user(&state, &session).await?;
+    ensure_object_storage_ready(&state)?;
+    cleanup_expired_upload_tokens(&state.db).await?;
     let row = sqlx::query(
-        "SELECT asset_id, user_id, object_key, mime_type, byte_len, sha256 FROM upload_tokens WHERE token = ?",
+        "SELECT asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at FROM upload_tokens WHERE token = ?",
     )
     .bind(&payload.upload_token)
     .fetch_optional(&state.db)
@@ -501,6 +557,11 @@ async fn upload_complete(
     let Some(row) = row else {
         return Err(AppError::not_found("上传凭证不存在"));
     };
+    let owner_id = row.get::<Option<String>, _>("user_id");
+    if owner_id.as_deref() != Some(user.id.as_str()) {
+        return Err(AppError::unauthorized("上传凭证不属于当前登录用户"));
+    }
+    ensure_upload_token_not_expired(&row)?;
 
     let created_at = now_rfc3339();
     sqlx::query(
@@ -517,6 +578,11 @@ async fn upload_complete(
     .execute(&state.db)
     .await
     .map_err(AppError::internal)?;
+    sqlx::query("DELETE FROM upload_tokens WHERE token = ?")
+        .bind(&payload.upload_token)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
 
     let asset = ImageAssetRef {
         id: row.get("asset_id"),
@@ -538,9 +604,11 @@ async fn upload_complete(
 
 async fn get_asset(
     State(state): State<Arc<AppState>>,
+    session: Session,
     Path(asset_id): Path<String>,
 ) -> Result<Response, AppError> {
-    let row = sqlx::query("SELECT object_key, mime_type FROM assets WHERE id = ?")
+    let user = require_user(&state, &session).await?;
+    let row = sqlx::query("SELECT object_key, mime_type, user_id FROM assets WHERE id = ?")
         .bind(asset_id)
         .fetch_optional(&state.db)
         .await
@@ -548,11 +616,15 @@ async fn get_asset(
     let Some(row) = row else {
         return Err(AppError::not_found("资源不存在"));
     };
+    let owner_id = row.get::<Option<String>, _>("user_id");
+    if owner_id.as_deref() != Some(user.id.as_str()) {
+        return Err(AppError::unauthorized("当前登录用户无权访问该资源"));
+    }
 
     let client = state
         .s3
         .as_ref()
-        .ok_or_else(|| AppError::internal_message("对象存储未配置"))?;
+        .ok_or_else(|| AppError::bad_request("服务器未启用远程资源存储，当前资源无法读取。"))?;
     let output = client
         .get_object()
         .bucket(&state.config.s3_bucket)
@@ -576,67 +648,28 @@ async fn get_asset(
     Ok((StatusCode::OK, headers, bytes).into_response())
 }
 
-async fn proxy_forward(
+async fn fetch_image_via_proxy(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ProxyInvokeRequest>,
-) -> Result<Json<ProxyInvokeResponse>, AppError> {
-    let method: Method = payload
-        .method
-        .parse()
-        .map_err(|_| AppError::bad_request("无效的 HTTP 方法"))?;
-    let url = Url::parse(&payload.url).map_err(|_| AppError::bad_request("无效的目标地址"))?;
-
-    let mut request = state.http.request(method, url);
-    for (key, value) in &payload.headers {
-        if is_forbidden_header(key) {
-            continue;
-        }
-        request = request.header(key, value);
+    Json(payload): Json<FetchImageRequest>,
+) -> Result<Json<FetchImageResponse>, AppError> {
+    if !state.config.enable_guest_proxy {
+        return Err(AppError::unauthorized("当前部署已关闭游客代理。"));
     }
-
-    if let Some(body) = payload.body_base64 {
-        let bytes = BASE64
-            .decode(body)
-            .map_err(|_| AppError::bad_request("请求体 Base64 无效"))?;
-        request = request.body(bytes);
-    }
-
-    let response = request.send().await.map_err(|error| {
-        warn!("proxy request failed: {}", error);
-        AppError::bad_gateway("上游请求失败，可能是网络错误或接口拒绝访问")
-    })?;
-
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-
-    let mut headers = std::collections::BTreeMap::new();
-    for (key, value) in response.headers() {
-        if is_forbidden_header(key.as_str()) {
-            continue;
-        }
-        if let Ok(value) = value.to_str() {
-            headers.insert(key.to_string(), value.to_string());
-        }
-    }
-    let body = response.bytes().await.map_err(AppError::internal)?;
-
-    Ok(Json(ProxyInvokeResponse {
-        status,
-        content_type,
-        headers,
-        body_base64: BASE64.encode(body),
+    let (mime_type, bytes) = fetch_remote_image_bytes(&state, &payload.url).await?;
+    Ok(Json(FetchImageResponse {
+        mime_type,
+        body_base64: BASE64.encode(bytes),
     }))
 }
 
 async fn generate_via_proxy(
     State(state): State<Arc<AppState>>,
+    session: Session,
     multipart: Multipart,
 ) -> Result<Json<GenerationResult>, AppError> {
     let payload = parse_generate_multipart(multipart).await?;
+    let user = current_user(&state, &session).await?;
+    validate_generate_request(&state, user.as_ref(), &payload)?;
     let started_at = Utc::now();
     let response_json = match payload.template.kind {
         ProviderKind::OpenAiImage => invoke_openai_image(&state, &payload).await?,
@@ -646,13 +679,15 @@ async fn generate_via_proxy(
     };
 
     let duration_ms = (Utc::now() - started_at).num_milliseconds().max(0) as u64;
-    Ok(Json(extract_generation_result(
+    let result = extract_generation_result(
         &payload.template,
         payload.config.output_format.as_deref(),
         &payload.request,
         response_json,
         duration_ms,
-    )))
+    );
+    let result = hydrate_proxy_result_images(&state, result).await?;
+    Ok(Json(result))
 }
 
 async fn parse_generate_multipart(
@@ -787,7 +822,7 @@ async fn load_sync_envelope(db: &SqlitePool, user_id: &str) -> Result<SyncEnvelo
 
 async fn normalize_envelope_assets(
     state: &AppState,
-    user_id: Option<&str>,
+    user_id: &str,
     mut envelope: SyncEnvelope,
 ) -> Result<SyncEnvelope, AppError> {
     for config in &mut envelope.configs {
@@ -803,7 +838,7 @@ async fn normalize_envelope_assets(
             continue;
         };
         let (mime_type, bytes) = decode_data_url(&data_url)?;
-        let object_key = format!("assets/{}/{}.bin", user_id.unwrap_or("guest"), asset.sha256);
+        let object_key = format!("assets/{user_id}/{}.bin", asset.sha256);
         put_object(state, &object_key, &mime_type, bytes).await?;
         asset.remote_object_key = Some(object_key);
         asset.remote_url = Some(format!("/api/assets/{}", asset.id));
@@ -834,9 +869,10 @@ async fn put_object(
     mime_type: &str,
     bytes: Vec<u8>,
 ) -> Result<(), AppError> {
-    let Some(client) = state.s3.as_ref() else {
-        return Ok(());
-    };
+    let client = state
+        .s3
+        .as_ref()
+        .ok_or_else(|| AppError::bad_request("服务器未启用远程资源存储，当前操作不可用。"))?;
     client
         .put_object()
         .bucket(&state.config.s3_bucket)
@@ -875,16 +911,245 @@ fn verify_password(password: &str, password_hash: &str) -> Result<(), AppError> 
         .map_err(|_| AppError::unauthorized("用户名或密码错误"))
 }
 
-fn validate_template(template: &ProviderTemplate) -> Result<(), AppError> {
+#[derive(Debug, Clone)]
+struct ResolvedUpstreamTarget {
+    base_url: String,
+}
+
+fn validate_template(
+    state: &AppState,
+    template: &ProviderTemplate,
+    require_custom_host_whitelist: bool,
+) -> Result<(), AppError> {
     if template.name.trim().is_empty() {
         return Err(AppError::bad_request("模板名称不能为空"));
     }
     if template.base_url.trim().is_empty() {
         return Err(AppError::bad_request("模板基础地址不能为空"));
     }
-    if !template.base_url.starts_with("http") {
+    if !template.base_url.starts_with("http://") && !template.base_url.starts_with("https://") {
         return Err(AppError::bad_request("模板基础地址必须是 http/https"));
     }
+    if require_custom_host_whitelist {
+        resolve_upstream_target(
+            state,
+            template.kind,
+            &template.base_url,
+            true,
+            true,
+            require_custom_host_whitelist,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_generate_request(
+    state: &AppState,
+    user: Option<&UserSummary>,
+    payload: &GenerateViaProxyRequest,
+) -> Result<(), AppError> {
+    if user.is_none() && !state.config.enable_guest_proxy {
+        return Err(AppError::unauthorized(
+            "当前部署已关闭游客代理，请登录后再试。",
+        ));
+    }
+
+    let require_custom_login = matches!(payload.template.kind, ProviderKind::CustomHttp)
+        && state.config.require_login_for_custom_provider;
+    if require_custom_login && user.is_none() {
+        return Err(AppError::unauthorized(
+            "自定义服务商仅对登录用户开放，请先登录。",
+        ));
+    }
+
+    validate_template(
+        state,
+        &payload.template,
+        state.config.enforce_provider_host_whitelist
+            && matches!(
+                payload.template.kind,
+                ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp
+            ),
+    )?;
+    let _ = resolve_upstream_target(
+        state,
+        payload.template.kind,
+        &payload.config.base_url,
+        user.is_some(),
+        false,
+        state.config.enforce_provider_host_whitelist
+            && matches!(
+                payload.template.kind,
+                ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp
+            ),
+    )?;
+    Ok(())
+}
+
+fn resolve_provider_base_url(
+    state: &AppState,
+    kind: ProviderKind,
+    configured_base_url: &str,
+    user_present: bool,
+) -> Result<String, AppError> {
+    let default_base_url = match kind {
+        ProviderKind::OpenAiImage => Some("https://api.openai.com"),
+        ProviderKind::NanoBanana => Some("https://generativelanguage.googleapis.com"),
+        ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp => None,
+    };
+    let base_url = if configured_base_url.trim().is_empty() {
+        default_base_url.unwrap_or_default().to_string()
+    } else {
+        configured_base_url.trim().to_string()
+    };
+    if base_url.is_empty() {
+        return Err(AppError::bad_request("当前配置缺少 Base URL。"));
+    }
+
+    let target = resolve_upstream_target(
+        state,
+        kind,
+        &base_url,
+        user_present,
+        false,
+        state.config.enforce_provider_host_whitelist
+            && matches!(kind, ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp),
+    )?;
+    Ok(target.base_url)
+}
+
+fn resolve_upstream_target(
+    state: &AppState,
+    kind: ProviderKind,
+    base_url: &str,
+    user_present: bool,
+    require_https: bool,
+    enforce_custom_whitelist: bool,
+) -> Result<ResolvedUpstreamTarget, AppError> {
+    let url = Url::parse(base_url)
+        .map_err(|_| AppError::bad_request("当前配置的 Base URL 无效。"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::provider_target_blocked(
+            "仅允许 http/https 上游地址。",
+        ));
+    }
+    if require_https && url.scheme() != "https" {
+        return Err(AppError::provider_target_blocked(
+            "当前上游仅允许 HTTPS 地址。",
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::provider_target_blocked("当前上游地址缺少主机名。"))?
+        .to_ascii_lowercase();
+    reject_unsafe_host(&host)?;
+
+    let mut allowed_hosts = BTreeSet::new();
+    match kind {
+        ProviderKind::OpenAiImage => {
+            allowed_hosts.insert("api.openai.com".to_string());
+        }
+        ProviderKind::NanoBanana => {
+            allowed_hosts.insert("generativelanguage.googleapis.com".to_string());
+        }
+        ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp => {}
+    }
+    for host in &state.config.trusted_provider_hosts {
+        allowed_hosts.insert(host.to_ascii_lowercase());
+    }
+
+    let requires_trusted_host = enforce_custom_whitelist
+        || (state.config.enforce_provider_host_whitelist
+            && (!matches!(kind, ProviderKind::OpenAiImage | ProviderKind::NanoBanana)
+                || user_present));
+    if requires_trusted_host && !host_matches_allowlist(&host, &allowed_hosts) {
+        return Err(AppError::provider_target_blocked(format!(
+            "上游 `{host}` 不在受信任白名单中；可关闭 `MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST`，或将该域名加入 `MEW_IMAGE_TRUSTED_PROVIDER_HOSTS`。"
+        )));
+    }
+
+    Ok(ResolvedUpstreamTarget {
+        base_url: url.to_string().trim_end_matches('/').to_string(),
+    })
+}
+
+fn reject_unsafe_host(host: &str) -> Result<(), AppError> {
+    if matches!(host, "localhost" | "localhost.localdomain") {
+        return Err(AppError::provider_target_blocked(
+            "不允许访问本机或内网地址。",
+        ));
+    }
+    if host.ends_with(".local") || host.ends_with(".internal") {
+        return Err(AppError::provider_target_blocked(
+            "不允许访问本地或内部网络地址。",
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(AppError::provider_target_blocked(
+                "不允许访问本机、私网或链路本地 IP。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_private()
+                || ipv4.is_loopback()
+                || ipv4.is_link_local()
+                || ipv4.is_broadcast()
+                || ipv4.is_documentation()
+                || ipv4.octets()[0] == 0
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || ipv6.is_unique_local()
+                || ipv6.is_unicast_link_local()
+                || ipv6.segments()[0] == 0x2001 && ipv6.segments()[1] == 0x0db8
+        }
+    }
+}
+
+fn host_matches_allowlist(host: &str, allowed_hosts: &BTreeSet<String>) -> bool {
+    allowed_hosts.iter().any(|candidate| {
+        host == candidate
+            || host
+                .strip_suffix(candidate)
+                .map(|prefix| prefix.ends_with('.'))
+                .unwrap_or(false)
+    })
+}
+
+fn ensure_object_storage_ready(state: &AppState) -> Result<(), AppError> {
+    if state.s3.is_none() {
+        return Err(AppError::bad_request(
+            "服务器未启用远程资源存储，请登录前确认对象存储配置完整。",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_upload_token_not_expired(row: &sqlx::sqlite::SqliteRow) -> Result<(), AppError> {
+    let expires_at = row.get::<String, _>("expires_at");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at)
+        .map_err(|error| AppError::internal_message(format!("上传凭证过期时间解析失败：{error}")))?;
+    if expires_at.with_timezone(&Utc) <= Utc::now() {
+        return Err(AppError::bad_request("上传凭证已过期，请重新发起上传。"));
+    }
+    Ok(())
+}
+
+async fn cleanup_expired_upload_tokens(db: &SqlitePool) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM upload_tokens WHERE expires_at <= ?")
+        .bind(now_rfc3339())
+        .execute(db)
+        .await
+        .map_err(AppError::internal)?;
     Ok(())
 }
 
@@ -910,13 +1175,6 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 fn random_token() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 32)
-}
-
-fn is_forbidden_header(header_name: &str) -> bool {
-    matches!(
-        header_name.to_ascii_lowercase().as_str(),
-        "host" | "content-length" | "connection"
-    )
 }
 
 fn openai_images_endpoint(request: &mew_image_shared::GenerationRequest) -> &'static str {
@@ -1001,8 +1259,14 @@ async fn invoke_openai_image(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let url = join_api_url(
+    let base_url = resolve_provider_base_url(
+        state,
+        ProviderKind::OpenAiImage,
         &payload.config.base_url,
+        true,
+    )?;
+    let url = join_api_url(
+        &base_url,
         match payload.config.endpoint_mode {
             ProviderEndpointMode::ImagesApi => openai_images_endpoint(&payload.request),
             ProviderEndpointMode::ResponsesApi => "/v1/responses",
@@ -1142,8 +1406,14 @@ async fn invoke_openai_compatible_image(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let url = join_api_url(
+    let base_url = resolve_provider_base_url(
+        state,
+        ProviderKind::OpenAiCompatible,
         &payload.config.base_url,
+        true,
+    )?;
+    let url = join_api_url(
+        &base_url,
         openai_compatible_endpoint(&payload.request),
     );
 
@@ -1218,8 +1488,14 @@ async fn invoke_nano_banana_google(
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
     let model = normalize_google_image_model(&payload.request.model);
-    let url = join_api_url(
+    let base_url = resolve_provider_base_url(
+        state,
+        ProviderKind::NanoBanana,
         &payload.config.base_url,
+        true,
+    )?;
+    let url = join_api_url(
+        &base_url,
         &format!("/v1beta/models/{model}:generateContent"),
     );
     let body = build_gemini_payload(state, payload).await?;
@@ -1247,9 +1523,15 @@ async fn invoke_custom_http(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
+    let base_url = resolve_provider_base_url(
+        state,
+        ProviderKind::CustomHttp,
+        &payload.config.base_url,
+        true,
+    )?;
     let url = format!(
         "{}{}",
-        payload.config.base_url.trim_end_matches('/'),
+        base_url.trim_end_matches('/'),
         payload.template.endpoint_path
     );
     let mut body = json!({});
@@ -1311,6 +1593,80 @@ fn mime_extension(mime_type: &str) -> &'static str {
         "image/jpeg" => "jpg",
         _ => "bin",
     }
+}
+
+async fn hydrate_proxy_result_images(
+    state: &AppState,
+    mut result: GenerationResult,
+) -> Result<GenerationResult, AppError> {
+    for image in &mut result.images {
+        if image.data_url.is_some() {
+            continue;
+        }
+        let Some(url) = image.url.clone() else {
+            continue;
+        };
+        if let Ok((mime_type, bytes)) = fetch_remote_image_bytes(state, &url).await {
+            image.data_url = Some(format!("data:{mime_type};base64,{}", BASE64.encode(bytes)));
+        }
+    }
+    Ok(result)
+}
+
+async fn fetch_remote_image_bytes(
+    state: &AppState,
+    image_url: &str,
+) -> Result<(String, Vec<u8>), AppError> {
+    let parsed =
+        Url::parse(image_url).map_err(|_| AppError::bad_request("上游返回了无效的图片地址。"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::provider_target_blocked("上游返回的图片地址缺少主机名。"))?
+        .to_ascii_lowercase();
+    reject_unsafe_host(&host)?;
+
+    let mut allowed_hosts = BTreeSet::new();
+    for value in &state.config.trusted_provider_hosts {
+        allowed_hosts.insert(value.to_ascii_lowercase());
+    }
+    allowed_hosts.insert("api.openai.com".into());
+    allowed_hosts.insert("oaidalleapiprodscus.blob.core.windows.net".into());
+    allowed_hosts.insert("generativelanguage.googleapis.com".into());
+    if state.config.enforce_provider_host_whitelist && !host_matches_allowlist(&host, &allowed_hosts) {
+        return Err(AppError::provider_target_blocked(format!(
+            "上游返回的图片地址 `{host}` 不在允许的下载白名单中；可关闭 `MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST`，或将该域名加入 `MEW_IMAGE_TRUSTED_PROVIDER_HOSTS`。"
+        )));
+    }
+
+    let response = state.http.get(parsed).send().await.map_err(|error| {
+        warn!("remote image fetch failed: {}", error);
+        AppError::bad_gateway("下载上游图片失败")
+    })?;
+    if !response.status().is_success() {
+        return Err(AppError::bad_gateway(format!(
+            "下载上游图片失败：HTTP {}",
+            response.status()
+        )));
+    }
+    let mime_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("image/png")
+        .to_string();
+    let bytes = response.bytes().await.map_err(AppError::internal)?.to_vec();
+    Ok((mime_type, bytes))
+}
+
+#[derive(serde::Deserialize)]
+struct FetchImageRequest {
+    url: String,
+}
+
+#[derive(serde::Serialize)]
+struct FetchImageResponse {
+    mime_type: String,
+    body_base64: String,
 }
 
 fn extract_generation_result(
@@ -1582,6 +1938,7 @@ fn collect_json_path(value: &serde_json::Value, path: &str) -> Vec<serde_json::V
 struct AppError {
     status: StatusCode,
     message: String,
+    code: Option<&'static str>,
 }
 
 impl AppError {
@@ -1589,6 +1946,7 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -1596,6 +1954,7 @@ impl AppError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -1603,6 +1962,7 @@ impl AppError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -1610,6 +1970,15 @@ impl AppError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
+            code: None,
+        }
+    }
+
+    fn provider_target_blocked(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+            code: Some("provider_target_blocked"),
         }
     }
 
@@ -1617,6 +1986,7 @@ impl AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -1632,6 +2002,7 @@ impl IntoResponse for AppError {
             self.status,
             Json(json!({
                 "error": self.message,
+                "code": self.code,
             })),
         )
             .into_response()
@@ -1641,6 +2012,7 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use mew_image_shared::{GenerationRequest, ProviderEndpointMode};
 
     #[test]
@@ -1651,9 +2023,40 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_headers_are_filtered() {
-        assert!(is_forbidden_header("Host"));
-        assert!(!is_forbidden_header("Authorization"));
+    fn private_hosts_are_blocked() {
+        assert!(reject_unsafe_host("127.0.0.1").is_err());
+        assert!(reject_unsafe_host("10.0.0.8").is_err());
+        assert!(reject_unsafe_host("localhost").is_err());
+        assert!(reject_unsafe_host("service.internal").is_err());
+        assert!(reject_unsafe_host("api.openai.com").is_ok());
+    }
+
+    #[test]
+    fn allowlist_matches_exact_host_and_subdomain() {
+        let allowed = BTreeSet::from([
+            "api.openai.com".to_string(),
+            "example.com".to_string(),
+        ]);
+        assert!(host_matches_allowlist("api.openai.com", &allowed));
+        assert!(host_matches_allowlist("cdn.example.com", &allowed));
+        assert!(!host_matches_allowlist("evil-example.com", &allowed));
+    }
+
+    #[test]
+    fn public_gateway_host_is_allowed_by_basic_safety_policy() {
+        assert!(reject_unsafe_host("api.cphone.vip").is_ok());
+        assert!(reject_unsafe_host("cdnoss.jounery.vip").is_ok());
+    }
+
+    #[test]
+    fn private_ip_detection_covers_v4_and_v6() {
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_private_ip(IpAddr::V6(
+            "fd00::1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 
     #[test]

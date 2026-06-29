@@ -8,7 +8,13 @@ services:
     environment:
       MEW_IMAGE_LISTEN: 0.0.0.0:3000
       MEW_IMAGE_DATABASE_URL: sqlite:///data/mew-image.db
-      MEW_IMAGE_FRONTEND_DIST: /app/frontend/dist
+      MEW_IMAGE_FRONTEND_DIST: /app/frontend/dist-app
+      MEW_IMAGE_SESSION_SECURE: "false"
+      MEW_IMAGE_ALLOWED_WEB_ORIGINS: http://127.0.0.1:3000,http://localhost:3000
+      MEW_IMAGE_ENABLE_GUEST_PROXY: "true"
+      MEW_IMAGE_REQUIRE_LOGIN_FOR_CUSTOM_PROVIDER: "true"
+      MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST: "false"
+      MEW_IMAGE_TRUSTED_PROVIDER_HOSTS: ""
       MEW_IMAGE_S3_BUCKET: mew-image
       MEW_IMAGE_S3_REGION: us-east-1
       MEW_IMAGE_S3_ENDPOINT: http://minio:9000

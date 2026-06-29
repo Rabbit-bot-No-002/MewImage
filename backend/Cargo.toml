@@ -26,7 +26,8 @@ sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "run
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "fs"] }
 tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["cors", "fs", "trace"] }
-tower-sessions = "0.15.0"
+tower-sessions = "0.14.0"
+tower-sessions-sqlx-store = { version = "0.15.0", features = ["sqlite"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uuid.workspace = true

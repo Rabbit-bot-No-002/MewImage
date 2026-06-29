@@ -3,6 +3,8 @@
 debug
 target
 frontend/dist
+frontend/dist-app
+.env
 mew-image.db
 *.db-shm
 *.db-wal
