@@ -191,6 +191,76 @@ pub async fn generate_with_strategy(
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
 ) -> Result<(GenerationResult, bool), String> {
+    let requested_count = request.count.max(1);
+    if requested_count <= 1 {
+        return generate_once_with_strategy(template, config, request).await;
+    }
+
+    let mut images = Vec::new();
+    let mut first_result: Option<GenerationResult> = None;
+    let mut any_proxy = false;
+    let mut last_error = None;
+
+    for _ in 0..requested_count {
+        let remaining = requested_count.saturating_sub(images.len() as u32);
+        if remaining == 0 {
+            break;
+        }
+
+        let mut next_request = request.clone();
+        next_request.count = if config.provider_kind == ProviderKind::NanoBanana
+            || config.endpoint_mode == ProviderEndpointMode::ResponsesApi
+        {
+            1
+        } else {
+            remaining
+        };
+
+        match generate_once_with_strategy(template, config, &next_request).await {
+            Ok((mut result, used_proxy)) => {
+                if used_proxy {
+                    any_proxy = true;
+                }
+                if first_result.is_none() {
+                    first_result = Some(result.clone());
+                }
+                let produced_count = result.images.len();
+                images.append(&mut result.images);
+                if produced_count == 0 {
+                    break;
+                }
+            }
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+
+    if images.is_empty() {
+        return Err(last_error.unwrap_or_else(|| "上游没有返回任何可用图片结果。".into()));
+    }
+
+    let result = first_result.unwrap_or_else(|| GenerationResult {
+        images: Vec::new(),
+        parameter_snapshot: Default::default(),
+        raw_response_json: None,
+    });
+    Ok((
+        GenerationResult {
+            images,
+            parameter_snapshot: result.parameter_snapshot,
+            raw_response_json: result.raw_response_json,
+        },
+        any_proxy,
+    ))
+}
+
+async fn generate_once_with_strategy(
+    template: &ProviderTemplate,
+    config: &EncryptedApiConfig,
+    request: &GenerationRequest,
+) -> Result<(GenerationResult, bool), String> {
     if config.provider_kind == ProviderKind::NanoBanana {
         return match config.access_mode {
             ProviderAccessMode::Proxy => proxy_generate(template, config, request)
@@ -311,6 +381,8 @@ async fn direct_generate(
                 &nano_banana_image_size_from_dimensions(request.width, request.height),
             )
             .map_err(|error| format!("{error:?}"))?;
+            form.append_with_str("n", &request.count.to_string())
+                .map_err(|error| format!("{error:?}"))?;
             for asset in &prepared_assets {
                 let blob = blob_from_bytes(&asset.bytes, &asset.mime_type)?;
                 form.append_with_blob_and_filename(
@@ -500,6 +572,7 @@ fn build_openai_compatible_json(
         "response_format": "url",
         "image_size": nano_banana_image_size_from_dimensions(request.width, request.height),
         "size": format!("{}x{}", request.width, request.height),
+        "n": request.count,
     })
 }
 

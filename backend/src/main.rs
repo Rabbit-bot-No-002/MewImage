@@ -1430,6 +1430,7 @@ async fn invoke_openai_compatible_image(
                 "response_format": "url",
                 "image_size": nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
                 "size": format!("{}x{}", payload.request.width, payload.request.height),
+                "n": payload.request.count,
             }))
             .send()
             .await
@@ -1452,7 +1453,8 @@ async fn invoke_openai_compatible_image(
             .text(
                 "image_size",
                 nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
-            );
+            )
+            .text("n", payload.request.count.to_string());
         for asset in &payload.request.reference_assets {
             let (mime, bytes) = resolve_asset_bytes(state, asset).await?;
             let part = reqwest::multipart::Part::bytes(bytes)

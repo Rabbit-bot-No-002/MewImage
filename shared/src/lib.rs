@@ -165,7 +165,7 @@ impl ProviderTemplate {
             model_field: Some("model".into()),
             size_field: Some("aspect_ratio".into()),
             quality_field: None,
-            count_field: None,
+            count_field: Some("n".into()),
             reference_images_field: Some("image".into()),
             response_image_url_path: Some("data[].url".into()),
             response_image_base64_path: Some("data[].b64_json".into()),

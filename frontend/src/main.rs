@@ -175,6 +175,7 @@ fn App() -> impl IntoView {
     let show_settings = RwSignal::new(false);
     let show_settings_menu = RwSignal::new(false);
     let show_resolution_menu = RwSignal::new(false);
+    let show_config_switcher = RwSignal::new(false);
     let preview_state = RwSignal::new(None::<PreviewState>);
     let preview_panel_state = RwSignal::new(None::<PreviewPanelState>);
     let preview_fullscreen = RwSignal::new(false);
@@ -287,7 +288,14 @@ fn App() -> impl IntoView {
             return;
         };
         let on_keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
-            if ev.key() != "Escape" || preview_state.get_untracked().is_none() {
+            if ev.key() != "Escape" {
+                return;
+            }
+            if show_config_switcher.get_untracked() {
+                show_config_switcher.set(false);
+                return;
+            }
+            if preview_state.get_untracked().is_none() {
                 return;
             }
             if preview_fullscreen.get_untracked() {
@@ -2139,16 +2147,64 @@ fn App() -> impl IntoView {
 
                 <div class="workspace-main">
                 <section class="panel composer-panel">
-                    <div class="row">
+                    <div class="row composer-title-row">
                         <h2>"提示词与生成"</h2>
-                        <span class="tag">
-                            {move || {
-                                current_config
-                                    .get()
-                                    .map(|config| format!("{} · {}", config.name, config.model))
-                                    .unwrap_or_else(|| "未配置模型".into())
+                        <div class="config-switcher">
+                            <button
+                                class="tag config-switcher-button"
+                                title="切换服务商配置"
+                                on:click=move |_| show_config_switcher.update(|value| *value = !*value)
+                            >
+                                <span>
+                                    {move || {
+                                        current_config
+                                            .get()
+                                            .map(|config| format!("{} · {}", config.name, config.model))
+                                            .unwrap_or_else(|| "未配置模型".into())
+                                    }}
+                                </span>
+                                <MaterialSymbolIcon name="expand_more" filled=false />
+                            </button>
+                            {move || if show_config_switcher.get() {
+                                view! {
+                                    <div class="config-switcher-menu">
+                                        <For
+                                            each=move || configs.get()
+                                            key=|config| config.id.clone()
+                                            children=move |config| {
+                                                let config_id = config.id.clone();
+                                                let is_active_id = config.id.clone();
+                                                let checked_id = config.id.clone();
+                                                let config_name = config.name.clone();
+                                                let config_model = config.model.clone();
+                                                let config_title = format!("{} · {}", config_name, config_model);
+                                                view! {
+                                                    <button
+                                                        class="config-switcher-item"
+                                                        class:is-active=move || current_config_id.get() == is_active_id
+                                                        title=config_title
+                                                        on:click=move |_| {
+                                                            current_config_id.set(config_id.clone());
+                                                            show_config_switcher.set(false);
+                                                        }
+                                                    >
+                                                        <span class="config-switcher-name">{config_name}</span>
+                                                        <span class="config-switcher-model">{config_model}</span>
+                                                        {move || if current_config_id.get() == checked_id {
+                                                            view! { <MaterialSymbolIcon name="check" filled=false /> }.into_any()
+                                                        } else {
+                                                            ().into_any()
+                                                        }}
+                                                    </button>
+                                                }
+                                            }
+                                        />
+                                    </div>
+                                }.into_any()
+                            } else {
+                                ().into_any()
                             }}
-                        </span>
+                        </div>
                     </div>
 
                     <div class="thread-strip">
@@ -2286,23 +2342,53 @@ fn App() -> impl IntoView {
                                         <option value="jpeg">"格式：JPEG"</option>
                                         <option value="webp">"格式：WEBP"</option>
                                     </select>
-                                    <input
-                                        class="field compact-field"
-                                        type="number"
-                                        min="0"
-                                        max="100"
-                                        prop:value=move || current_config.get().and_then(|config| config.output_compression).unwrap_or(100).to_string()
-                                        on:input=move |ev| {
-                                            let value = event_target_value(&ev).parse::<u8>().unwrap_or(100).clamp(0, 100);
-                                            configs.update(|items| {
-                                                if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                                                    config.output_compression = Some(value);
-                                                    config.updated_at = now_rfc3339();
-                                                }
-                                            });
-                                            persist_ui_state();
-                                        }
-                                    />
+                                    <div class="compact-stepper compression-stepper" aria-label="压缩率">
+                                        <button
+                                            type="button"
+                                            class="stepper-button"
+                                            on:click=move |_| {
+                                                let value = current_config.get_untracked().and_then(|config| config.output_compression).unwrap_or(100).saturating_sub(1);
+                                                configs.update(|items| {
+                                                    if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
+                                                        config.output_compression = Some(value);
+                                                        config.updated_at = now_rfc3339();
+                                                    }
+                                                });
+                                                persist_ui_state();
+                                            }
+                                        >"-"</button>
+                                        <input
+                                            class="stepper-value"
+                                            type="number"
+                                            min="0"
+                                            max="100"
+                                            prop:value=move || current_config.get().and_then(|config| config.output_compression).unwrap_or(100).to_string()
+                                            on:input=move |ev| {
+                                                let value = event_target_value(&ev).parse::<u8>().unwrap_or(100).clamp(0, 100);
+                                                configs.update(|items| {
+                                                    if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
+                                                        config.output_compression = Some(value);
+                                                        config.updated_at = now_rfc3339();
+                                                    }
+                                                });
+                                                persist_ui_state();
+                                            }
+                                        />
+                                        <button
+                                            type="button"
+                                            class="stepper-button"
+                                            on:click=move |_| {
+                                                let value = current_config.get_untracked().and_then(|config| config.output_compression).unwrap_or(100).saturating_add(1).min(100);
+                                                configs.update(|items| {
+                                                    if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
+                                                        config.output_compression = Some(value);
+                                                        config.updated_at = now_rfc3339();
+                                                    }
+                                                });
+                                                persist_ui_state();
+                                            }
+                                        >"+"</button>
+                                    </div>
                                     <select
                                         class="select-input compact-select"
                                         prop:value=move || current_config.get().and_then(|config| config.moderation).unwrap_or_else(|| "auto".into())
@@ -2333,14 +2419,26 @@ fn App() -> impl IntoView {
                                         <option value="on">"Codex 兼容：开"</option>
                                         <option value="off">"Codex 兼容：关"</option>
                                     </select>
-                                    <input
-                                        class="field compact-field"
-                                        type="number"
-                                        min="1"
-                                        max="4"
-                                        prop:value=move || count.get().to_string()
-                                        on:input=move |ev| count.set(event_target_value(&ev).parse().unwrap_or(1).clamp(1, 4))
-                                    />
+                                    <div class="compact-stepper count-stepper" aria-label="生成数量">
+                                        <button
+                                            type="button"
+                                            class="stepper-button"
+                                            on:click=move |_| count.update(|value| *value = value.saturating_sub(1).clamp(1, 4))
+                                        >"-"</button>
+                                        <input
+                                            class="stepper-value"
+                                            type="number"
+                                            min="1"
+                                            max="4"
+                                            prop:value=move || count.get().to_string()
+                                            on:input=move |ev| count.set(event_target_value(&ev).parse().unwrap_or(1).clamp(1, 4))
+                                        />
+                                        <button
+                                            type="button"
+                                            class="stepper-button"
+                                            on:click=move |_| count.update(|value| *value = value.saturating_add(1).clamp(1, 4))
+                                        >"+"</button>
+                                    </div>
                                 </>
                             }.into_any()
                         } else {
@@ -2355,14 +2453,26 @@ fn App() -> impl IntoView {
                                         <option value="medium">"质量：中"</option>
                                         <option value="high">"质量：高"</option>
                                     </select>
-                                    <input
-                                        class="field compact-field"
-                                        type="number"
-                                        min="1"
-                                        max="4"
-                                        prop:value=move || count.get().to_string()
-                                        on:input=move |ev| count.set(event_target_value(&ev).parse().unwrap_or(1).clamp(1, 4))
-                                    />
+                                    <div class="compact-stepper count-stepper" aria-label="生成数量">
+                                        <button
+                                            type="button"
+                                            class="stepper-button"
+                                            on:click=move |_| count.update(|value| *value = value.saturating_sub(1).clamp(1, 4))
+                                        >"-"</button>
+                                        <input
+                                            class="stepper-value"
+                                            type="number"
+                                            min="1"
+                                            max="4"
+                                            prop:value=move || count.get().to_string()
+                                            on:input=move |ev| count.set(event_target_value(&ev).parse().unwrap_or(1).clamp(1, 4))
+                                        />
+                                        <button
+                                            type="button"
+                                            class="stepper-button"
+                                            on:click=move |_| count.update(|value| *value = value.saturating_add(1).clamp(1, 4))
+                                        >"+"</button>
+                                    </div>
                                 </>
                             }.into_any()
                         }}
@@ -2625,6 +2735,8 @@ fn App() -> impl IntoView {
                 let copy_src = fullscreen_src.clone();
                 let toolbar_download_src = fullscreen_src.clone();
                 let download_src = fullscreen_src.clone();
+                let toolbar_download_name = download_file_name_for_asset(&asset);
+                let download_name = toolbar_download_name.clone();
                 let prompt_text = panel.prompt.clone();
                 let reference_thumb_ids = panel
                     .reference_thumbs
@@ -2646,6 +2758,7 @@ fn App() -> impl IntoView {
                                 {move || {
                                     if preview_fullscreen.get() {
                                         let toolbar_download_src = toolbar_download_src.clone();
+                                        let toolbar_download_name = toolbar_download_name.clone();
                                         view! {
                                             <div class="preview-fullscreen-toolbar">
                                                 <button
@@ -2653,7 +2766,7 @@ fn App() -> impl IntoView {
                                                     title="下载原图"
                                                     on:click=move |_| {
                                                         let src = toolbar_download_src.clone();
-                                                        let _ = download_image_from_src(&src, "mew-image-output");
+                                                        let _ = download_image_from_src(&src, &toolbar_download_name);
                                                     }
                                                 >
                                                     <MaterialSymbolIcon name="download" filled=false />
@@ -2908,7 +3021,7 @@ fn App() -> impl IntoView {
                                         });
                                     }>"复制"</button>
                                     <button class="button ghost" on:click=move |_| {
-                                        let _ = download_image_from_src(&download_src, "mew-image-output");
+                                        let _ = download_image_from_src(&download_src, &download_name);
                                     }>"下载"</button>
                                 </div>
                             </aside>
@@ -2929,6 +3042,12 @@ fn App() -> impl IntoView {
                         .unwrap_or_default()
                 });
                 let download_src = copy_src.clone();
+                let download_name = assets.with(|items| {
+                    items.iter()
+                        .find(|asset| asset.id == asset_id)
+                        .map(download_file_name_for_asset)
+                        .unwrap_or_else(|| download_file_name_for_src(&download_src))
+                });
                 let edit_task_id = task_id.clone();
                 let edit_asset_id = asset_id.clone();
                 view! {
@@ -2946,7 +3065,7 @@ fn App() -> impl IntoView {
                                 });
                             }>"复制"</button>
                             <button class="button ghost context-item" on:click=move |_| {
-                                let _ = download_image_from_src(&download_src, "mew-image-output");
+                                let _ = download_image_from_src(&download_src, &download_name);
                                 context_menu_state.set(None);
                             }>"下载"</button>
                             <button class="button ghost context-item" on:click=move |_| {
@@ -4048,6 +4167,101 @@ fn format_shanghai_datetime(value: &str) -> String {
     )
 }
 
+fn format_shanghai_date_compact(value: &str) -> Option<String> {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_str(value));
+    let timestamp = date.get_time();
+    if !timestamp.is_finite() {
+        return None;
+    }
+    let shanghai = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+        timestamp + 8.0 * 60.0 * 60.0 * 1000.0,
+    ));
+    Some(format!(
+        "{:04}{:02}{:02}",
+        shanghai.get_utc_full_year() as i32,
+        shanghai.get_utc_month() + 1,
+        shanghai.get_utc_date()
+    ))
+}
+
+fn today_compact() -> String {
+    let now = js_sys::Date::new_0();
+    format!(
+        "{:04}{:02}{:02}",
+        now.get_full_year() as i32,
+        now.get_month() + 1,
+        now.get_date()
+    )
+}
+
+fn download_file_name_for_asset(asset: &ImageAssetRef) -> String {
+    let date = format_shanghai_date_compact(&asset.created_at).unwrap_or_else(today_compact);
+    let hash = short_download_hash(asset);
+    let extension = extension_from_mime(&asset.mime_type);
+    format!("mew_{date}_{hash}.{extension}")
+}
+
+fn download_file_name_for_src(src: &str) -> String {
+    let hash = short_hash_from_text(src);
+    let extension = extension_from_src(src).unwrap_or("png");
+    format!("mew_{}_{}.{}", today_compact(), hash, extension)
+}
+
+fn short_download_hash(asset: &ImageAssetRef) -> String {
+    let candidate = if asset.sha256.trim().is_empty() {
+        asset.id.as_str()
+    } else {
+        asset.sha256.as_str()
+    };
+    short_hash_text(candidate)
+}
+
+fn short_hash_from_text(value: &str) -> String {
+    short_hash_text(&sha256_hex(value.as_bytes()))
+}
+
+fn short_hash_text(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        "image".into()
+    } else {
+        cleaned
+    }
+}
+
+fn extension_from_mime(mime_type: &str) -> &'static str {
+    match mime_type.split(';').next().unwrap_or("").trim() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/avif" => "avif",
+        "image/png" => "png",
+        _ => "png",
+    }
+}
+
+fn extension_from_src(src: &str) -> Option<&'static str> {
+    let lowered = src.split('?').next().unwrap_or(src).to_ascii_lowercase();
+    if lowered.ends_with(".jpg") || lowered.ends_with(".jpeg") {
+        Some("jpg")
+    } else if lowered.ends_with(".webp") {
+        Some("webp")
+    } else if lowered.ends_with(".gif") {
+        Some("gif")
+    } else if lowered.ends_with(".avif") {
+        Some("avif")
+    } else if lowered.ends_with(".png") {
+        Some("png")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn asset_src(asset: &ImageAssetRef) -> String {
     asset
         .data_url
@@ -4355,7 +4569,7 @@ async fn copy_image_from_src(src: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn download_image_from_src(src: &str, base_name: &str) -> Result<(), String> {
+fn download_image_from_src(src: &str, file_name: &str) -> Result<(), String> {
     let Some(window) = web_sys::window() else {
         return Err("浏览器窗口不可用".into());
     };
@@ -4369,7 +4583,7 @@ fn download_image_from_src(src: &str, base_name: &str) -> Result<(), String> {
         .dyn_into()
         .map_err(|_| "下载元素类型错误".to_string())?;
     anchor.set_href(src);
-    anchor.set_download(&format!("{base_name}.png"));
+    anchor.set_download(file_name);
     let _ = anchor.set_attribute("style", "display:none");
     let Some(body) = document.body() else {
         return Err("浏览器页面主体不可用".into());
