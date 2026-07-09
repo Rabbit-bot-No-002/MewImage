@@ -167,6 +167,7 @@ fn MaterialSymbolIcon(name: &'static str, filled: bool) -> impl IntoView {
 const THUMBNAIL_DATA_URL_KEY: &str = "thumbnail_data_url";
 const THUMBNAIL_MAX_EDGE: u32 = 320;
 const GALLERY_PAGE_SIZE: usize = 10;
+const VISIBLE_THREAD_LIMIT: usize = 5;
 
 #[component]
 fn App() -> impl IntoView {
@@ -212,6 +213,7 @@ fn App() -> impl IntoView {
     let text_popover = RwSignal::new(None::<TextPopoverState>);
     let text_popover_value = RwSignal::new(String::new());
     let confirm_popover = RwSignal::new(None::<ConfirmPopoverState>);
+    let show_thread_archive_menu = RwSignal::new(false);
     let gallery_page = RwSignal::new(1usize);
     let show_gallery_page_picker = RwSignal::new(false);
     let gallery_page_candidate = RwSignal::new(1usize);
@@ -618,6 +620,27 @@ fn App() -> impl IntoView {
                 textarea.set_value(&value);
             }
         }
+    });
+
+    let visible_threads = Memo::new(move |_| {
+        let all_threads = threads.get();
+        let current_id = current_thread_id.get();
+        visible_thread_items(&all_threads, &current_id)
+    });
+
+    let archived_threads = Memo::new(move |_| {
+        let visible_ids: HashSet<String> = visible_threads
+            .get()
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect();
+        let mut archived = threads
+            .get()
+            .into_iter()
+            .filter(|thread| !visible_ids.contains(&thread.id))
+            .collect::<Vec<_>>();
+        archived.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        archived
     });
 
     let visible_tasks = Memo::new(move |_| {
@@ -1243,6 +1266,23 @@ fn App() -> impl IntoView {
             x,
             y,
         }));
+    };
+
+    let select_thread = move |thread_id: String| {
+        if current_thread_id.get_untracked() == thread_id {
+            return;
+        }
+        commit_current_thread_draft();
+        current_thread_id.set(thread_id.clone());
+        if let Some(selected_thread) = threads.with_untracked(|items| {
+            items.iter().find(|item| item.id == thread_id).cloned()
+        }) {
+            draft_prompt.set(selected_thread.draft_prompt.clone());
+        }
+        selected_reference_ids.set(Vec::new());
+        reference_menu_asset_id.set(None);
+        continuation_asset_id.set(None);
+        show_thread_archive_menu.set(false);
     };
 
     let import_reference_assets = move |files: FileList| {
@@ -2780,7 +2820,7 @@ fn App() -> impl IntoView {
 
                     <div class="thread-strip">
                         <For
-                            each=move || threads.get()
+                            each=move || visible_threads.get()
                             key=|thread| thread.id.clone()
                             children=move |thread| {
                                 let thread_id = thread.id.clone();
@@ -2793,28 +2833,14 @@ fn App() -> impl IntoView {
                                         <button
                                             class="chip-button thread-chip-button"
                                             class:active-chip=move || current_thread_id.get() == active_thread_id
-                                        on:click=move |_| {
-                                            if current_thread_id.get_untracked() == click_thread_id {
-                                                return;
-                                            }
-                                            commit_current_thread_draft();
-                                            current_thread_id.set(click_thread_id.clone());
-                                            if let Some(selected_thread) = threads.with_untracked(|items| {
-                                                items.iter().find(|item| item.id == click_thread_id).cloned()
-                                            }) {
-                                                draft_prompt.set(selected_thread.draft_prompt.clone());
-                                            }
-                                            selected_reference_ids.set(Vec::new());
-                                            reference_menu_asset_id.set(None);
-                                            continuation_asset_id.set(None);
-                                        }
-                                    >
+                                            on:click=move |_| select_thread(click_thread_id.clone())
+                                        >
                                             <span class="thread-chip-label">
                                                 {move || {
                                                     thread_display_name(&thread)
                                                 }}
                                             </span>
-                                    </button>
+                                        </button>
                                         <div class="thread-chip-actions">
                                             <button
                                                 class="button ghost mini-action icon-action"
@@ -2836,6 +2862,45 @@ fn App() -> impl IntoView {
                             }
                         />
                         <button class="chip-button add-chip" on:click=new_thread>"+" "新会话"</button>
+                        {move || if !archived_threads.get().is_empty() {
+                            view! {
+                                <div class="thread-archive">
+                                    <button
+                                        class="button ghost icon-button thread-archive-button"
+                                        title="归档会话"
+                                        on:click=move |_| show_thread_archive_menu.update(|value| *value = !*value)
+                                    >
+                                        <MaterialSymbolIcon name="archive" filled=false />
+                                    </button>
+                                    {move || if show_thread_archive_menu.get() {
+                                        view! {
+                                            <>
+                                                <button class="thread-archive-dismiss" aria-label="关闭归档会话菜单" on:click=move |_| show_thread_archive_menu.set(false)></button>
+                                                <div class="thread-archive-menu">
+                                                    <For
+                                                        each=move || archived_threads.get()
+                                                        key=|thread| thread.id.clone()
+                                                        children=move |thread| {
+                                                            let thread_id = thread.id.clone();
+                                                            view! {
+                                                                <button class="thread-archive-item" on:click=move |_| select_thread(thread_id.clone())>
+                                                                    <MaterialSymbolIcon name="forum" filled=false />
+                                                                    <span>{thread_display_name(&thread)}</span>
+                                                                </button>
+                                                            }
+                                                        }
+                                                    />
+                                                </div>
+                                            </>
+                                        }.into_any()
+                                    } else {
+                                        ().into_any()
+                                    }}
+                                </div>
+                            }.into_any()
+                        } else {
+                            ().into_any()
+                        }}
                     </div>
 
                     <textarea
@@ -4080,6 +4145,42 @@ fn normalized_favorite_folders(mut folders: Vec<FavoriteFolder>) -> Vec<Favorite
         );
     }
     folders
+}
+
+fn visible_thread_items(
+    threads: &[ConversationThread],
+    current_thread_id: &str,
+) -> Vec<ConversationThread> {
+    if threads.len() <= VISIBLE_THREAD_LIMIT {
+        let mut items = threads.to_vec();
+        items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        return items;
+    }
+
+    let mut by_newest = threads.to_vec();
+    by_newest.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let mut visible = by_newest
+        .iter()
+        .take(VISIBLE_THREAD_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    if visible
+        .iter()
+        .any(|thread| thread.id.as_str() == current_thread_id)
+    {
+        return visible;
+    }
+
+    if let Some(current_thread) = by_newest
+        .iter()
+        .find(|thread| thread.id.as_str() == current_thread_id)
+        .cloned()
+    {
+        if let Some(last) = visible.last_mut() {
+            *last = current_thread;
+        }
+    }
+    visible
 }
 
 fn reconcile_task_integrity(
