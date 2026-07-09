@@ -30,6 +30,7 @@ pub enum ProviderKind {
 pub const BUILTIN_OPENAI_IMAGE_TEMPLATE_ID: &str = "builtin-openai-compatible";
 pub const BUILTIN_NANO_BANANA_TEMPLATE_ID: &str = "builtin-nano-banana";
 pub const BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID: &str = "builtin-openai-compatible-gateway";
+pub const DEFAULT_FAVORITE_FOLDER_ID: &str = "default";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -791,6 +792,8 @@ pub struct LocalTaskRecord {
     pub reference_asset_ids: Vec<String>,
     pub result: Option<GenerationResult>,
     pub favorite: bool,
+    #[serde(default)]
+    pub favorite_folder_id: Option<String>,
     pub status: TaskStatus,
     pub error_message: Option<String>,
     pub created_at: String,
@@ -808,11 +811,33 @@ pub struct ConversationThread {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FavoriteFolder {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub fn default_favorite_folders() -> Vec<FavoriteFolder> {
+    let now = now_rfc3339();
+    vec![FavoriteFolder {
+        id: DEFAULT_FAVORITE_FOLDER_ID.into(),
+        name: "默认".into(),
+        created_at: now.clone(),
+        updated_at: now,
+    }]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppPreferences {
     pub theme: ThemePreference,
     pub clear_prompt_after_submit: bool,
     pub preserve_draft_on_restart: bool,
     pub reuse_last_config: bool,
+    #[serde(default = "default_favorite_folders")]
+    pub favorite_folders: Vec<FavoriteFolder>,
+    #[serde(default)]
+    pub active_favorite_folder_id: Option<String>,
 }
 
 impl Default for AppPreferences {
@@ -822,6 +847,8 @@ impl Default for AppPreferences {
             clear_prompt_after_submit: false,
             preserve_draft_on_restart: true,
             reuse_last_config: true,
+            favorite_folders: default_favorite_folders(),
+            active_favorite_folder_id: Some(DEFAULT_FAVORITE_FOLDER_ID.into()),
         }
     }
 }

@@ -16,10 +16,11 @@ use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use leptos::{html, prelude::*, task::spawn_local};
 use mew_image_shared::{
     AppPreferences, AuthRequest, AuthResponse, BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
-    ConversationThread, EncryptedApiConfig, ImageAssetRef, LocalAppState, LocalTaskRecord,
-    MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind, ProviderTemplate,
-    SyncCheckpoint, SyncPullResponse, TaskStatus, ThemePreference, UserSummary, clamp_size,
-    new_id, normalize_api_config, now_rfc3339,
+    ConversationThread, DEFAULT_FAVORITE_FOLDER_ID, EncryptedApiConfig, FavoriteFolder,
+    ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse, ProviderAccessMode,
+    ProviderEndpointMode, ProviderKind, ProviderTemplate, SyncCheckpoint, SyncPullResponse,
+    TaskStatus, ThemePreference, UserSummary, clamp_size, new_id, normalize_api_config,
+    now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -105,6 +106,45 @@ struct FloatingTipState {
     persistent: bool,
 }
 
+#[derive(Clone, PartialEq)]
+struct FavoriteFolderPickerState {
+    task_id: String,
+    x: f64,
+    y: f64,
+    is_favorite: bool,
+}
+
+#[derive(Clone, PartialEq)]
+enum TextPopoverKind {
+    RenameThread(String),
+    AddFavoriteFolder,
+    RenameFavoriteFolder(String),
+}
+
+#[derive(Clone, PartialEq)]
+struct TextPopoverState {
+    kind: TextPopoverKind,
+    title: String,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, PartialEq)]
+enum ConfirmPopoverKind {
+    DeleteThread(String),
+    DeleteFavoriteFolder(String),
+    DeleteTask(String),
+}
+
+#[derive(Clone, PartialEq)]
+struct ConfirmPopoverState {
+    kind: ConfirmPopoverKind,
+    title: String,
+    message: String,
+    x: f64,
+    y: f64,
+}
+
 #[derive(Deserialize)]
 struct FetchImageResponse {
     mime_type: String,
@@ -167,7 +207,11 @@ fn App() -> impl IntoView {
     );
     let generating = RwSignal::new(false);
     let syncing = RwSignal::new(false);
-    let show_favorites_only = RwSignal::new(false);
+    let show_favorites_panel = RwSignal::new(false);
+    let favorite_folder_picker = RwSignal::new(None::<FavoriteFolderPickerState>);
+    let text_popover = RwSignal::new(None::<TextPopoverState>);
+    let text_popover_value = RwSignal::new(String::new());
+    let confirm_popover = RwSignal::new(None::<ConfirmPopoverState>);
     let gallery_page = RwSignal::new(1usize);
     let show_gallery_page_picker = RwSignal::new(false);
     let gallery_page_candidate = RwSignal::new(1usize);
@@ -578,12 +622,10 @@ fn App() -> impl IntoView {
 
     let visible_tasks = Memo::new(move |_| {
         let thread_id = current_thread_id.get();
-        let show_favorites = show_favorites_only.get();
         let mut visible: Vec<LocalTaskRecord> = tasks.with(|task_list| {
             task_list
                 .iter()
                 .filter(|task| task.thread_id == thread_id)
-                .filter(|task| !show_favorites || task.favorite)
                 .cloned()
                 .collect()
         });
@@ -593,7 +635,6 @@ fn App() -> impl IntoView {
 
     Effect::new(move |_| {
         let _ = current_thread_id.get();
-        let _ = show_favorites_only.get();
         gallery_page.set(1);
     });
 
@@ -752,6 +793,43 @@ fn App() -> impl IntoView {
         let visible = visible_tasks.get();
         let config_list = configs.get();
         assets.with(|asset_list| gallery_items(&visible, &config_list, asset_list))
+    });
+    let favorite_folders = Memo::new(move |_| {
+        normalized_favorite_folders(preferences.get().favorite_folders)
+    });
+    let active_favorite_folder_id = Memo::new(move |_| {
+        let folders = favorite_folders.get();
+        let preferred = preferences
+            .get()
+            .active_favorite_folder_id
+            .unwrap_or_else(|| DEFAULT_FAVORITE_FOLDER_ID.into());
+        if folders.iter().any(|folder| folder.id == preferred) {
+            preferred
+        } else {
+            folders
+                .first()
+                .map(|folder| folder.id.clone())
+                .unwrap_or_else(|| DEFAULT_FAVORITE_FOLDER_ID.into())
+        }
+    });
+    let favorite_gallery_entries = Memo::new(move |_| {
+        let folder_id = active_favorite_folder_id.get();
+        let mut favorite_tasks: Vec<LocalTaskRecord> = tasks.with(|task_list| {
+            task_list
+                .iter()
+                .filter(|task| task.favorite)
+                .filter(|task| {
+                    task.favorite_folder_id
+                        .as_deref()
+                        .unwrap_or(DEFAULT_FAVORITE_FOLDER_ID)
+                        == folder_id
+                })
+                .cloned()
+                .collect()
+        });
+        favorite_tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let config_list = configs.get();
+        assets.with(|asset_list| gallery_items(&favorite_tasks, &config_list, asset_list))
     });
     let gallery_page_count = Memo::new(move |_| {
         let total = gallery_entries.get().len();
@@ -1058,38 +1136,33 @@ fn App() -> impl IntoView {
         status_text.set("已新建会话，可以开始新的连续修改。".into());
     };
 
-    let rename_thread = move |thread_id: String| {
+    let open_text_popover = move |kind: TextPopoverKind, title: &str, value: String, x: f64, y: f64| {
+        text_popover_value.set(value);
+        text_popover.set(Some(TextPopoverState {
+            kind,
+            title: title.into(),
+            x,
+            y,
+        }));
+    };
+
+    let rename_thread = move |thread_id: String, x: f64, y: f64| {
         let current_name = threads
             .get_untracked()
             .iter()
             .find(|thread| thread.id == thread_id)
             .map(|thread| thread.title.clone())
             .unwrap_or_else(|| "新的会话".into());
-        let next_name = web_sys::window()
-            .and_then(|window| {
-                window
-                    .prompt_with_message_and_default("重命名会话", &current_name)
-                    .ok()
-                    .flatten()
-            })
-            .unwrap_or_default();
-        if next_name.trim().is_empty() {
-            return;
-        }
-        threads.update(|items| {
-            if let Some(thread) = items.iter_mut().find(|thread| thread.id == thread_id) {
-                thread.title = next_name.trim().to_string();
-                thread.updated_at = now_rfc3339();
-            }
-        });
-        persist_state();
+        open_text_popover(
+            TextPopoverKind::RenameThread(thread_id),
+            "重命名会话",
+            current_name,
+            x,
+            y,
+        );
     };
 
-    let delete_thread = move |thread_id: String| {
-        if !confirm_action("删除会话后，会连同该会话的记录与参考图一起移除，是否继续？")
-        {
-            return;
-        }
+    let perform_delete_thread = move |thread_id: String| {
         let removed_task_ids: Vec<String> = tasks
             .get_untracked()
             .iter()
@@ -1160,6 +1233,16 @@ fn App() -> impl IntoView {
         }
         persist_state();
         status_text.set("会话已删除。".into());
+    };
+
+    let delete_thread = move |thread_id: String, x: f64, y: f64| {
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::DeleteThread(thread_id),
+            title: "删除会话".into(),
+            message: "删除会话后，会连同该会话的记录与参考图一起移除，是否继续？".into(),
+            x,
+            y,
+        }));
     };
 
     let import_reference_assets = move |files: FileList| {
@@ -1339,11 +1422,7 @@ fn App() -> impl IntoView {
         status_text.set("已进入连续修改模式。".into());
     };
 
-    let delete_task = move |task_id: String| {
-        if !confirm_action("删除后会从当前浏览器移除这条生成记录和对应图片，是否继续？")
-        {
-            return;
-        }
+    let perform_delete_task = move |task_id: String| {
         let removed_asset_ids: Vec<String> = assets
             .get_untracked()
             .iter()
@@ -1372,6 +1451,16 @@ fn App() -> impl IntoView {
         status_text.set("历史记录已删除。".into());
     };
 
+    let delete_task = move |task_id: String, x: f64, y: f64| {
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::DeleteTask(task_id),
+            title: "删除记录".into(),
+            message: "删除后会从当前浏览器移除这条生成记录和对应图片，是否继续？".into(),
+            x,
+            y,
+        }));
+    };
+
     let open_preview = move |task_id: String, asset_id: String| {
         let preview_asset_id = asset_id.clone();
         let assets_signal = assets;
@@ -1386,6 +1475,219 @@ fn App() -> impl IntoView {
         preview_offset_y.set(0.0);
         preview_dragging.set(false);
         context_menu_state.set(None);
+    };
+
+    let select_favorite_folder = move |folder_id: String| {
+        preferences.update(|value| {
+            value.favorite_folders = normalized_favorite_folders(value.favorite_folders.clone());
+            value.active_favorite_folder_id = Some(folder_id);
+        });
+        persist_ui_state();
+    };
+
+    let add_favorite_folder = move |x: f64, y: f64| {
+        let folders = normalized_favorite_folders(preferences.get_untracked().favorite_folders);
+        let default_name = format!("文件夹 {}", folders.len() + 1);
+        open_text_popover(
+            TextPopoverKind::AddFavoriteFolder,
+            "新增收藏文件夹",
+            default_name,
+            x,
+            y,
+        );
+    };
+
+    let rename_favorite_folder = move |folder_id: String, x: f64, y: f64| {
+        let current_name = preferences
+            .get_untracked()
+            .favorite_folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .map(|folder| folder.name.clone())
+            .unwrap_or_else(|| "默认".into());
+        open_text_popover(
+            TextPopoverKind::RenameFavoriteFolder(folder_id),
+            "重命名收藏文件夹",
+            current_name,
+            x,
+            y,
+        );
+    };
+
+    let perform_delete_favorite_folder = move |folder_id: String| {
+        preferences.update(|value| {
+            value.favorite_folders = normalized_favorite_folders(value.favorite_folders.clone());
+            if folder_id == DEFAULT_FAVORITE_FOLDER_ID {
+                return;
+            }
+            value.favorite_folders.retain(|folder| folder.id != folder_id);
+            if value.active_favorite_folder_id.as_deref() == Some(folder_id.as_str()) {
+                value.active_favorite_folder_id = Some(DEFAULT_FAVORITE_FOLDER_ID.into());
+            }
+        });
+        tasks.update(|items| {
+            for task in items {
+                if task.favorite_folder_id.as_deref() == Some(folder_id.as_str()) {
+                    task.favorite_folder_id = Some(DEFAULT_FAVORITE_FOLDER_ID.into());
+                    task.updated_at = now_rfc3339();
+                }
+            }
+        });
+        persist_state();
+    };
+
+    let delete_favorite_folder = move |folder_id: String, x: f64, y: f64| {
+        if folder_id == DEFAULT_FAVORITE_FOLDER_ID {
+            return;
+        }
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::DeleteFavoriteFolder(folder_id),
+            title: "删除收藏文件夹".into(),
+            message: "删除文件夹后，其中收藏图片会移动到“默认”文件夹，是否继续？".into(),
+            x,
+            y,
+        }));
+    };
+
+    let submit_text_popover = move || {
+        let Some(state) = text_popover.get_untracked() else {
+            return;
+        };
+        let next_name = text_popover_value.get_untracked().trim().to_string();
+        if next_name.is_empty() {
+            text_popover.set(None);
+            return;
+        }
+        match state.kind {
+            TextPopoverKind::RenameThread(thread_id) => {
+                threads.update(|items| {
+                    if let Some(thread) = items.iter_mut().find(|thread| thread.id == thread_id) {
+                        thread.title = next_name;
+                        thread.updated_at = now_rfc3339();
+                    }
+                });
+                persist_state();
+            }
+            TextPopoverKind::AddFavoriteFolder => {
+                preferences.update(|value| {
+                    value.favorite_folders =
+                        normalized_favorite_folders(value.favorite_folders.clone());
+                    let now = now_rfc3339();
+                    let folder = FavoriteFolder {
+                        id: new_id(),
+                        name: next_name,
+                        created_at: now.clone(),
+                        updated_at: now,
+                    };
+                    value.active_favorite_folder_id = Some(folder.id.clone());
+                    value.favorite_folders.push(folder);
+                });
+                persist_ui_state();
+            }
+            TextPopoverKind::RenameFavoriteFolder(folder_id) => {
+                preferences.update(|value| {
+                    value.favorite_folders =
+                        normalized_favorite_folders(value.favorite_folders.clone());
+                    if let Some(folder) = value
+                        .favorite_folders
+                        .iter_mut()
+                        .find(|folder| folder.id == folder_id)
+                    {
+                        folder.name = next_name;
+                        folder.updated_at = now_rfc3339();
+                    }
+                });
+                persist_ui_state();
+            }
+        }
+        text_popover.set(None);
+    };
+
+    let submit_confirm_popover = move || {
+        let Some(state) = confirm_popover.get_untracked() else {
+            return;
+        };
+        confirm_popover.set(None);
+        match state.kind {
+            ConfirmPopoverKind::DeleteThread(thread_id) => perform_delete_thread(thread_id),
+            ConfirmPopoverKind::DeleteFavoriteFolder(folder_id) => {
+                perform_delete_favorite_folder(folder_id)
+            }
+            ConfirmPopoverKind::DeleteTask(task_id) => perform_delete_task(task_id),
+        }
+    };
+
+    let assign_favorite_folder = move |task_id: String, folder_id: String| {
+        tasks.update(|items| {
+            if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
+                task.favorite = true;
+                task.favorite_folder_id = Some(folder_id);
+                task.updated_at = now_rfc3339();
+            }
+        });
+        preview_panel_state.update(|state| {
+            if let Some(state) = state.as_mut() {
+                if state.task_id == task_id {
+                    state.favorite = true;
+                }
+            }
+        });
+        favorite_folder_picker.set(None);
+        persist_state();
+    };
+
+    let cancel_favorite_for_task = move |task_id: String| {
+        tasks.update(|items| {
+            if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
+                task.favorite = false;
+                task.favorite_folder_id = None;
+                task.updated_at = now_rfc3339();
+            }
+        });
+        preview_panel_state.update(|state| {
+            if let Some(state) = state.as_mut() {
+                if state.task_id == task_id {
+                    state.favorite = false;
+                }
+            }
+        });
+        favorite_folder_picker.set(None);
+        persist_state();
+    };
+
+    let toggle_favorite_for_task = move |task_id: String, x: f64, y: f64| {
+        let is_favorite = tasks.with_untracked(|items| {
+            items
+                .iter()
+                .find(|task| task.id == task_id)
+                .map(|task| task.favorite)
+                .unwrap_or(false)
+        });
+        if is_favorite {
+            favorite_folder_picker.set(Some(FavoriteFolderPickerState {
+                task_id,
+                x,
+                y,
+                is_favorite: true,
+            }));
+            return;
+        }
+
+        let folders = normalized_favorite_folders(preferences.get_untracked().favorite_folders);
+        if folders.len() <= 1 {
+            let folder_id = folders
+                .first()
+                .map(|folder| folder.id.clone())
+                .unwrap_or_else(|| DEFAULT_FAVORITE_FOLDER_ID.into());
+            assign_favorite_folder(task_id, folder_id);
+        } else {
+            favorite_folder_picker.set(Some(FavoriteFolderPickerState {
+                task_id,
+                x,
+                y,
+                is_favorite: false,
+            }));
+        }
     };
 
     let close_preview = move || {
@@ -1517,6 +1819,7 @@ fn App() -> impl IntoView {
                 reference_asset_ids: selected_ids.clone(),
                 result: None,
                 favorite: false,
+                favorite_folder_id: None,
                 status: TaskStatus::Running,
                 error_message: None,
                 created_at: now_rfc3339(),
@@ -1742,7 +2045,7 @@ fn App() -> impl IntoView {
                             asset_build_errors.join("；")
                         )
                     } else if used_proxy {
-                        "生成完成，已自动进入连续修改模式，并通过同源代理绕过跨域限制。".into()
+                        "生成完成，已自动进入连续修改模式。".into()
                     } else {
                         "生成完成，已自动进入连续修改模式，结果已写入当前会话。".into()
                     });
@@ -1774,8 +2077,15 @@ fn App() -> impl IntoView {
         <div class="shell shell-single">
             <header class="panel topbar">
                 <div class="brand brand-inline">
+                    <button
+                        class="button ghost icon-button favorite-top-button"
+                        title="收藏夹"
+                        on:click=move |_| show_favorites_panel.update(|value| *value = !*value)
+                    >
+                        <MaterialSymbolIcon name="star" filled=true />
+                    </button>
                     <h1>"MewImage"</h1>
-                    <span class="muted">"游客本地、登录手动同步、代理兜底"</span>
+                    <span class="muted">"默认本地模式、登录手动同步~"</span>
                 </div>
                 <div class="row topbar-actions">
                     <button class="button ghost" on:click=move |_| {
@@ -1874,15 +2184,277 @@ fn App() -> impl IntoView {
                 ().into_any()
             }}
 
+            {move || if show_favorites_panel.get() {
+                view! {
+                    <div class="favorites-overlay" on:click=move |_| show_favorites_panel.set(false)>
+                        <div class="favorites-popover" on:click=move |ev: MouseEvent| ev.stop_propagation()>
+                            <div class="favorites-header">
+                                <div class="row">
+                                    <MaterialSymbolIcon name="star" filled=true />
+                                    <h2>"全局收藏"</h2>
+                                    <span class="tag">{move || format!("{} 张", favorite_gallery_entries.get().len())}</span>
+                                </div>
+                                <button class="button ghost icon-button" title="关闭收藏夹" on:click=move |_| show_favorites_panel.set(false)>
+                                    <MaterialSymbolIcon name="close" filled=false />
+                                </button>
+                            </div>
+                            <div class="favorite-folder-tabs">
+                                {move || favorite_folders
+                                    .get()
+                                    .into_iter()
+                                    .map(|folder| {
+                                        let folder_id = folder.id.clone();
+                                        let active_folder_id = folder.id.clone();
+                                        let rename_folder_id = folder.id.clone();
+                                        let delete_folder_id = folder.id.clone();
+                                        let can_delete_folder = folder.id != DEFAULT_FAVORITE_FOLDER_ID;
+                                        view! {
+                                            <div
+                                                class="favorite-folder-tab"
+                                                class:is-active=move || active_favorite_folder_id.get() == active_folder_id
+                                            >
+                                                <button class="favorite-folder-tab-main" on:click=move |_| select_favorite_folder(folder_id.clone())>
+                                                    <MaterialSymbolIcon name="folder" filled=false />
+                                                    <span>{folder.name}</span>
+                                                </button>
+                                                <button class="favorite-folder-rename" title="重命名收藏文件夹" on:click=move |ev: MouseEvent| rename_favorite_folder(rename_folder_id.clone(), ev.client_x() as f64, ev.client_y() as f64)>
+                                                    <MaterialSymbolIcon name="edit_square" filled=false />
+                                                </button>
+                                                {if can_delete_folder {
+                                                    view! {
+                                                        <button class="favorite-folder-rename danger" title="删除收藏文件夹" on:click=move |ev: MouseEvent| delete_favorite_folder(delete_folder_id.clone(), ev.client_x() as f64, ev.client_y() as f64)>
+                                                            <MaterialSymbolIcon name="delete" filled=false />
+                                                        </button>
+                                                    }.into_any()
+                                                } else {
+                                                    ().into_any()
+                                                }}
+                                            </div>
+                                        }.into_any()
+                                    })
+                                    .collect::<Vec<_>>()}
+                                <button class="favorite-folder-add" title="新增收藏文件夹" on:click=move |ev: MouseEvent| add_favorite_folder(ev.client_x() as f64, ev.client_y() as f64)>
+                                    <MaterialSymbolIcon name="add" filled=false />
+                                </button>
+                            </div>
+                            <div class="favorite-gallery-grid">
+                                {move || {
+                                    let entries = favorite_gallery_entries.get();
+                                    if entries.is_empty() {
+                                        return vec![view! {
+                                            <div class="favorite-empty">
+                                                <MaterialSymbolIcon name="star" filled=false />
+                                                <strong>"这个文件夹还没有收藏~"</strong>
+                                                <span class="muted">"点击画廊卡片里的星星就能加入这里。"</span>
+                                            </div>
+                                        }.into_any()];
+                                    }
+                                    entries
+                                        .into_iter()
+                                        .map(|item| {
+                                            let task_id = item.task_id.clone();
+                                            let asset_id = item.asset_id.clone();
+                                            let prompt = item.prompt.clone();
+                                            let show_failure_log = tasks.with_untracked(|items| {
+                                                items
+                                                    .iter()
+                                                    .find(|task| task.id == task_id)
+                                                    .and_then(|task| task.error_message.clone())
+                                                    .is_some()
+                                            });
+                                            let rerun_task_id = task_id.clone();
+                                            let continue_task_id = task_id.clone();
+                                            let favorite_task_id = task_id.clone();
+                                            let delete_task_id = task_id.clone();
+                                            let open_task_id = task_id.clone();
+                                            let ratio_label = item.ratio_label.clone();
+                                            let size_label = item.size_label.clone();
+                                            view! {
+                                                <article class="card gallery-card-compact favorite-gallery-card">
+                                                    {item.src.clone().map(|src| {
+                                                        let open_asset_id = asset_id.clone();
+                                                        let open_task_id = open_task_id.clone();
+                                                        let ratio_label = ratio_label.clone();
+                                                        let size_label = size_label.clone();
+                                                        view! {
+                                                            <button class="image-button compact-preview-button" on:click=move |_| {
+                                                                if let Some(asset_id) = open_asset_id.clone() {
+                                                                    open_preview(open_task_id.clone(), asset_id);
+                                                                }
+                                                            }>
+                                                                <div class="gallery-image-overlay">
+                                                                    <span class="gallery-corner-badge">{ratio_label}</span>
+                                                                    <span class="gallery-corner-badge">{size_label}</span>
+                                                                </div>
+                                                                <img class="compact-preview-image" src=src alt=prompt.clone() />
+                                                            </button>
+                                                        }.into_any()
+                                                    }).unwrap_or_else(|| view! {
+                                                        <div class="compact-preview-fallback favorite-empty-thumb">"无预览"</div>
+                                                    }.into_any())}
+                                                    <div class="card-body stack compact-card-body">
+                                                        <p class="gallery-card-title">{item.prompt.clone()}</p>
+                                                        <div class="gallery-meta">
+                                                            <span class="gallery-badge" title=format!("{} · {}", item.config_name, item.model)>
+                                                                {format!("{} · {}", item.config_name, item.model)}
+                                                            </span>
+                                                        </div>
+                                                        <div class="row compact-actions">
+                                                            <button class="button ghost mini-action icon-action" title="重新生成" on:click=move |_| rerun_task(rerun_task_id.clone())>
+                                                                <MaterialSymbolIcon name="restart_alt" filled=false />
+                                                            </button>
+                                                            <button class="button ghost mini-action icon-action" title="继续修改" on:click=move |_| {
+                                                                if let Some(first_asset) = assets.with_untracked(|items| {
+                                                                    items.iter().find(|asset| asset.source_task_id.as_deref() == Some(continue_task_id.as_str())).cloned()
+                                                                }) {
+                                                                    enter_continuation_context(continue_task_id.clone(), first_asset.id);
+                                                                    show_favorites_panel.set(false);
+                                                                }
+                                                            }>
+                                                                <MaterialSymbolIcon name="edit_square" filled=false />
+                                                            </button>
+                                                            <button
+                                                                class="button ghost mini-action icon-action"
+                                                                title="移动或取消收藏"
+                                                                on:click=move |ev: MouseEvent| {
+                                                                    toggle_favorite_for_task(
+                                                                        favorite_task_id.clone(),
+                                                                        ev.client_x() as f64,
+                                                                        ev.client_y() as f64,
+                                                                    );
+                                                                }
+                                                            >
+                                                                <MaterialSymbolIcon name="star" filled=true />
+                                                            </button>
+                                                            {if show_failure_log {
+                                                                view! {
+                                                                    <button class="button ghost mini-action icon-action" title="查看失败日志" on:click=move |_| open_failure_log(task_id.clone())>
+                                                                        <MaterialSymbolIcon name="receipt_long" filled=false />
+                                                                    </button>
+                                                                }.into_any()
+                                                            } else {
+                                                                ().into_any()
+                                                            }}
+                                                            <button class="button ghost danger mini-action icon-action" title="删除记录" on:click=move |ev: MouseEvent| delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64)>
+                                                                <MaterialSymbolIcon name="delete" filled=false />
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                </article>
+                                            }.into_any()
+                                        })
+                                        .collect::<Vec<_>>()
+                                }}
+                            </div>
+                        </div>
+                    </div>
+                }.into_any()
+            } else {
+                ().into_any()
+            }}
+
+            {move || text_popover.get().map(|state| {
+                let style = format!("left: {}px; top: {}px;", state.x + 8.0, state.y + 8.0);
+                view! {
+                    <>
+                        <button class="inline-popover-dismiss" aria-label="关闭输入弹窗" on:click=move |_| text_popover.set(None)></button>
+                        <div class="inline-action-popover" style=style on:click=move |ev: MouseEvent| ev.stop_propagation()>
+                            <strong>{state.title}</strong>
+                            <input
+                                class="text-input inline-popover-input"
+                                prop:value=move || text_popover_value.get()
+                                on:input=move |ev| text_popover_value.set(event_target_value(&ev))
+                                on:keydown=move |ev: KeyboardEvent| {
+                                    match ev.key().as_str() {
+                                        "Enter" => {
+                                            ev.prevent_default();
+                                            submit_text_popover();
+                                        }
+                                        "Escape" => text_popover.set(None),
+                                        _ => {}
+                                    }
+                                }
+                            />
+                            <div class="row inline-popover-actions">
+                                <button class="button ghost" on:click=move |_| text_popover.set(None)>"取消"</button>
+                                <button class="button secondary" on:click=move |_| submit_text_popover()>"确定"</button>
+                            </div>
+                        </div>
+                    </>
+                }.into_any()
+            }).unwrap_or_else(|| ().into_any())}
+
+            {move || confirm_popover.get().map(|state| {
+                let style = format!("left: {}px; top: {}px;", state.x + 8.0, state.y + 8.0);
+                view! {
+                    <>
+                        <button class="inline-popover-dismiss" aria-label="关闭确认弹窗" on:click=move |_| confirm_popover.set(None)></button>
+                        <div class="inline-action-popover confirm-popover" style=style on:click=move |ev: MouseEvent| ev.stop_propagation()>
+                            <strong>{state.title}</strong>
+                            <p class="muted">{state.message}</p>
+                            <div class="row inline-popover-actions">
+                                <button class="button ghost" on:click=move |_| confirm_popover.set(None)>"取消"</button>
+                                <button class="button danger" on:click=move |_| submit_confirm_popover()>"确认删除"</button>
+                            </div>
+                        </div>
+                    </>
+                }.into_any()
+            }).unwrap_or_else(|| ().into_any())}
+
+            {move || favorite_folder_picker.get().map(|picker| {
+                let style = format!("left: {}px; top: {}px;", picker.x + 8.0, picker.y + 8.0);
+                let current_folder_id = tasks.with_untracked(|items| {
+                    items
+                        .iter()
+                        .find(|task| task.id == picker.task_id)
+                        .and_then(|task| task.favorite_folder_id.clone())
+                        .unwrap_or_else(|| DEFAULT_FAVORITE_FOLDER_ID.into())
+                });
+                let folder_options: Vec<FavoriteFolder> = favorite_folders
+                    .get()
+                    .into_iter()
+                    .filter(|folder| !picker.is_favorite || folder.id != current_folder_id)
+                    .collect();
+                view! {
+                    <>
+                        <button class="folder-picker-dismiss" aria-label="关闭收藏文件夹选择" on:click=move |_| favorite_folder_picker.set(None)></button>
+                        <div class="folder-picker-popover" style=style>
+                            <strong>{if picker.is_favorite { "移动到" } else { "收藏到" }}</strong>
+                            {folder_options
+                                .into_iter()
+                                .map(|folder| {
+                                    let task_id = picker.task_id.clone();
+                                    let folder_id = folder.id.clone();
+                                    view! {
+                                        <button class="folder-picker-item" on:click=move |_| assign_favorite_folder(task_id.clone(), folder_id.clone())>
+                                            <MaterialSymbolIcon name="folder" filled=false />
+                                            <span>{folder.name}</span>
+                                        </button>
+                                    }.into_any()
+                                })
+                                .collect::<Vec<_>>()}
+                            {if picker.is_favorite {
+                                let cancel_task_id = picker.task_id.clone();
+                                view! {
+                                    <button class="folder-picker-item folder-picker-cancel" on:click=move |_| cancel_favorite_for_task(cancel_task_id.clone())>
+                                        <MaterialSymbolIcon name="star" filled=false />
+                                        <span>"取消收藏"</span>
+                                    </button>
+                                }.into_any()
+                            } else {
+                                ().into_any()
+                            }}
+                        </div>
+                    </>
+                }.into_any()
+            }).unwrap_or_else(|| ().into_any())}
+
             <main class="workspace-layout">
                 <aside class="panel gallery-sidebar">
                     <div class="row">
                         <h2>"结果画廊"</h2>
-                        <div class="row">
-                            <button class="button ghost" on:click=move |_| show_favorites_only.update(|value| *value = !*value)>
-                                {move || if show_favorites_only.get() { "显示全部" } else { "仅收藏" }}
-                            </button>
-                            <span class="tag">{move || format!("{} 张", gallery_entries.get().len())}</span>
+                        <div class="row gallery-title-actions">
+                            <span class="tag gallery-count-tag">{move || format!("{} 张", gallery_entries.get().len())}</span>
                         </div>
                     </div>
                     <div class="gallery sidebar-gallery">
@@ -1974,13 +2546,12 @@ fn App() -> impl IntoView {
                                                             enter_continuation_context(continue_task_id.clone(), first_asset.id);
                                                         }
                                                     }><MaterialSymbolIcon name="edit_square" filled=false /></button>
-                                                    <button class="button ghost mini-action icon-action" on:click=move |_| {
-                                                        tasks.update(|items| {
-                                                            if let Some(found) = items.iter_mut().find(|task| task.id == favorite_task_id) {
-                                                                found.favorite = !found.favorite;
-                                                            }
-                                                        });
-                                                        persist_state();
+                                                    <button class="button ghost mini-action icon-action" on:click=move |ev: MouseEvent| {
+                                                        toggle_favorite_for_task(
+                                                            favorite_task_id.clone(),
+                                                            ev.client_x() as f64,
+                                                            ev.client_y() as f64,
+                                                        );
                                                     } title=move || {
                                                         if tasks.with(|items| {
                                                             items.iter()
@@ -2028,7 +2599,7 @@ fn App() -> impl IntoView {
                                                     } else {
                                                         ().into_any()
                                                     }}
-                                                    <button class="button ghost danger mini-action icon-action" title="删除记录" on:click=move |_| delete_task(delete_task_id.clone())><MaterialSymbolIcon name="delete" filled=false /></button>
+                                                    <button class="button ghost danger mini-action icon-action" title="删除记录" on:click=move |ev: MouseEvent| delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64)><MaterialSymbolIcon name="delete" filled=false /></button>
                                                 </div>
                                             </div>
                                         </article>
@@ -2248,14 +2819,14 @@ fn App() -> impl IntoView {
                                             <button
                                                 class="button ghost mini-action icon-action"
                                                 title="重命名会话"
-                                                on:click=move |_| rename_thread(rename_thread_id.clone())
+                                                on:click=move |ev: MouseEvent| rename_thread(rename_thread_id.clone(), ev.client_x() as f64, ev.client_y() as f64)
                                             >
                                                 <MaterialSymbolIcon name="edit_square" filled=false />
                                             </button>
                                             <button
                                                 class="button ghost danger mini-action icon-action"
                                                 title="删除会话"
-                                                on:click=move |_| delete_thread(delete_thread_id.clone())
+                                                on:click=move |ev: MouseEvent| delete_thread(delete_thread_id.clone(), ev.client_x() as f64, ev.client_y() as f64)
                                             >
                                                 <MaterialSymbolIcon name="delete" filled=false />
                                             </button>
@@ -2993,22 +3564,16 @@ fn App() -> impl IntoView {
                                         close_preview();
                                     }>"复用配置"</button>
                                     <button class="button secondary" on:click=move |_| edit_output_asset(edit_task_id.clone(), edit_asset_id.clone())>"编辑输出"</button>
-                                    <button class="button ghost danger" on:click=move |_| {
+                                    <button class="button ghost danger" on:click=move |ev: MouseEvent| {
                                         close_preview();
-                                        delete_task(delete_task_id.clone());
+                                        delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64);
                                     }>"删除记录"</button>
-                                    <button class="button ghost" on:click=move |_| {
-                                        tasks.update(|items| {
-                                            if let Some(found) = items.iter_mut().find(|item| item.id == favorite_task_id) {
-                                                found.favorite = !found.favorite;
-                                            }
-                                        });
-                                        preview_panel_state.update(|state| {
-                                            if let Some(state) = state.as_mut() {
-                                                state.favorite = !state.favorite;
-                                            }
-                                        });
-                                        persist_state();
+                                    <button class="button ghost" on:click=move |ev: MouseEvent| {
+                                        toggle_favorite_for_task(
+                                            favorite_task_id.clone(),
+                                            ev.client_x() as f64,
+                                            ev.client_y() as f64,
+                                        );
                                     }>
                                         {move || if preview_panel_state.get().map(|state| state.favorite).unwrap_or(false) { "取消收藏" } else { "收藏" }}
                                     </button>
@@ -3104,8 +3669,8 @@ fn App() -> impl IntoView {
                                     <MaterialSymbolIcon name="content_copy" filled=false />
                                     "复制"
                                 </button>
-                                <button class="button ghost danger" on:click=move |_| {
-                                    delete_task(delete_task_id.clone());
+                                <button class="button ghost danger" on:click=move |ev: MouseEvent| {
+                                    delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64);
                                     failure_log_state.set(None);
                                 }>
                                     <MaterialSymbolIcon name="delete" filled=false />
@@ -3486,6 +4051,35 @@ fn gallery_items(
         }
     }
     items
+}
+
+fn normalized_favorite_folders(mut folders: Vec<FavoriteFolder>) -> Vec<FavoriteFolder> {
+    if folders.is_empty() {
+        let now = now_rfc3339();
+        folders.push(FavoriteFolder {
+            id: DEFAULT_FAVORITE_FOLDER_ID.into(),
+            name: "默认".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        });
+        return folders;
+    }
+    if !folders
+        .iter()
+        .any(|folder| folder.id == DEFAULT_FAVORITE_FOLDER_ID)
+    {
+        let now = now_rfc3339();
+        folders.insert(
+            0,
+            FavoriteFolder {
+                id: DEFAULT_FAVORITE_FOLDER_ID.into(),
+                name: "默认".into(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        );
+    }
+    folders
 }
 
 fn reconcile_task_integrity(
