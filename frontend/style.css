@@ -934,6 +934,96 @@ body[data-theme="night"] .thread-chip-actions {
   min-width: 0;
 }
 
+.compact-help {
+  margin: -4px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.account-security-card,
+.admin-user-list,
+.admin-empty {
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background:
+    linear-gradient(135deg, rgba(255, 125, 176, 0.1), rgba(140, 202, 255, 0.08)),
+    var(--panel-strong);
+}
+
+.account-security-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+}
+
+.account-security-card h3 {
+  font-size: 15px;
+}
+
+.admin-panel {
+  grid-column: 1 / -1;
+}
+
+.admin-panel-header {
+  justify-content: space-between;
+}
+
+.admin-user-list {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  max-height: min(420px, 48vh);
+  overflow: auto;
+}
+
+.admin-empty {
+  padding: 18px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.admin-user-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto minmax(120px, auto) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.26);
+  border: 1px solid rgba(255, 125, 176, 0.12);
+}
+
+body[data-theme="night"] .admin-user-row {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.admin-user-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.admin-user-main strong,
+.admin-user-main span,
+.admin-user-date {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-user-actions {
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.admin-user-actions .button {
+  min-height: 34px;
+  padding: 8px 12px;
+  border-radius: 13px;
+}
+
 .resolution-sheet {
   width: min(720px, 100%);
   min-height: 360px;

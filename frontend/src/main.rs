@@ -15,12 +15,12 @@ use gloo_net::http::Request;
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use leptos::{html, prelude::*, task::spawn_local};
 use mew_image_shared::{
-    AppPreferences, AuthRequest, AuthResponse, BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
-    ConversationThread, DEFAULT_FAVORITE_FOLDER_ID, EncryptedApiConfig, FavoriteFolder,
-    ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse, ProviderAccessMode,
-    ProviderEndpointMode, ProviderKind, ProviderTemplate, SyncCheckpoint, SyncPullResponse,
-    TaskStatus, ThemePreference, UserSummary, clamp_size, new_id, normalize_api_config,
-    now_rfc3339,
+    AdminUserActionRequest, AdminUserSummary, AdminUsersResponse, AppPreferences, AuthRequest,
+    AuthResponse, BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, ConversationThread,
+    DEFAULT_FAVORITE_FOLDER_ID, EncryptedApiConfig, FavoriteFolder, ImageAssetRef, LocalAppState,
+    LocalTaskRecord, MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
+    ProviderTemplate, RegisterRequest, SyncCheckpoint, SyncPullResponse, TaskStatus,
+    ThemePreference, UserSummary, clamp_size, new_id, normalize_api_config, now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -185,6 +185,13 @@ fn App() -> impl IntoView {
     let auth_user = RwSignal::new(None::<UserSummary>);
     let login_username = RwSignal::new(String::new());
     let login_password = RwSignal::new(String::new());
+    let register_password_confirm = RwSignal::new(String::new());
+    let admin_setup_token = RwSignal::new(String::new());
+    let change_old_password = RwSignal::new(String::new());
+    let change_new_password = RwSignal::new(String::new());
+    let change_new_password_confirm = RwSignal::new(String::new());
+    let admin_users = RwSignal::new(Vec::<AdminUserSummary>::new());
+    let loading_admin_users = RwSignal::new(false);
     let sync_secret = RwSignal::new(String::new());
     let current_thread_id = RwSignal::new(String::new());
     let current_config_id = RwSignal::new(String::new());
@@ -975,6 +982,10 @@ fn App() -> impl IntoView {
             status_text.set("登录后才会启用跨设备同步。".into());
             return;
         };
+        if user.status != "approved" {
+            status_text.set("账号仍在等待管理员审批，暂不能使用云端同步。".into());
+            return;
+        }
         syncing.set(true);
         status_text.set("正在同步本地记录到云端……".into());
         let state = snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
@@ -988,6 +999,7 @@ fn App() -> impl IntoView {
         let assets_signal = assets;
         let preferences_signal = preferences;
         let checkpoint_signal = checkpoint;
+        let auth_user_signal = auth_user;
         spawn_local(async move {
             let envelope = match prepare_sync_envelope(
                 &state,
@@ -1043,6 +1055,15 @@ fn App() -> impl IntoView {
                         persist();
                         persist_ui_state();
                         status_signal.set(format!("已完成与 {} 的云端同步。", user.username));
+                        if let Ok(response) = Request::get(&api_url("/api/auth/me"))
+                            .credentials(web_sys::RequestCredentials::Include)
+                            .send()
+                            .await
+                        {
+                            if let Ok(me) = response.json::<MeResponse>().await {
+                                auth_user_signal.set(me.user);
+                            }
+                        }
                     }
                     Err(error) => status_signal.set(format!("同步响应解析失败：{error}")),
                 },
@@ -1062,21 +1083,37 @@ fn App() -> impl IntoView {
             status_text.set("请先填写用户名和密码。".into());
             return;
         }
+        if mode == "register" {
+            let confirm = register_password_confirm.get_untracked();
+            if let Err(message) = validate_frontend_password_strength(&password, &confirm) {
+                status_text.set(message);
+                return;
+            }
+        }
         status_text.set("正在处理账号状态……".into());
         let auth_user = auth_user;
         let sync_secret = sync_secret;
         let status_text = status_text;
+        let password_confirm = register_password_confirm.get_untracked();
+        let setup_token = admin_setup_token.get_untracked();
         spawn_local(async move {
-            let request = Request::post(&api_url(if mode == "register" {
-                "/api/auth/register"
+            let request = if mode == "register" {
+                Request::post(&api_url("/api/auth/register"))
+                    .credentials(web_sys::RequestCredentials::Include)
+                    .json(&RegisterRequest {
+                        username,
+                        password: password.clone(),
+                        password_confirm,
+                        admin_setup_token: non_empty_string(setup_token),
+                    })
             } else {
-                "/api/auth/login"
-            }))
-            .credentials(web_sys::RequestCredentials::Include)
-            .json(&AuthRequest {
-                username,
-                password: password.clone(),
-            });
+                Request::post(&api_url("/api/auth/login"))
+                    .credentials(web_sys::RequestCredentials::Include)
+                    .json(&AuthRequest {
+                        username,
+                        password: password.clone(),
+                    })
+            };
             let Ok(builder) = request else {
                 status_text.set("认证请求序列化失败。".into());
                 return;
@@ -1086,10 +1123,7 @@ fn App() -> impl IntoView {
                     Ok(auth) => {
                         sync_secret.set(password);
                         auth_user.set(Some(auth.user.clone()));
-                        status_text.set(format!(
-                            "欢迎，{}。现在可以手动进行跨设备同步。",
-                            auth.user.username
-                        ));
+                        status_text.set(auth_status_message(&auth.user));
                     }
                     Err(error) => status_text.set(format!("认证响应解析失败：{error}")),
                 },
@@ -1097,6 +1131,132 @@ fn App() -> impl IntoView {
                     status_text.set(response.text().await.unwrap_or_else(|_| "认证失败".into()));
                 }
                 Err(error) => status_text.set(format!("认证失败：{error}")),
+            }
+        });
+    };
+
+    let change_password = move |_| {
+        let old_password = change_old_password.get_untracked();
+        let new_password = change_new_password.get_untracked();
+        let new_password_confirm = change_new_password_confirm.get_untracked();
+        if auth_user.get_untracked().is_none() {
+            status_text.set("请先登录后再修改密码。".into());
+            return;
+        }
+        if let Err(message) = validate_frontend_password_strength(&new_password, &new_password_confirm) {
+            status_text.set(message);
+            return;
+        }
+        if old_password.is_empty() {
+            status_text.set("请填写当前密码。".into());
+            return;
+        }
+        status_text.set("正在更新密码……".into());
+        let status_text = status_text;
+        let sync_secret = sync_secret;
+        let change_old_password = change_old_password;
+        let change_new_password = change_new_password;
+        let change_new_password_confirm = change_new_password_confirm;
+        spawn_local(async move {
+            let request = Request::post(&api_url("/api/auth/change-password"))
+                .credentials(web_sys::RequestCredentials::Include)
+                .json(&ChangePasswordRequest {
+                    old_password,
+                    new_password: new_password.clone(),
+                    new_password_confirm,
+                });
+            let Ok(builder) = request else {
+                status_text.set("改密请求序列化失败。".into());
+                return;
+            };
+            match builder.send().await {
+                Ok(response) if response.ok() => {
+                    sync_secret.set(new_password);
+                    change_old_password.set(String::new());
+                    change_new_password.set(String::new());
+                    change_new_password_confirm.set(String::new());
+                    status_text.set("密码已更新，下次登录请使用新密码。".into());
+                }
+                Ok(response) => {
+                    status_text.set(response.text().await.unwrap_or_else(|_| "修改密码失败".into()));
+                }
+                Err(error) => status_text.set(format!("修改密码失败：{error}")),
+            }
+        });
+    };
+
+    let refresh_admin_users = move |_| {
+        if !auth_user
+            .get_untracked()
+            .map(|user| user.role == "admin")
+            .unwrap_or(false)
+        {
+            status_text.set("只有管理员可以查看用户审批列表。".into());
+            return;
+        }
+        loading_admin_users.set(true);
+        status_text.set("正在刷新用户列表……".into());
+        let admin_users = admin_users;
+        let loading_admin_users = loading_admin_users;
+        let status_text = status_text;
+        spawn_local(async move {
+            match Request::get(&api_url("/api/admin/users"))
+                .credentials(web_sys::RequestCredentials::Include)
+                .send()
+                .await
+            {
+                Ok(response) if response.ok() => match response.json::<AdminUsersResponse>().await {
+                    Ok(payload) => {
+                        let count = payload.users.len();
+                        admin_users.set(payload.users);
+                        status_text.set(format!("已刷新用户列表，共 {count} 个账号。"));
+                    }
+                    Err(error) => status_text.set(format!("用户列表解析失败：{error}")),
+                },
+                Ok(response) => {
+                    status_text.set(response.text().await.unwrap_or_else(|_| "刷新用户列表失败".into()));
+                }
+                Err(error) => status_text.set(format!("刷新用户列表失败：{error}")),
+            }
+            loading_admin_users.set(false);
+        });
+    };
+
+    let admin_user_action = move |endpoint: &'static str, user_id: String| {
+        status_text.set("正在提交管理员操作……".into());
+        let status_text = status_text;
+        let admin_users = admin_users;
+        let loading_admin_users = loading_admin_users;
+        spawn_local(async move {
+            let request = Request::post(&api_url(endpoint))
+                .credentials(web_sys::RequestCredentials::Include)
+                .json(&AdminUserActionRequest { user_id });
+            let Ok(builder) = request else {
+                status_text.set("管理员操作序列化失败。".into());
+                return;
+            };
+            match builder.send().await {
+                Ok(response) if response.ok() => {
+                    status_text.set("管理员操作已完成，正在刷新列表。".into());
+                    loading_admin_users.set(true);
+                    match Request::get(&api_url("/api/admin/users"))
+                        .credentials(web_sys::RequestCredentials::Include)
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.ok() => {
+                            if let Ok(payload) = response.json::<AdminUsersResponse>().await {
+                                admin_users.set(payload.users);
+                            }
+                        }
+                        _ => {}
+                    }
+                    loading_admin_users.set(false);
+                }
+                Ok(response) => {
+                    status_text.set(response.text().await.unwrap_or_else(|_| "管理员操作失败".into()));
+                }
+                Err(error) => status_text.set(format!("管理员操作失败：{error}")),
             }
         });
     };
@@ -2154,14 +2314,23 @@ fn App() -> impl IntoView {
                                 <section class="stack">
                                     <div class="row">
                                         <h2>"账号与同步"</h2>
-                                        <span class="tag">{move || auth_user.get().map(|user| user.username).unwrap_or_else(|| "游客本地 + 受限代理模式".into())}</span>
+                                        <span class="tag">{move || auth_user
+                                            .get()
+                                            .map(|user| format!("{} · {} · 服务器图片 {} 张", user.username, user.status, user.image_count))
+                                            .unwrap_or_else(|| "游客本地 + 受限代理模式".into())}</span>
                                     </div>
                                     <p class="status">
                                         {move || {
-                                            if auth_user.get().is_some() {
-                                                "已登录：本地继续优先，只有点击“立即同步”才会上云。".to_string()
-                                            } else {
-                                                "未登录：会话、历史、参考图和配置都保存在当前浏览器；代理仅临时中转请求，不写入云端同步或对象存储。".to_string()
+                                            match auth_user.get() {
+                                                Some(user) if user.status == "approved" => {
+                                                    "已登录且审批通过：本地继续优先，只有点击“立即同步”才会上云。".to_string()
+                                                }
+                                                Some(_) => {
+                                                    "已登录但账号待审批：可以继续本地使用，暂不能使用云端同步和服务器资源存储。".to_string()
+                                                }
+                                                None => {
+                                                    "未登录：会话、历史、参考图和配置都保存在当前浏览器；代理仅临时中转请求，不写入云端同步或对象存储。".to_string()
+                                                }
                                             }
                                         }}
                                     </p>
@@ -2178,13 +2347,64 @@ fn App() -> impl IntoView {
                                         prop:value=move || login_password.get()
                                         on:input=move |ev| login_password.set(event_target_value(&ev))
                                     />
+                                    <input
+                                        class="text-input"
+                                        type="password"
+                                        placeholder="确认密码（注册 / 改密时使用）"
+                                        prop:value=move || register_password_confirm.get()
+                                        on:input=move |ev| register_password_confirm.set(event_target_value(&ev))
+                                    />
+                                    <input
+                                        class="text-input"
+                                        type="password"
+                                        placeholder="管理员初始化口令（仅首次管理员注册，可选）"
+                                        prop:value=move || admin_setup_token.get()
+                                        on:input=move |ev| admin_setup_token.set(event_target_value(&ev))
+                                    />
+                                    <p class="status compact-help">"注册密码需至少 10 位，并包含大写、小写、数字和符号。普通注册账号需管理员审批后才能同步。"</p>
                                     <div class="row">
                                         <button class="button" on:click=move |_| submit_auth("login")>"登录"</button>
                                         <button class="button secondary" on:click=move |_| submit_auth("register")>"注册"</button>
-                                        <button class="button ghost" on:click=move |_| sync_action() disabled=move || syncing.get()>
+                                        <button
+                                            class="button ghost"
+                                            on:click=move |_| sync_action()
+                                            disabled=move || syncing.get()
+                                                || auth_user.get().map(|user| user.status != "approved").unwrap_or(true)
+                                        >
                                             {move || if syncing.get() { "同步中…" } else { "立即同步" }}
                                         </button>
                                     </div>
+                                    {move || if auth_user.get().is_some() {
+                                        view! {
+                                            <div class="account-security-card">
+                                                <h3>"账号安全"</h3>
+                                                <input
+                                                    class="text-input"
+                                                    type="password"
+                                                    placeholder="当前密码"
+                                                    prop:value=move || change_old_password.get()
+                                                    on:input=move |ev| change_old_password.set(event_target_value(&ev))
+                                                />
+                                                <input
+                                                    class="text-input"
+                                                    type="password"
+                                                    placeholder="新密码"
+                                                    prop:value=move || change_new_password.get()
+                                                    on:input=move |ev| change_new_password.set(event_target_value(&ev))
+                                                />
+                                                <input
+                                                    class="text-input"
+                                                    type="password"
+                                                    placeholder="再次输入新密码"
+                                                    prop:value=move || change_new_password_confirm.get()
+                                                    on:input=move |ev| change_new_password_confirm.set(event_target_value(&ev))
+                                                />
+                                                <button class="button secondary" on:click=change_password>"更新密码"</button>
+                                            </div>
+                                        }.into_any()
+                                    } else {
+                                        ().into_any()
+                                    }}
                                 </section>
 
                                 <section class="stack">
@@ -2216,6 +2436,73 @@ fn App() -> impl IntoView {
                                         save_configs_only=move || persist_ui_state()
                                     />
                                 </section>
+
+                                {move || if auth_user
+                                    .get()
+                                    .map(|user| user.role == "admin")
+                                    .unwrap_or(false)
+                                {
+                                    view! {
+                                        <section class="stack admin-panel">
+                                            <div class="row admin-panel-header">
+                                                <h2>"用户审批"</h2>
+                                                <button class="button ghost" on:click=refresh_admin_users disabled=move || loading_admin_users.get()>
+                                                    {move || if loading_admin_users.get() { "刷新中…" } else { "刷新列表" }}
+                                                </button>
+                                            </div>
+                                            <div class="admin-user-list">
+                                                {move || {
+                                                    let rows = admin_users.get();
+                                                    if rows.is_empty() {
+                                                        return vec![view! {
+                                                            <div class="admin-empty">
+                                                                "还没有加载用户列表。点击“刷新列表”查看注册申请。"
+                                                            </div>
+                                                        }.into_any()];
+                                                    }
+                                                    rows.into_iter().map(|user| {
+                                                        let approve_id = user.id.clone();
+                                                        let disable_id = user.id.clone();
+                                                        let restore_id = user.id.clone();
+                                                        view! {
+                                                            <article class="admin-user-row">
+                                                                <div class="admin-user-main">
+                                                                    <strong>{user.username}</strong>
+                                                                    <span class="muted">{format!("{} · {}", user.role, user.status)}</span>
+                                                                </div>
+                                                                <span class="tag">{format!("服务器图片 {} 张", user.image_count)}</span>
+                                                                <span class="muted admin-user-date">{format!("注册 {}", user.created_at)}</span>
+                                                                <div class="row admin-user-actions">
+                                                                    {if user.status == "pending" {
+                                                                        view! {
+                                                                            <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/approve", approve_id.clone())>
+                                                                                "批准"
+                                                                            </button>
+                                                                        }.into_any()
+                                                                    } else if user.status == "disabled" {
+                                                                        view! {
+                                                                            <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/restore", restore_id.clone())>
+                                                                                "恢复"
+                                                                            </button>
+                                                                        }.into_any()
+                                                                    } else {
+                                                                        view! {
+                                                                            <button class="button ghost danger" on:click=move |_| admin_user_action("/api/admin/users/disable", disable_id.clone())>
+                                                                                "禁用"
+                                                                            </button>
+                                                                        }.into_any()
+                                                                    }}
+                                                                </div>
+                                                            </article>
+                                                        }.into_any()
+                                                    }).collect::<Vec<_>>()
+                                                }}
+                                            </div>
+                                        </section>
+                                    }.into_any()
+                                } else {
+                                    ().into_any()
+                                }}
                             </div>
                         </div>
                     </div>
@@ -4727,6 +5014,48 @@ fn summarize_prompt(prompt: &str) -> String {
         format!("{summary}…")
     } else {
         summary
+    }
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn validate_frontend_password_strength(password: &str, confirm: &str) -> Result<(), String> {
+    if password != confirm {
+        return Err("两次输入的密码不一致。".into());
+    }
+    if password.len() < 10 {
+        return Err("密码至少需要 10 个字符。".into());
+    }
+    let has_upper = password.chars().any(|ch| ch.is_ascii_uppercase());
+    let has_lower = password.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_digit = password.chars().any(|ch| ch.is_ascii_digit());
+    let has_symbol = password.chars().any(|ch| !ch.is_ascii_alphanumeric());
+    if has_upper && has_lower && has_digit && has_symbol {
+        Ok(())
+    } else {
+        Err("密码必须同时包含大写字母、小写字母、数字和符号。".into())
+    }
+}
+
+fn auth_status_message(user: &UserSummary) -> String {
+    match user.status.as_str() {
+        "approved" => format!(
+            "欢迎，{}。账号已审批，服务器当前保存 {} 张图片，可手动同步。",
+            user.username, user.image_count
+        ),
+        "pending" => format!(
+            "欢迎，{}。账号正在等待管理员审批，暂不能使用云端同步。",
+            user.username
+        ),
+        "disabled" => format!("账号 {} 已被禁用，请联系管理员。", user.username),
+        _ => format!("欢迎，{}。当前账号状态：{}。", user.username, user.status),
     }
 }
 

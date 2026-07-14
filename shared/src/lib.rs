@@ -919,9 +919,50 @@ pub struct AuthRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterRequest {
+    pub username: String,
+    pub password: String,
+    pub password_confirm: String,
+    pub admin_setup_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
+    pub new_password_confirm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUserActionRequest {
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUserSummary {
+    pub id: String,
+    pub username: String,
+    pub role: String,
+    pub status: String,
+    pub image_count: usize,
+    pub created_at: String,
+    pub approved_at: Option<String>,
+    pub approved_by: Option<String>,
+    pub last_login_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUsersResponse {
+    pub users: Vec<AdminUserSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserSummary {
     pub id: String,
     pub username: String,
+    pub role: String,
+    pub status: String,
+    pub image_count: usize,
     pub created_at: String,
 }
 

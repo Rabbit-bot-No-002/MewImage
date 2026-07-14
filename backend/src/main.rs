@@ -3,6 +3,7 @@ mod state;
 use std::{
     collections::BTreeSet,
     net::{IpAddr, SocketAddr},
+    path::{Component, Path as FsPath, PathBuf},
     str::FromStr,
     sync::Arc,
 };
@@ -25,9 +26,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use mew_image_shared::{
-    AuthRequest, AuthResponse, GenerateViaProxyRequest, GeneratedImageResult, GenerationResult,
+    AdminUserActionRequest, AdminUserSummary, AdminUsersResponse, AuthRequest, AuthResponse,
+    ChangePasswordRequest, GenerateViaProxyRequest, GeneratedImageResult, GenerationResult,
     ImageAssetRef, MeResponse, MergePreviewResponse, ParameterSnapshot, ProviderEndpointMode,
-    ProviderKind, ProviderTemplate, ProviderTemplateImportRequest, SyncEnvelope,
+    ProviderKind, ProviderTemplate, ProviderTemplateImportRequest, RegisterRequest, SyncEnvelope,
     SyncPullResponse, SyncPushRequest, UploadCompleteRequest, UploadCompleteResponse,
     UploadInitRequest, UploadInitResponse, UserSummary,
     aspect_ratio_from_dimensions, extract_gemini_generation_result,
@@ -42,7 +44,7 @@ use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use state::{AppConfig, AppState};
+use state::{AppConfig, AppState, AssetStoreKind};
 use tokio::net::TcpListener;
 use tower_http::{
     cors::{AllowHeaders, AllowOrigin, CorsLayer},
@@ -65,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
     ensure_sqlite_parent_dir(&config.database_url)?;
+    ensure_asset_store_ready(&config)?;
     let db_options = SqliteConnectOptions::from_str(&config.database_url)?.create_if_missing(true);
     let db = SqlitePoolOptions::new()
         .max_connections(5)
@@ -110,6 +113,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/auth/change-password", post(change_password))
+        .route("/api/admin/users", get(admin_list_users))
+        .route("/api/admin/users/approve", post(admin_approve_user))
+        .route("/api/admin/users/disable", post(admin_disable_user))
+        .route("/api/admin/users/restore", post(admin_restore_user))
         .route("/api/sync/push", post(sync_push))
         .route("/api/sync/pull", get(sync_pull))
         .route("/api/sync/merge-preview", post(sync_merge_preview))
@@ -153,8 +161,15 @@ fn ensure_sqlite_parent_dir(database_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn ensure_asset_store_ready(config: &AppConfig) -> anyhow::Result<()> {
+    if config.asset_store == AssetStoreKind::Local {
+        std::fs::create_dir_all(&config.local_asset_dir)?;
+    }
+    Ok(())
+}
+
 async fn build_s3_client(config: &AppConfig) -> anyhow::Result<Option<S3Client>> {
-    if config.s3_bucket.is_empty() {
+    if config.asset_store != AssetStoreKind::S3 || config.s3_bucket.is_empty() {
         return Ok(None);
     }
 
@@ -180,6 +195,12 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             id TEXT PRIMARY KEY,
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            status TEXT NOT NULL DEFAULT 'approved',
+            password_updated_at TEXT,
+            approved_at TEXT,
+            approved_by TEXT,
+            last_login_at TEXT,
             created_at TEXT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS sync_snapshots (
@@ -216,6 +237,36 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     ] {
         sqlx::query(statement).execute(db).await?;
     }
+    migrate_users_table(db).await?;
+    Ok(())
+}
+
+async fn migrate_users_table(db: &SqlitePool) -> anyhow::Result<()> {
+    let rows = sqlx::query("PRAGMA table_info(users)").fetch_all(db).await?;
+    let columns = rows
+        .iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<BTreeSet<_>>();
+    for (name, definition) in [
+        ("role", "TEXT NOT NULL DEFAULT 'user'"),
+        ("status", "TEXT NOT NULL DEFAULT 'approved'"),
+        ("password_updated_at", "TEXT"),
+        ("approved_at", "TEXT"),
+        ("approved_by", "TEXT"),
+        ("last_login_at", "TEXT"),
+    ] {
+        if !columns.contains(name) {
+            sqlx::query(&format!("ALTER TABLE users ADD COLUMN {name} {definition}"))
+                .execute(db)
+                .await?;
+        }
+    }
+    sqlx::query("UPDATE users SET role = 'user' WHERE role IS NULL OR role = ''")
+        .execute(db)
+        .await?;
+    sqlx::query("UPDATE users SET status = 'approved' WHERE status IS NULL OR status = ''")
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -255,24 +306,48 @@ async fn health() -> impl IntoResponse {
 async fn register(
     State(state): State<Arc<AppState>>,
     session: Session,
-    Json(payload): Json<AuthRequest>,
+    Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    validate_credentials(&payload)?;
+    validate_registration(&payload)?;
 
     let password_hash = hash_password(&payload.password)?;
+    let has_admin = user_role_exists(&state.db, "admin").await?;
+    let can_bootstrap_admin = state.config.allow_first_admin_setup
+        && !has_admin
+        && payload
+            .admin_setup_token
+            .as_deref()
+            .zip(state.config.admin_setup_token.as_deref())
+            .map(|(provided, expected)| provided == expected)
+            .unwrap_or(false);
+    let role = if can_bootstrap_admin { "admin" } else { "user" };
+    let status = if can_bootstrap_admin {
+        "approved"
+    } else {
+        "pending"
+    };
+    let now = now_rfc3339();
     let user = UserSummary {
         id: new_id(),
         username: payload.username.trim().to_string(),
-        created_at: now_rfc3339(),
+        role: role.into(),
+        status: status.into(),
+        image_count: 0,
+        created_at: now.clone(),
     };
 
     let result = sqlx::query(
-        "INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO users (id, username, password_hash, role, status, password_updated_at, approved_at, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&user.id)
     .bind(&user.username)
     .bind(&password_hash)
-    .bind(&user.created_at)
+    .bind(role)
+    .bind(status)
+    .bind(&now)
+    .bind(if can_bootstrap_admin { Some(now.clone()) } else { None })
+    .bind(if can_bootstrap_admin { Some(user.id.clone()) } else { None })
+    .bind(&now)
     .execute(&state.db)
     .await;
 
@@ -295,10 +370,10 @@ async fn login(
     session: Session,
     Json(payload): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    validate_credentials(&payload)?;
+    validate_login_credentials(&payload)?;
 
     let row =
-        sqlx::query("SELECT id, username, password_hash, created_at FROM users WHERE username = ?")
+        sqlx::query("SELECT id, username, password_hash, role, status, created_at FROM users WHERE username = ?")
             .bind(payload.username.trim())
             .fetch_optional(&state.db)
             .await
@@ -310,12 +385,24 @@ async fn login(
 
     let password_hash = row.get::<String, _>("password_hash");
     verify_password(&payload.password, &password_hash)?;
+    if row.get::<String, _>("status") == "disabled" {
+        return Err(AppError::unauthorized("账号已被禁用，请联系管理员。"));
+    }
 
     let user = UserSummary {
         id: row.get("id"),
         username: row.get("username"),
+        role: row.get("role"),
+        status: row.get("status"),
+        image_count: user_image_count(&state.db, row.get::<String, _>("id").as_str()).await?,
         created_at: row.get("created_at"),
     };
+    sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&user.id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
     session
         .insert("user_id", &user.id)
         .await
@@ -336,12 +423,143 @@ async fn me(
     Ok(Json(MeResponse { user }))
 }
 
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &session).await?;
+    validate_strong_password(&payload.new_password, &payload.new_password_confirm)?;
+
+    let row = sqlx::query("SELECT password_hash FROM users WHERE id = ?")
+        .bind(&user.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::unauthorized("登录状态已失效，请重新登录。"))?;
+
+    verify_password(&payload.old_password, &row.get::<String, _>("password_hash"))?;
+    let password_hash = hash_password(&payload.new_password)?;
+    sqlx::query("UPDATE users SET password_hash = ?, password_updated_at = ? WHERE id = ?")
+        .bind(password_hash)
+        .bind(now_rfc3339())
+        .bind(&user.id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_list_users(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AdminUsersResponse>, AppError> {
+    require_admin(&state, &session).await?;
+    let rows = sqlx::query(
+        "SELECT id, username, role, status, created_at, approved_at, approved_by, last_login_at
+         FROM users
+         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+
+    let mut users = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row.get::<String, _>("id");
+        users.push(AdminUserSummary {
+            image_count: user_image_count(&state.db, &id).await?,
+            id,
+            username: row.get("username"),
+            role: row.get("role"),
+            status: row.get("status"),
+            created_at: row.get("created_at"),
+            approved_at: row.get("approved_at"),
+            approved_by: row.get("approved_by"),
+            last_login_at: row.get("last_login_at"),
+        });
+    }
+    Ok(Json(AdminUsersResponse { users }))
+}
+
+async fn admin_approve_user(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AdminUserActionRequest>,
+) -> Result<StatusCode, AppError> {
+    let admin = require_admin(&state, &session).await?;
+    update_user_status(
+        &state,
+        &payload.user_id,
+        "approved",
+        Some(admin.id.as_str()),
+    )
+    .await
+}
+
+async fn admin_disable_user(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AdminUserActionRequest>,
+) -> Result<StatusCode, AppError> {
+    let admin = require_admin(&state, &session).await?;
+    if payload.user_id == admin.id {
+        return Err(AppError::bad_request("不能禁用当前登录的管理员账号。"));
+    }
+    update_user_status(&state, &payload.user_id, "disabled", None).await
+}
+
+async fn admin_restore_user(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AdminUserActionRequest>,
+) -> Result<StatusCode, AppError> {
+    let admin = require_admin(&state, &session).await?;
+    update_user_status(
+        &state,
+        &payload.user_id,
+        "approved",
+        Some(admin.id.as_str()),
+    )
+    .await
+}
+
+async fn update_user_status(
+    state: &AppState,
+    user_id: &str,
+    status: &str,
+    approved_by: Option<&str>,
+) -> Result<StatusCode, AppError> {
+    let approved_at = if status == "approved" {
+        Some(now_rfc3339())
+    } else {
+        None
+    };
+    let result = sqlx::query(
+        "UPDATE users
+         SET status = ?, approved_at = COALESCE(?, approved_at), approved_by = COALESCE(?, approved_by)
+         WHERE id = ?",
+    )
+    .bind(status)
+    .bind(approved_at)
+    .bind(approved_by)
+    .bind(user_id)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("用户不存在"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn sync_push(
     State(state): State<Arc<AppState>>,
     session: Session,
     Json(payload): Json<SyncPushRequest>,
 ) -> Result<Json<SyncPullResponse>, AppError> {
-    let user = require_user(&state, &session).await?;
+    let user = require_approved_user(&state, &session).await?;
     let existing = load_sync_envelope(&state.db, &user.id).await?;
     let normalized = normalize_envelope_assets(&state, &user.id, payload.envelope).await?;
     let merged = merge_envelopes(&existing, &normalized);
@@ -373,7 +591,7 @@ async fn sync_pull(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<SyncPullResponse>, AppError> {
-    let user = require_user(&state, &session).await?;
+    let user = require_approved_user(&state, &session).await?;
     let envelope = load_sync_envelope(&state.db, &user.id).await?;
     let now = now_rfc3339();
     Ok(Json(SyncPullResponse {
@@ -391,7 +609,7 @@ async fn sync_merge_preview(
     session: Session,
     Json(payload): Json<SyncPushRequest>,
 ) -> Result<Json<MergePreviewResponse>, AppError> {
-    let user = require_user(&state, &session).await?;
+    let user = require_approved_user(&state, &session).await?;
     let existing = load_sync_envelope(&state.db, &user.id).await?;
     let merged = merge_envelopes(&existing, &payload.envelope);
     Ok(Json(MergePreviewResponse {
@@ -432,10 +650,7 @@ async fn import_provider_template(
     session: Session,
     Json(payload): Json<ProviderTemplateImportRequest>,
 ) -> Result<Json<ProviderTemplate>, AppError> {
-    let user = current_user(&state, &session).await?;
-    let user = user.ok_or_else(|| {
-        AppError::unauthorized("游客模式仅可使用内置模板；导入自定义服务商前请先登录。")
-    })?;
+    let user = require_approved_user(&state, &session).await?;
     validate_template(&state, &payload.template, true)?;
 
     let serialized = serde_json::to_string(&payload.template).map_err(AppError::internal)?;
@@ -460,12 +675,17 @@ async fn upload_init(
     session: Session,
     Json(payload): Json<UploadInitRequest>,
 ) -> Result<Json<UploadInitResponse>, AppError> {
-    let user = require_user(&state, &session).await?;
+    let user = require_approved_user(&state, &session).await?;
     ensure_object_storage_ready(&state)?;
     cleanup_expired_upload_tokens(&state.db).await?;
     let asset_id = new_id();
     let token = random_token();
-    let object_key = format!("assets/{}/{}-{}", user.id, payload.sha256, payload.file_name);
+    let object_key = format!(
+        "users/{}/assets/{}-{}",
+        user.id,
+        payload.sha256,
+        sanitize_file_name(&payload.file_name)
+    );
     let expires_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
 
     sqlx::query(
@@ -498,7 +718,7 @@ async fn upload_bytes(
     Path(token): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
-    let user = require_user(&state, &session).await?;
+    let user = require_approved_user(&state, &session).await?;
     ensure_object_storage_ready(&state)?;
     cleanup_expired_upload_tokens(&state.db).await?;
     let row = sqlx::query(
@@ -544,7 +764,7 @@ async fn upload_complete(
     session: Session,
     Json(payload): Json<UploadCompleteRequest>,
 ) -> Result<Json<UploadCompleteResponse>, AppError> {
-    let user = require_user(&state, &session).await?;
+    let user = require_approved_user(&state, &session).await?;
     ensure_object_storage_ready(&state)?;
     cleanup_expired_upload_tokens(&state.db).await?;
     let row = sqlx::query(
@@ -607,7 +827,7 @@ async fn get_asset(
     session: Session,
     Path(asset_id): Path<String>,
 ) -> Result<Response, AppError> {
-    let user = require_user(&state, &session).await?;
+    let user = require_approved_user(&state, &session).await?;
     let row = sqlx::query("SELECT object_key, mime_type, user_id FROM assets WHERE id = ?")
         .bind(asset_id)
         .fetch_optional(&state.db)
@@ -621,24 +841,7 @@ async fn get_asset(
         return Err(AppError::unauthorized("当前登录用户无权访问该资源"));
     }
 
-    let client = state
-        .s3
-        .as_ref()
-        .ok_or_else(|| AppError::bad_request("服务器未启用远程资源存储，当前资源无法读取。"))?;
-    let output = client
-        .get_object()
-        .bucket(&state.config.s3_bucket)
-        .key(row.get::<String, _>("object_key"))
-        .send()
-        .await
-        .map_err(AppError::internal)?;
-
-    let bytes = output
-        .body
-        .collect()
-        .await
-        .map_err(AppError::internal)?
-        .into_bytes();
+    let bytes = get_object_bytes(&state, &row.get::<String, _>("object_key")).await?;
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -786,23 +989,53 @@ async fn current_user(
     else {
         return Ok(None);
     };
-    let row = sqlx::query("SELECT id, username, created_at FROM users WHERE id = ?")
+    let row = sqlx::query("SELECT id, username, role, status, created_at FROM users WHERE id = ?")
         .bind(user_id)
         .fetch_optional(&state.db)
         .await
         .map_err(AppError::internal)?;
 
-    Ok(row.map(|row| UserSummary {
-        id: row.get("id"),
-        username: row.get("username"),
-        created_at: row.get("created_at"),
-    }))
+    if let Some(row) = row {
+        let id = row.get::<String, _>("id");
+        let image_count = user_image_count(&state.db, &id).await?;
+        Ok(Some(UserSummary {
+            id,
+            username: row.get("username"),
+            role: row.get("role"),
+            status: row.get("status"),
+            image_count,
+            created_at: row.get("created_at"),
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn require_user(state: &AppState, session: &Session) -> Result<UserSummary, AppError> {
     current_user(state, session)
         .await?
         .ok_or_else(|| AppError::unauthorized("请先登录以启用云端同步"))
+}
+
+async fn require_approved_user(
+    state: &AppState,
+    session: &Session,
+) -> Result<UserSummary, AppError> {
+    let user = require_user(state, session).await?;
+    if user.status != "approved" {
+        return Err(AppError::unauthorized(
+            "账号待管理员审批，暂不能使用云端同步和服务器资源存储。",
+        ));
+    }
+    Ok(user)
+}
+
+async fn require_admin(state: &AppState, session: &Session) -> Result<UserSummary, AppError> {
+    let user = require_approved_user(state, session).await?;
+    if user.role != "admin" {
+        return Err(AppError::unauthorized("需要管理员权限。"));
+    }
+    Ok(user)
 }
 
 async fn load_sync_envelope(db: &SqlitePool, user_id: &str) -> Result<SyncEnvelope, AppError> {
@@ -838,7 +1071,7 @@ async fn normalize_envelope_assets(
             continue;
         };
         let (mime_type, bytes) = decode_data_url(&data_url)?;
-        let object_key = format!("assets/{user_id}/{}.bin", asset.sha256);
+        let object_key = format!("users/{user_id}/assets/{}.bin", asset.sha256);
         put_object(state, &object_key, &mime_type, bytes).await?;
         asset.remote_object_key = Some(object_key);
         asset.remote_url = Some(format!("/api/assets/{}", asset.id));
@@ -869,28 +1102,121 @@ async fn put_object(
     mime_type: &str,
     bytes: Vec<u8>,
 ) -> Result<(), AppError> {
-    let client = state
-        .s3
-        .as_ref()
-        .ok_or_else(|| AppError::bad_request("服务器未启用远程资源存储，当前操作不可用。"))?;
-    client
-        .put_object()
-        .bucket(&state.config.s3_bucket)
-        .key(object_key)
-        .content_type(mime_type)
-        .body(ByteStream::from(bytes))
-        .send()
-        .await
-        .map_err(AppError::internal)?;
-    Ok(())
+    match state.config.asset_store {
+        AssetStoreKind::Local => {
+            let path = local_object_path(&state.config.local_asset_dir, object_key)?;
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(AppError::internal)?;
+            }
+            tokio::fs::write(path, bytes)
+                .await
+                .map_err(AppError::internal)?;
+            Ok(())
+        }
+        AssetStoreKind::S3 => {
+            let client = state.s3.as_ref().ok_or_else(|| {
+                AppError::bad_request("服务器未启用远程资源存储，当前操作不可用。")
+            })?;
+            client
+                .put_object()
+                .bucket(&state.config.s3_bucket)
+                .key(object_key)
+                .content_type(mime_type)
+                .body(ByteStream::from(bytes))
+                .send()
+                .await
+                .map_err(AppError::internal)?;
+            Ok(())
+        }
+        AssetStoreKind::Disabled => {
+            Err(AppError::bad_request("服务器未启用远程资源存储，当前操作不可用。"))
+        }
+    }
 }
 
-fn validate_credentials(payload: &AuthRequest) -> Result<(), AppError> {
+async fn get_object_bytes(state: &AppState, object_key: &str) -> Result<Vec<u8>, AppError> {
+    match state.config.asset_store {
+        AssetStoreKind::Local => {
+            let path = local_object_path(&state.config.local_asset_dir, object_key)?;
+            tokio::fs::read(path).await.map_err(AppError::internal)
+        }
+        AssetStoreKind::S3 => {
+            let client = state.s3.as_ref().ok_or_else(|| {
+                AppError::bad_request("服务器未启用远程资源存储，当前资源无法读取。")
+            })?;
+            let output = client
+                .get_object()
+                .bucket(&state.config.s3_bucket)
+                .key(object_key)
+                .send()
+                .await
+                .map_err(AppError::internal)?;
+            Ok(output
+                .body
+                .collect()
+                .await
+                .map_err(AppError::internal)?
+                .into_bytes()
+                .to_vec())
+        }
+        AssetStoreKind::Disabled => Err(AppError::bad_request(
+            "服务器未启用远程资源存储，当前资源无法读取。",
+        )),
+    }
+}
+
+async fn user_role_exists(db: &SqlitePool, role: &str) -> Result<bool, AppError> {
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE role = ?")
+        .bind(role)
+        .fetch_one(db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(count > 0)
+}
+
+async fn user_image_count(db: &SqlitePool, user_id: &str) -> Result<usize, AppError> {
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(count.max(0) as usize)
+}
+
+fn validate_login_credentials(payload: &AuthRequest) -> Result<(), AppError> {
     if payload.username.trim().len() < 3 {
         return Err(AppError::bad_request("用户名至少 3 个字符"));
     }
     if payload.password.len() < 8 {
         return Err(AppError::bad_request("密码至少 8 个字符"));
+    }
+    Ok(())
+}
+
+fn validate_registration(payload: &RegisterRequest) -> Result<(), AppError> {
+    if payload.username.trim().len() < 3 {
+        return Err(AppError::bad_request("用户名至少 3 个字符"));
+    }
+    validate_strong_password(&payload.password, &payload.password_confirm)
+}
+
+fn validate_strong_password(password: &str, confirm: &str) -> Result<(), AppError> {
+    if password != confirm {
+        return Err(AppError::bad_request("两次输入的密码不一致"));
+    }
+    if password.len() < 10 {
+        return Err(AppError::bad_request("密码至少 10 个字符"));
+    }
+    let has_upper = password.chars().any(|ch| ch.is_ascii_uppercase());
+    let has_lower = password.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_digit = password.chars().any(|ch| ch.is_ascii_digit());
+    let has_symbol = password.chars().any(|ch| !ch.is_ascii_alphanumeric());
+    if !(has_upper && has_lower && has_digit && has_symbol) {
+        return Err(AppError::bad_request(
+            "密码必须包含大写字母、小写字母、数字和符号",
+        ));
     }
     Ok(())
 }
@@ -1126,12 +1452,15 @@ fn host_matches_allowlist(host: &str, allowed_hosts: &BTreeSet<String>) -> bool 
 }
 
 fn ensure_object_storage_ready(state: &AppState) -> Result<(), AppError> {
-    if state.s3.is_none() {
-        return Err(AppError::bad_request(
-            "服务器未启用远程资源存储，请登录前确认对象存储配置完整。",
-        ));
+    match state.config.asset_store {
+        AssetStoreKind::Local => Ok(()),
+        AssetStoreKind::S3 if state.s3.is_some() => Ok(()),
+        _ => {
+            Err(AppError::bad_request(
+                "服务器未启用远程资源存储，请登录前确认资源存储配置完整。",
+            ))
+        }
     }
-    Ok(())
 }
 
 fn ensure_upload_token_not_expired(row: &sqlx::sqlite::SqliteRow) -> Result<(), AppError> {
@@ -1165,6 +1494,36 @@ fn decode_data_url(data_url: &str) -> Result<(String, Vec<u8>), AppError> {
         .decode(data)
         .map_err(|_| AppError::bad_request("资源 Base64 无效"))?;
     Ok((mime_type, bytes))
+}
+
+fn local_object_path(base_dir: &str, object_key: &str) -> Result<PathBuf, AppError> {
+    let mut path = PathBuf::from(base_dir);
+    for component in FsPath::new(object_key).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            _ => return Err(AppError::bad_request("资源路径无效")),
+        }
+    }
+    Ok(path)
+}
+
+fn sanitize_file_name(file_name: &str) -> String {
+    let sanitized = file_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_').trim_matches('.');
+    if sanitized.is_empty() {
+        "asset.bin".into()
+    } else {
+        sanitized.chars().take(120).collect()
+    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -1859,23 +2218,7 @@ async fn resolve_asset_bytes(
         .remote_object_key
         .as_ref()
         .ok_or_else(|| AppError::bad_request("资源缺少可读取的图像数据"))?;
-    let Some(client) = state.s3.as_ref() else {
-        return Err(AppError::internal_message("对象存储未配置"));
-    };
-    let output = client
-        .get_object()
-        .bucket(&state.config.s3_bucket)
-        .key(object_key)
-        .send()
-        .await
-        .map_err(AppError::internal)?;
-    let bytes = output
-        .body
-        .collect()
-        .await
-        .map_err(AppError::internal)?
-        .into_bytes()
-        .to_vec();
+    let bytes = get_object_bytes(state, object_key).await?;
     Ok((asset.mime_type.clone(), bytes))
 }
 

@@ -2,6 +2,24 @@ use aws_sdk_s3::Client as S3Client;
 use mew_image_shared::ProviderTemplate;
 use sqlx::SqlitePool;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetStoreKind {
+    Disabled,
+    Local,
+    S3,
+}
+
+impl AssetStoreKind {
+    fn from_env_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Self::Local,
+            "s3" => Self::S3,
+            "disabled" | "none" | "off" => Self::Disabled,
+            _ => Self::Disabled,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub listen_addr: String,
@@ -13,6 +31,10 @@ pub struct AppConfig {
     pub enforce_provider_host_whitelist: bool,
     pub enable_guest_proxy: bool,
     pub require_login_for_custom_provider: bool,
+    pub admin_setup_token: Option<String>,
+    pub allow_first_admin_setup: bool,
+    pub asset_store: AssetStoreKind,
+    pub local_asset_dir: String,
     pub s3_bucket: String,
     pub s3_region: String,
     pub s3_endpoint: Option<String>,
@@ -47,6 +69,27 @@ impl AppConfig {
             )
             .map(|value| value != "false")
             .unwrap_or(true),
+            admin_setup_token: std::env::var("MEW_IMAGE_ADMIN_SETUP_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            allow_first_admin_setup: std::env::var("MEW_IMAGE_ALLOW_FIRST_ADMIN_SETUP")
+                .map(|value| value != "false")
+                .unwrap_or(true),
+            asset_store: std::env::var("MEW_IMAGE_ASSET_STORE")
+                .ok()
+                .map(|value| AssetStoreKind::from_env_value(&value))
+                .unwrap_or_else(|| {
+                    if std::env::var("MEW_IMAGE_S3_BUCKET")
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        AssetStoreKind::S3
+                    } else {
+                        AssetStoreKind::Local
+                    }
+                }),
+            local_asset_dir: std::env::var("MEW_IMAGE_LOCAL_ASSET_DIR")
+                .unwrap_or_else(|_| "./data/assets".into()),
             s3_bucket: std::env::var("MEW_IMAGE_S3_BUCKET").unwrap_or_default(),
             s3_region: std::env::var("MEW_IMAGE_S3_REGION").unwrap_or_else(|_| "auto".into()),
             s3_endpoint: std::env::var("MEW_IMAGE_S3_ENDPOINT").ok(),
