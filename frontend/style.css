@@ -114,6 +114,16 @@ h3 {
   flex-wrap: wrap;
 }
 
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  object-fit: cover;
+  box-shadow:
+    0 8px 18px rgba(255, 125, 176, 0.22),
+    0 0 0 1px rgba(255, 255, 255, 0.6);
+}
+
 .brand-compact h1 {
   font-size: 28px;
 }
@@ -915,13 +925,154 @@ body[data-theme="night"] .thread-chip-actions {
 }
 
 .settings-popover {
-  width: min(920px, calc(100vw - 40px));
+  width: min(1040px, calc(100vw - 40px));
   padding: 20px;
   border-radius: 28px;
   border: 1px solid var(--line);
   background: var(--panel);
   backdrop-filter: blur(18px);
   box-shadow: var(--shadow);
+}
+
+.settings-shell {
+  min-height: min(620px, calc(100vh - 128px));
+  display: grid;
+  grid-template-columns: 188px minmax(0, 1fr);
+  gap: 18px;
+}
+
+.settings-sidebar {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px;
+  border-radius: 24px;
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(160deg, rgba(255, 125, 176, 0.12), rgba(140, 202, 255, 0.08)),
+    rgba(255, 255, 255, 0.22);
+}
+
+.settings-sidebar-main {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-nav-button {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 10px;
+  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  text-align: left;
+  transition: transform 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+}
+
+.settings-nav-button:hover,
+.settings-nav-button.is-active {
+  background: rgba(255, 255, 255, 0.36);
+  border-color: rgba(255, 125, 176, 0.24);
+  transform: translateX(2px);
+}
+
+body[data-theme="night"] .settings-nav-button:hover,
+body[data-theme="night"] .settings-nav-button.is-active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.settings-about-button {
+  margin-top: auto;
+}
+
+.settings-content {
+  min-width: 0;
+  max-height: min(620px, calc(100vh - 128px));
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.settings-form-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background:
+    linear-gradient(135deg, rgba(255, 125, 176, 0.08), rgba(140, 202, 255, 0.08)),
+    var(--panel-strong);
+}
+
+.auth-mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 4px;
+  border-radius: 16px;
+  background: rgba(255, 125, 176, 0.08);
+}
+
+.auth-mode-button {
+  min-height: 36px;
+  border-radius: 12px;
+  color: var(--muted);
+  background: transparent;
+  font-weight: 700;
+}
+
+.auth-mode-button.is-active {
+  color: var(--text);
+  background: var(--panel-strong);
+  box-shadow: 0 6px 16px rgba(255, 125, 176, 0.12);
+}
+
+.form-hint,
+.form-error {
+  margin: -4px 0 0;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.form-hint {
+  color: var(--muted);
+}
+
+.form-error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.admin-bootstrap-block {
+  gap: 8px;
+}
+
+.settings-about-card {
+  min-height: 220px;
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+  padding: 24px;
+  border-radius: 28px;
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(circle at top left, rgba(255, 125, 176, 0.22), transparent 42%),
+    radial-gradient(circle at bottom right, rgba(140, 202, 255, 0.2), transparent 46%),
+    var(--panel-strong);
+}
+
+.settings-about-logo {
+  width: 92px;
+  height: 92px;
+  border-radius: 28px;
+  object-fit: cover;
+  box-shadow: 0 18px 36px rgba(255, 125, 176, 0.2);
 }
 
 .settings-config-actions {
@@ -2330,11 +2481,40 @@ body[data-theme="night"] .config-switcher-menu {
 
 @media (max-width: 1100px) {
   .settings-grid,
+  .settings-shell,
   .split-panel,
   .compact-grid,
   .grid,
   .workspace-layout {
     grid-template-columns: 1fr;
+  }
+
+  .settings-shell {
+    min-height: auto;
+  }
+
+  .settings-sidebar {
+    flex-direction: row;
+    align-items: stretch;
+    overflow-x: auto;
+  }
+
+  .settings-sidebar-main {
+    display: flex;
+    min-width: max-content;
+  }
+
+  .settings-nav-button {
+    white-space: nowrap;
+  }
+
+  .settings-about-button {
+    margin-top: 0;
+    min-width: max-content;
+  }
+
+  .settings-content {
+    max-height: min(620px, calc(100vh - 220px));
   }
 
   .topbar {

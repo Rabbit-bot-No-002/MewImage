@@ -15,12 +15,14 @@ use gloo_net::http::Request;
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use leptos::{html, prelude::*, task::spawn_local};
 use mew_image_shared::{
-    AdminUserActionRequest, AdminUserSummary, AdminUsersResponse, AppPreferences, AuthRequest,
-    AuthResponse, BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, ConversationThread,
+    AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUserSummary,
+    AdminUsersResponse, AppPreferences, AuthRequest, AuthResponse,
+    BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, ConversationThread,
     DEFAULT_FAVORITE_FOLDER_ID, EncryptedApiConfig, FavoriteFolder, ImageAssetRef, LocalAppState,
     LocalTaskRecord, MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
     ProviderTemplate, RegisterRequest, SyncCheckpoint, SyncPullResponse, TaskStatus,
-    ThemePreference, UserSummary, clamp_size, new_id, normalize_api_config, now_rfc3339,
+    ThemePreference, UserSummary, UsernameAvailabilityResponse, clamp_size, new_id,
+    normalize_api_config, now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -185,11 +187,17 @@ fn App() -> impl IntoView {
     let auth_user = RwSignal::new(None::<UserSummary>);
     let login_username = RwSignal::new(String::new());
     let login_password = RwSignal::new(String::new());
+    let auth_mode = RwSignal::new("login".to_string());
     let register_password_confirm = RwSignal::new(String::new());
     let admin_setup_token = RwSignal::new(String::new());
+    let show_admin_setup_token = RwSignal::new(false);
+    let admin_setup_allowed = RwSignal::new(false);
+    let auth_form_message = RwSignal::new(None::<String>);
+    let username_check_message = RwSignal::new(None::<String>);
     let change_old_password = RwSignal::new(String::new());
     let change_new_password = RwSignal::new(String::new());
     let change_new_password_confirm = RwSignal::new(String::new());
+    let password_form_message = RwSignal::new(None::<String>);
     let admin_users = RwSignal::new(Vec::<AdminUserSummary>::new());
     let loading_admin_users = RwSignal::new(false);
     let sync_secret = RwSignal::new(String::new());
@@ -227,6 +235,7 @@ fn App() -> impl IntoView {
     let gallery_page_picker_thread_marker = RwSignal::new(String::new());
     let show_settings = RwSignal::new(false);
     let show_settings_menu = RwSignal::new(false);
+    let settings_tab = RwSignal::new("providers".to_string());
     let show_resolution_menu = RwSignal::new(false);
     let show_config_switcher = RwSignal::new(false);
     let preview_state = RwSignal::new(None::<PreviewState>);
@@ -400,7 +409,9 @@ fn App() -> impl IntoView {
     });
 
     let open_failure_log = move |task_id: String| {
-        let Some(task) = tasks.with_untracked(|items| items.iter().find(|task| task.id == task_id).cloned()) else {
+        let Some(task) =
+            tasks.with_untracked(|items| items.iter().find(|task| task.id == task_id).cloned())
+        else {
             return;
         };
         let raw_response = task
@@ -413,7 +424,9 @@ fn App() -> impl IntoView {
             "任务ID: {}\n状态: {:?}\n错误: {}\n创建时间: {}\n更新时间: {}\n\n原始响应:\n{}",
             task.id,
             task.status,
-            task.error_message.clone().unwrap_or_else(|| "无错误信息".into()),
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "无错误信息".into()),
             task.created_at,
             task.updated_at,
             raw_response,
@@ -435,6 +448,7 @@ fn App() -> impl IntoView {
         let checkpoint = checkpoint;
         let templates = templates;
         let auth_user = auth_user;
+        let admin_setup_allowed = admin_setup_allowed;
         let current_thread_id = current_thread_id;
         let current_config_id = current_config_id;
         let draft_prompt = draft_prompt;
@@ -604,6 +618,15 @@ fn App() -> impl IntoView {
             {
                 if let Ok(me) = response.json::<MeResponse>().await {
                     auth_user.set(me.user);
+                }
+            }
+
+            if let Ok(response) = Request::get(&api_url("/api/auth/setup-status"))
+                .send()
+                .await
+            {
+                if let Ok(status) = response.json::<AdminSetupStatusResponse>().await {
+                    admin_setup_allowed.set(status.setup_allowed);
                 }
             }
 
@@ -824,9 +847,8 @@ fn App() -> impl IntoView {
         let config_list = configs.get();
         assets.with(|asset_list| gallery_items(&visible, &config_list, asset_list))
     });
-    let favorite_folders = Memo::new(move |_| {
-        normalized_favorite_folders(preferences.get().favorite_folders)
-    });
+    let favorite_folders =
+        Memo::new(move |_| normalized_favorite_folders(preferences.get().favorite_folders));
     let active_favorite_folder_id = Memo::new(move |_| {
         let folders = favorite_folders.get();
         let preferred = preferences
@@ -875,9 +897,8 @@ fn App() -> impl IntoView {
         let end = (start + GALLERY_PAGE_SIZE).min(entries.len());
         entries[start..end].to_vec()
     });
-    let gallery_page_label = Memo::new(move |_| {
-        format!("{}/{}", gallery_page.get(), gallery_page_count.get())
-    });
+    let gallery_page_label =
+        Memo::new(move |_| format!("{}/{}", gallery_page.get(), gallery_page_count.get()));
     let gallery_page_picker_rows = Memo::new(move |_| {
         let total = gallery_page_count.get().max(1);
         let current = gallery_page_candidate.get().clamp(1, total) as isize;
@@ -1076,17 +1097,63 @@ fn App() -> impl IntoView {
         });
     };
 
+    let check_username_availability = move || {
+        let username = login_username.get_untracked();
+        let trimmed = username.trim().to_string();
+        username_check_message.set(None);
+        if trimmed.len() < 3 {
+            username_check_message.set(Some("用户名至少 3 个字符。".into()));
+            return;
+        }
+        let username_check_message = username_check_message;
+        spawn_local(async move {
+            let url = format!(
+                "/api/auth/check-username?username={}",
+                percent_encode_query_value(&trimmed)
+            );
+            match Request::get(&api_url(&url)).send().await {
+                Ok(response) if response.ok() => {
+                    match response.json::<UsernameAvailabilityResponse>().await {
+                        Ok(payload) if payload.available => {
+                            username_check_message.set(Some("这个用户名可以注册。".into()));
+                        }
+                        Ok(_) => {
+                            username_check_message
+                                .set(Some("这个用户名已被使用，请换一个。".into()));
+                        }
+                        Err(error) => {
+                            username_check_message
+                                .set(Some(format!("用户名检查解析失败：{error}")));
+                        }
+                    }
+                }
+                Ok(response) => {
+                    username_check_message.set(Some(
+                        response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "用户名检查失败，请稍后再试。".into()),
+                    ));
+                }
+                Err(error) => {
+                    username_check_message.set(Some(format!("用户名检查失败：{error}")));
+                }
+            }
+        });
+    };
+
     let submit_auth = move |mode: &'static str| {
         let username = login_username.get_untracked();
         let password = login_password.get_untracked();
+        auth_form_message.set(None);
         if username.trim().is_empty() || password.is_empty() {
-            status_text.set("请先填写用户名和密码。".into());
+            auth_form_message.set(Some("请先填写用户名和密码。".into()));
             return;
         }
         if mode == "register" {
             let confirm = register_password_confirm.get_untracked();
             if let Err(message) = validate_frontend_password_strength(&password, &confirm) {
-                status_text.set(message);
+                auth_form_message.set(Some(message));
                 return;
             }
         }
@@ -1094,6 +1161,8 @@ fn App() -> impl IntoView {
         let auth_user = auth_user;
         let sync_secret = sync_secret;
         let status_text = status_text;
+        let auth_form_message = auth_form_message;
+        let admin_setup_allowed = admin_setup_allowed;
         let password_confirm = register_password_confirm.get_untracked();
         let setup_token = admin_setup_token.get_untracked();
         spawn_local(async move {
@@ -1115,7 +1184,7 @@ fn App() -> impl IntoView {
                     })
             };
             let Ok(builder) = request else {
-                status_text.set("认证请求序列化失败。".into());
+                auth_form_message.set(Some("认证请求序列化失败。".into()));
                 return;
             };
             match builder.send().await {
@@ -1123,14 +1192,71 @@ fn App() -> impl IntoView {
                     Ok(auth) => {
                         sync_secret.set(password);
                         auth_user.set(Some(auth.user.clone()));
+                        if auth.user.role == "admin" {
+                            admin_setup_allowed.set(false);
+                            show_admin_setup_token.set(false);
+                        }
                         status_text.set(auth_status_message(&auth.user));
                     }
-                    Err(error) => status_text.set(format!("认证响应解析失败：{error}")),
+                    Err(error) => auth_form_message.set(Some(format!("认证响应解析失败：{error}"))),
                 },
                 Ok(response) => {
-                    status_text.set(response.text().await.unwrap_or_else(|_| "认证失败".into()));
+                    auth_form_message.set(Some(
+                        response.text().await.unwrap_or_else(|_| "认证失败".into()),
+                    ));
                 }
-                Err(error) => status_text.set(format!("认证失败：{error}")),
+                Err(error) => auth_form_message.set(Some(format!("认证失败：{error}"))),
+            }
+        });
+    };
+
+    let bootstrap_current_user_as_admin = move |_| {
+        auth_form_message.set(None);
+        let token = admin_setup_token.get_untracked();
+        if token.trim().is_empty() {
+            auth_form_message.set(Some("请先填写管理员初始化口令。".into()));
+            return;
+        }
+        if auth_user.get_untracked().is_none() {
+            auth_form_message.set(Some("请先登录要升级的旧账号。".into()));
+            return;
+        }
+        status_text.set("正在尝试初始化当前账号为管理员……".into());
+        let auth_user = auth_user;
+        let status_text = status_text;
+        let auth_form_message = auth_form_message;
+        let admin_setup_allowed = admin_setup_allowed;
+        spawn_local(async move {
+            let request = Request::post(&api_url("/api/auth/bootstrap-admin"))
+                .credentials(web_sys::RequestCredentials::Include)
+                .json(&AdminBootstrapRequest {
+                    admin_setup_token: token,
+                });
+            let Ok(builder) = request else {
+                auth_form_message.set(Some("管理员初始化请求序列化失败。".into()));
+                return;
+            };
+            match builder.send().await {
+                Ok(response) if response.ok() => match response.json::<AuthResponse>().await {
+                    Ok(payload) => {
+                        auth_user.set(Some(payload.user.clone()));
+                        admin_setup_allowed.set(false);
+                        show_admin_setup_token.set(false);
+                        status_text.set("当前账号已升级为管理员，可以审批其他用户。".into());
+                    }
+                    Err(error) => {
+                        auth_form_message.set(Some(format!("管理员初始化响应解析失败：{error}")));
+                    }
+                },
+                Ok(response) => {
+                    auth_form_message.set(Some(
+                        response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "管理员初始化失败。".into()),
+                    ));
+                }
+                Err(error) => auth_form_message.set(Some(format!("管理员初始化失败：{error}"))),
             }
         });
     };
@@ -1139,20 +1265,24 @@ fn App() -> impl IntoView {
         let old_password = change_old_password.get_untracked();
         let new_password = change_new_password.get_untracked();
         let new_password_confirm = change_new_password_confirm.get_untracked();
+        password_form_message.set(None);
         if auth_user.get_untracked().is_none() {
-            status_text.set("请先登录后再修改密码。".into());
+            password_form_message.set(Some("请先登录后再修改密码。".into()));
             return;
         }
-        if let Err(message) = validate_frontend_password_strength(&new_password, &new_password_confirm) {
-            status_text.set(message);
+        if let Err(message) =
+            validate_frontend_password_strength(&new_password, &new_password_confirm)
+        {
+            password_form_message.set(Some(message));
             return;
         }
         if old_password.is_empty() {
-            status_text.set("请填写当前密码。".into());
+            password_form_message.set(Some("请填写当前密码。".into()));
             return;
         }
         status_text.set("正在更新密码……".into());
         let status_text = status_text;
+        let password_form_message = password_form_message;
         let sync_secret = sync_secret;
         let change_old_password = change_old_password;
         let change_new_password = change_new_password;
@@ -1166,7 +1296,7 @@ fn App() -> impl IntoView {
                     new_password_confirm,
                 });
             let Ok(builder) = request else {
-                status_text.set("改密请求序列化失败。".into());
+                password_form_message.set(Some("改密请求序列化失败。".into()));
                 return;
             };
             match builder.send().await {
@@ -1178,9 +1308,14 @@ fn App() -> impl IntoView {
                     status_text.set("密码已更新，下次登录请使用新密码。".into());
                 }
                 Ok(response) => {
-                    status_text.set(response.text().await.unwrap_or_else(|_| "修改密码失败".into()));
+                    password_form_message.set(Some(
+                        response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "修改密码失败".into()),
+                    ));
                 }
-                Err(error) => status_text.set(format!("修改密码失败：{error}")),
+                Err(error) => password_form_message.set(Some(format!("修改密码失败：{error}"))),
             }
         });
     };
@@ -1205,16 +1340,23 @@ fn App() -> impl IntoView {
                 .send()
                 .await
             {
-                Ok(response) if response.ok() => match response.json::<AdminUsersResponse>().await {
-                    Ok(payload) => {
-                        let count = payload.users.len();
-                        admin_users.set(payload.users);
-                        status_text.set(format!("已刷新用户列表，共 {count} 个账号。"));
+                Ok(response) if response.ok() => {
+                    match response.json::<AdminUsersResponse>().await {
+                        Ok(payload) => {
+                            let count = payload.users.len();
+                            admin_users.set(payload.users);
+                            status_text.set(format!("已刷新用户列表，共 {count} 个账号。"));
+                        }
+                        Err(error) => status_text.set(format!("用户列表解析失败：{error}")),
                     }
-                    Err(error) => status_text.set(format!("用户列表解析失败：{error}")),
-                },
+                }
                 Ok(response) => {
-                    status_text.set(response.text().await.unwrap_or_else(|_| "刷新用户列表失败".into()));
+                    status_text.set(
+                        response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "刷新用户列表失败".into()),
+                    );
                 }
                 Err(error) => status_text.set(format!("刷新用户列表失败：{error}")),
             }
@@ -1254,7 +1396,12 @@ fn App() -> impl IntoView {
                     loading_admin_users.set(false);
                 }
                 Ok(response) => {
-                    status_text.set(response.text().await.unwrap_or_else(|_| "管理员操作失败".into()));
+                    status_text.set(
+                        response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "管理员操作失败".into()),
+                    );
                 }
                 Err(error) => status_text.set(format!("管理员操作失败：{error}")),
             }
@@ -1291,7 +1438,10 @@ fn App() -> impl IntoView {
         }) else {
             return;
         };
-        if !confirm_action(&format!("删除配置「{}」后无法恢复，是否继续？", current.name)) {
+        if !confirm_action(&format!(
+            "删除配置「{}」后无法恢复，是否继续？",
+            current.name
+        )) {
             return;
         }
         configs.update(|items| {
@@ -1319,15 +1469,16 @@ fn App() -> impl IntoView {
         status_text.set("已新建会话，可以开始新的连续修改。".into());
     };
 
-    let open_text_popover = move |kind: TextPopoverKind, title: &str, value: String, x: f64, y: f64| {
-        text_popover_value.set(value);
-        text_popover.set(Some(TextPopoverState {
-            kind,
-            title: title.into(),
-            x,
-            y,
-        }));
-    };
+    let open_text_popover =
+        move |kind: TextPopoverKind, title: &str, value: String, x: f64, y: f64| {
+            text_popover_value.set(value);
+            text_popover.set(Some(TextPopoverState {
+                kind,
+                title: title.into(),
+                x,
+                y,
+            }));
+        };
 
     let rename_thread = move |thread_id: String, x: f64, y: f64| {
         let current_name = threads
@@ -1377,7 +1528,7 @@ fn App() -> impl IntoView {
                     .get("thread_id")
                     .map(|id| id == &thread_id)
                     .unwrap_or(false)
-                || asset
+                    || asset
                         .source_task_id
                         .as_ref()
                         .map(|task_id| removed_task_ids.contains(task_id))
@@ -1434,9 +1585,9 @@ fn App() -> impl IntoView {
         }
         commit_current_thread_draft();
         current_thread_id.set(thread_id.clone());
-        if let Some(selected_thread) = threads.with_untracked(|items| {
-            items.iter().find(|item| item.id == thread_id).cloned()
-        }) {
+        if let Some(selected_thread) =
+            threads.with_untracked(|items| items.iter().find(|item| item.id == thread_id).cloned())
+        {
             draft_prompt.set(selected_thread.draft_prompt.clone());
         }
         selected_reference_ids.set(Vec::new());
@@ -1555,8 +1706,7 @@ fn App() -> impl IntoView {
     let delete_asset = move |asset_id: String| {
         if !confirm_action(
             "删除后将从当前浏览器移除这张参考图，并让所有引用它的结果失效，是否继续？",
-        )
-        {
+        ) {
             return;
         }
         assets.update(|items| items.retain(|asset| asset.id != asset_id));
@@ -1720,7 +1870,9 @@ fn App() -> impl IntoView {
             if folder_id == DEFAULT_FAVORITE_FOLDER_ID {
                 return;
             }
-            value.favorite_folders.retain(|folder| folder.id != folder_id);
+            value
+                .favorite_folders
+                .retain(|folder| folder.id != folder_id);
             if value.active_favorite_folder_id.as_deref() == Some(folder_id.as_str()) {
                 value.active_favorite_folder_id = Some(DEFAULT_FAVORITE_FOLDER_ID.into());
             }
@@ -1923,10 +2075,12 @@ fn App() -> impl IntoView {
         floating_tip_state.set(None);
     };
 
-    let reference_tip_enabled = move || !preview_panel_state
-        .get()
-        .map(|panel| panel.reference_thumbs.is_empty())
-        .unwrap_or(true);
+    let reference_tip_enabled = move || {
+        !preview_panel_state
+            .get()
+            .map(|panel| panel.reference_thumbs.is_empty())
+            .unwrap_or(true)
+    };
 
     let run_generation = move || {
         if generating.get_untracked() {
@@ -2043,7 +2197,8 @@ fn App() -> impl IntoView {
             if let Some(asset_id) = continuation_asset_id_for_request.clone() {
                 required_asset_ids.push(asset_id);
             }
-            if let Err(error) = ensure_asset_payloads_loaded(assets_signal, &required_asset_ids).await
+            if let Err(error) =
+                ensure_asset_payloads_loaded(assets_signal, &required_asset_ids).await
             {
                 tasks_signal.update(|items| {
                     if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
@@ -2284,6 +2439,7 @@ fn App() -> impl IntoView {
                     >
                         <MaterialSymbolIcon name="star" filled=true />
                     </button>
+                    <img class="brand-logo" src="/favicon/MewImage01.png" alt="MewImage" />
                     <h1>"MewImage"</h1>
                     <span class="muted">"默认本地模式、登录手动同步~"</span>
                 </div>
@@ -2310,199 +2466,399 @@ fn App() -> impl IntoView {
                 view! {
                     <div class="settings-overlay" on:click=move |_| show_settings_menu.set(false)>
                         <div class="settings-popover" on:click=move |ev: MouseEvent| ev.stop_propagation()>
-                            <div class="settings-grid">
-                                <section class="stack">
-                                    <div class="row">
-                                        <h2>"账号与同步"</h2>
-                                        <span class="tag">{move || auth_user
-                                            .get()
-                                            .map(|user| format!("{} · {} · 服务器图片 {} 张", user.username, user.status, user.image_count))
-                                            .unwrap_or_else(|| "游客本地 + 受限代理模式".into())}</span>
-                                    </div>
-                                    <p class="status">
-                                        {move || {
-                                            match auth_user.get() {
-                                                Some(user) if user.status == "approved" => {
-                                                    "已登录且审批通过：本地继续优先，只有点击“立即同步”才会上云。".to_string()
-                                                }
-                                                Some(_) => {
-                                                    "已登录但账号待审批：可以继续本地使用，暂不能使用云端同步和服务器资源存储。".to_string()
-                                                }
-                                                None => {
-                                                    "未登录：会话、历史、参考图和配置都保存在当前浏览器；代理仅临时中转请求，不写入云端同步或对象存储。".to_string()
-                                                }
-                                            }
-                                        }}
-                                    </p>
-                                    <input
-                                        class="text-input"
-                                        placeholder="用户名"
-                                        prop:value=move || login_username.get()
-                                        on:input=move |ev| login_username.set(event_target_value(&ev))
-                                    />
-                                    <input
-                                        class="text-input"
-                                        type="password"
-                                        placeholder="密码 / 同步口令"
-                                        prop:value=move || login_password.get()
-                                        on:input=move |ev| login_password.set(event_target_value(&ev))
-                                    />
-                                    <input
-                                        class="text-input"
-                                        type="password"
-                                        placeholder="确认密码（注册 / 改密时使用）"
-                                        prop:value=move || register_password_confirm.get()
-                                        on:input=move |ev| register_password_confirm.set(event_target_value(&ev))
-                                    />
-                                    <input
-                                        class="text-input"
-                                        type="password"
-                                        placeholder="管理员初始化口令（仅首次管理员注册，可选）"
-                                        prop:value=move || admin_setup_token.get()
-                                        on:input=move |ev| admin_setup_token.set(event_target_value(&ev))
-                                    />
-                                    <p class="status compact-help">"注册密码需至少 10 位，并包含大写、小写、数字和符号。普通注册账号需管理员审批后才能同步。"</p>
-                                    <div class="row">
-                                        <button class="button" on:click=move |_| submit_auth("login")>"登录"</button>
-                                        <button class="button secondary" on:click=move |_| submit_auth("register")>"注册"</button>
+                            <div class="settings-shell">
+                                <aside class="settings-sidebar">
+                                    <div class="settings-sidebar-main">
                                         <button
-                                            class="button ghost"
-                                            on:click=move |_| sync_action()
-                                            disabled=move || syncing.get()
-                                                || auth_user.get().map(|user| user.status != "approved").unwrap_or(true)
+                                            class="settings-nav-button"
+                                            class:is-active=move || settings_tab.get() == "providers"
+                                            on:click=move |_| settings_tab.set("providers".into())
                                         >
-                                            {move || if syncing.get() { "同步中…" } else { "立即同步" }}
+                                            <MaterialSymbolIcon name="tune" filled=false />
+                                            <span>"服务商配置"</span>
                                         </button>
-                                    </div>
-                                    {move || if auth_user.get().is_some() {
-                                        view! {
-                                            <div class="account-security-card">
-                                                <h3>"账号安全"</h3>
-                                                <input
-                                                    class="text-input"
-                                                    type="password"
-                                                    placeholder="当前密码"
-                                                    prop:value=move || change_old_password.get()
-                                                    on:input=move |ev| change_old_password.set(event_target_value(&ev))
-                                                />
-                                                <input
-                                                    class="text-input"
-                                                    type="password"
-                                                    placeholder="新密码"
-                                                    prop:value=move || change_new_password.get()
-                                                    on:input=move |ev| change_new_password.set(event_target_value(&ev))
-                                                />
-                                                <input
-                                                    class="text-input"
-                                                    type="password"
-                                                    placeholder="再次输入新密码"
-                                                    prop:value=move || change_new_password_confirm.get()
-                                                    on:input=move |ev| change_new_password_confirm.set(event_target_value(&ev))
-                                                />
-                                                <button class="button secondary" on:click=change_password>"更新密码"</button>
-                                            </div>
-                                        }.into_any()
-                                    } else {
-                                        ().into_any()
-                                    }}
-                                </section>
-
-                                <section class="stack">
-                                    <div class="row">
-                                        <h2>"服务商配置"</h2>
-                                        <div class="row">
-                                            <button class="button ghost" on:click=add_config>"新增配置"</button>
-                                            <button class="button ghost danger" on:click=delete_config>"删除配置"</button>
-                                        </div>
-                                    </div>
-                                    <select
-                                        class="select-input"
-                                        prop:value=move || current_config_id.get()
-                                        on:change=move |ev| current_config_id.set(event_target_value(&ev))
-                                    >
-                                        <For
-                                            each=move || configs.get()
-                                            key=|config| config.id.clone()
-                                            children=move |config| view! {
-                                                <option value=config.id.clone()>{config.name}</option>
-                                            }
-                                        />
-                                    </select>
-                                    <ConfigEditor
-                                        configs=configs
-                                        current_config_id=current_config_id
-                                        current_config_snapshot=current_config
-                                        templates=templates
-                                        save_configs_only=move || persist_ui_state()
-                                    />
-                                </section>
-
-                                {move || if auth_user
-                                    .get()
-                                    .map(|user| user.role == "admin")
-                                    .unwrap_or(false)
-                                {
-                                    view! {
-                                        <section class="stack admin-panel">
-                                            <div class="row admin-panel-header">
-                                                <h2>"用户审批"</h2>
-                                                <button class="button ghost" on:click=refresh_admin_users disabled=move || loading_admin_users.get()>
-                                                    {move || if loading_admin_users.get() { "刷新中…" } else { "刷新列表" }}
+                                        <button
+                                            class="settings-nav-button"
+                                            class:is-active=move || settings_tab.get() == "account"
+                                            on:click=move |_| settings_tab.set("account".into())
+                                        >
+                                            <MaterialSymbolIcon name="cloud_sync" filled=false />
+                                            <span>"账号与同步"</span>
+                                        </button>
+                                        {move || if auth_user.get().is_some() {
+                                            view! {
+                                                <button
+                                                    class="settings-nav-button"
+                                                    class:is-active=move || settings_tab.get() == "password"
+                                                    on:click=move |_| settings_tab.set("password".into())
+                                                >
+                                                    <MaterialSymbolIcon name="lock_reset" filled=false />
+                                                    <span>"密码更改"</span>
                                                 </button>
-                                            </div>
-                                            <div class="admin-user-list">
-                                                {move || {
-                                                    let rows = admin_users.get();
-                                                    if rows.is_empty() {
-                                                        return vec![view! {
-                                                            <div class="admin-empty">
-                                                                "还没有加载用户列表。点击“刷新列表”查看注册申请。"
-                                                            </div>
-                                                        }.into_any()];
-                                                    }
-                                                    rows.into_iter().map(|user| {
-                                                        let approve_id = user.id.clone();
-                                                        let disable_id = user.id.clone();
-                                                        let restore_id = user.id.clone();
+                                            }.into_any()
+                                        } else {
+                                            ().into_any()
+                                        }}
+                                        {move || if auth_user
+                                            .get()
+                                            .map(|user| user.role == "admin")
+                                            .unwrap_or(false)
+                                        {
+                                            view! {
+                                                <button
+                                                    class="settings-nav-button"
+                                                    class:is-active=move || settings_tab.get() == "admin"
+                                                    on:click=move |_| settings_tab.set("admin".into())
+                                                >
+                                                    <MaterialSymbolIcon name="admin_panel_settings" filled=false />
+                                                    <span>"用户审批"</span>
+                                                </button>
+                                            }.into_any()
+                                        } else {
+                                            ().into_any()
+                                        }}
+                                    </div>
+                                    <button
+                                        class="settings-nav-button settings-about-button"
+                                        class:is-active=move || settings_tab.get() == "about"
+                                        on:click=move |_| settings_tab.set("about".into())
+                                    >
+                                        <MaterialSymbolIcon name="info" filled=false />
+                                        <span>"关于"</span>
+                                    </button>
+                                </aside>
+                                <div class="settings-content">
+                                    {move || match settings_tab.get().as_str() {
+                                        "account" => view! {
+                                            <section class="stack">
+                                                <div class="row">
+                                                    <h2>"账号与同步"</h2>
+                                                    <span class="tag">{move || auth_user
+                                                        .get()
+                                                        .map(|user| format!("{} · {} · 服务器图片 {} 张", user.username, user.status, user.image_count))
+                                                        .unwrap_or_else(|| "游客本地 + 受限代理模式".into())}</span>
+                                                </div>
+                                                <p class="status">
+                                                    {move || {
+                                                        match auth_user.get() {
+                                                            Some(user) if user.status == "approved" => {
+                                                                "已登录且审批通过：本地继续优先，只有点击“立即同步”才会上云。".to_string()
+                                                            }
+                                                            Some(_) => {
+                                                                "已登录但账号待审批：可以继续本地使用，暂不能使用云端同步和服务器资源存储。".to_string()
+                                                            }
+                                                            None => {
+                                                                "未登录：会话、历史、参考图和配置都保存在当前浏览器；代理仅临时中转请求，不写入云端同步或对象存储。".to_string()
+                                                            }
+                                                        }
+                                                    }}
+                                                </p>
+                                                <div class="settings-form-card">
+                                                    <div class="auth-mode-tabs">
+                                                        <button
+                                                            class="auth-mode-button"
+                                                            class:is-active=move || auth_mode.get() == "login"
+                                                            on:click=move |_| {
+                                                                auth_mode.set("login".into());
+                                                                username_check_message.set(None);
+                                                                auth_form_message.set(None);
+                                                            }
+                                                        >
+                                                            "登录"
+                                                        </button>
+                                                        <button
+                                                            class="auth-mode-button"
+                                                            class:is-active=move || auth_mode.get() == "register"
+                                                            on:click=move |_| {
+                                                                auth_mode.set("register".into());
+                                                                username_check_message.set(None);
+                                                                auth_form_message.set(None);
+                                                            }
+                                                        >
+                                                            "注册"
+                                                        </button>
+                                                    </div>
+                                                    <input
+                                                        class="text-input"
+                                                        placeholder="用户名"
+                                                        prop:value=move || login_username.get()
+                                                        on:input=move |ev| {
+                                                            login_username.set(event_target_value(&ev));
+                                                            username_check_message.set(None);
+                                                            auth_form_message.set(None);
+                                                        }
+                                                        on:blur=move |_| {
+                                                            if auth_mode.get_untracked() == "register" {
+                                                                check_username_availability();
+                                                            }
+                                                        }
+                                                    />
+                                                    {move || if auth_mode.get() == "register" {
+                                                        username_check_message.get().map(|message| view! {
+                                                            <p class="form-hint">{message}</p>
+                                                        }).into_any()
+                                                    } else {
+                                                        ().into_any()
+                                                    }}
+                                                    <input
+                                                        class="text-input"
+                                                        type="password"
+                                                        placeholder="密码"
+                                                        prop:value=move || login_password.get()
+                                                        on:input=move |ev| {
+                                                            login_password.set(event_target_value(&ev));
+                                                            auth_form_message.set(None);
+                                                        }
+                                                    />
+                                                    {move || if auth_mode.get() == "register" {
                                                         view! {
-                                                            <article class="admin-user-row">
-                                                                <div class="admin-user-main">
-                                                                    <strong>{user.username}</strong>
-                                                                    <span class="muted">{format!("{} · {}", user.role, user.status)}</span>
-                                                                </div>
-                                                                <span class="tag">{format!("服务器图片 {} 张", user.image_count)}</span>
-                                                                <span class="muted admin-user-date">{format!("注册 {}", user.created_at)}</span>
-                                                                <div class="row admin-user-actions">
-                                                                    {if user.status == "pending" {
-                                                                        view! {
-                                                                            <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/approve", approve_id.clone())>
-                                                                                "批准"
-                                                                            </button>
-                                                                        }.into_any()
-                                                                    } else if user.status == "disabled" {
-                                                                        view! {
-                                                                            <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/restore", restore_id.clone())>
-                                                                                "恢复"
-                                                                            </button>
-                                                                        }.into_any()
-                                                                    } else {
-                                                                        view! {
-                                                                            <button class="button ghost danger" on:click=move |_| admin_user_action("/api/admin/users/disable", disable_id.clone())>
-                                                                                "禁用"
-                                                                            </button>
-                                                                        }.into_any()
-                                                                    }}
-                                                                </div>
-                                                            </article>
+                                                            <input
+                                                                class="text-input"
+                                                                type="password"
+                                                                placeholder="确认密码"
+                                                                prop:value=move || register_password_confirm.get()
+                                                                on:input=move |ev| {
+                                                                    register_password_confirm.set(event_target_value(&ev));
+                                                                    auth_form_message.set(None);
+                                                                }
+                                                            />
                                                         }.into_any()
-                                                    }).collect::<Vec<_>>()
+                                                    } else {
+                                                        ().into_any()
+                                                    }}
+                                                    {move || if admin_setup_allowed.get()
+                                                        && auth_user.get().map(|user| user.role != "admin").unwrap_or(true)
+                                                    {
+                                                        view! {
+                                                            <div class="stack admin-bootstrap-block">
+                                                                <button
+                                                                    class="button ghost"
+                                                                    on:click=move |_| show_admin_setup_token.update(|value| *value = !*value)
+                                                                >
+                                                                    {move || if show_admin_setup_token.get() { "隐藏管理员初始化" } else { "使用管理员初始化口令" }}
+                                                                </button>
+                                                                {move || if show_admin_setup_token.get() {
+                                                                    view! {
+                                                                        <div class="stack">
+                                                                            <input
+                                                                                class="text-input"
+                                                                                type="password"
+                                                                                placeholder="管理员初始化口令"
+                                                                                prop:value=move || admin_setup_token.get()
+                                                                                on:input=move |ev| {
+                                                                                    admin_setup_token.set(event_target_value(&ev));
+                                                                                    auth_form_message.set(None);
+                                                                                }
+                                                                            />
+                                                                            {move || if auth_user.get().is_some() {
+                                                                                view! {
+                                                                                    <button class="button secondary" on:click=bootstrap_current_user_as_admin>
+                                                                                        "将当前账号初始化为管理员"
+                                                                                    </button>
+                                                                                }.into_any()
+                                                                            } else {
+                                                                                view! {
+                                                                                    <p class="status compact-help">"首次管理员注册时填写；已有管理员后此入口会自动隐藏。"</p>
+                                                                                }.into_any()
+                                                                            }}
+                                                                        </div>
+                                                                    }.into_any()
+                                                                } else {
+                                                                    ().into_any()
+                                                                }}
+                                                            </div>
+                                                        }.into_any()
+                                                    } else {
+                                                        ().into_any()
+                                                    }}
+                                                    {move || auth_form_message.get().map(|message| view! {
+                                                        <p class="form-error">{message}</p>
+                                                    })}
+                                                    {move || if auth_mode.get() == "register" {
+                                                        view! {
+                                                            <p class="status compact-help">"注册密码需至少 10 位，并包含大写、小写、数字和符号。普通注册账号需管理员审批后才能同步。"</p>
+                                                        }.into_any()
+                                                    } else {
+                                                        ().into_any()
+                                                    }}
+                                                    <div class="row">
+                                                        <button
+                                                            class="button"
+                                                            on:click=move |_| {
+                                                                if auth_mode.get_untracked() == "register" {
+                                                                    submit_auth("register");
+                                                                } else {
+                                                                    submit_auth("login");
+                                                                }
+                                                            }
+                                                        >
+                                                            {move || if auth_mode.get() == "register" { "创建账号" } else { "登录" }}
+                                                        </button>
+                                                        <button
+                                                            class="button ghost"
+                                                            on:click=move |_| sync_action()
+                                                            disabled=move || syncing.get()
+                                                                || auth_user.get().map(|user| user.status != "approved").unwrap_or(true)
+                                                        >
+                                                            {move || if syncing.get() { "同步中…" } else { "立即同步" }}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </section>
+                                        }.into_any(),
+                                        "password" => view! {
+                                            <section class="stack">
+                                                <h2>"密码更改"</h2>
+                                                {move || if auth_user.get().is_some() {
+                                                    view! {
+                                                        <div class="account-security-card">
+                                                            <input
+                                                                class="text-input"
+                                                                type="password"
+                                                                placeholder="当前密码"
+                                                                prop:value=move || change_old_password.get()
+                                                                on:input=move |ev| {
+                                                                    change_old_password.set(event_target_value(&ev));
+                                                                    password_form_message.set(None);
+                                                                }
+                                                            />
+                                                            <input
+                                                                class="text-input"
+                                                                type="password"
+                                                                placeholder="新密码"
+                                                                prop:value=move || change_new_password.get()
+                                                                on:input=move |ev| {
+                                                                    change_new_password.set(event_target_value(&ev));
+                                                                    password_form_message.set(None);
+                                                                }
+                                                            />
+                                                            <input
+                                                                class="text-input"
+                                                                type="password"
+                                                                placeholder="再次输入新密码"
+                                                                prop:value=move || change_new_password_confirm.get()
+                                                                on:input=move |ev| {
+                                                                    change_new_password_confirm.set(event_target_value(&ev));
+                                                                    password_form_message.set(None);
+                                                                }
+                                                            />
+                                                            {move || password_form_message.get().map(|message| view! {
+                                                                <p class="form-error">{message}</p>
+                                                            })}
+                                                            <p class="status compact-help">"新密码至少 10 位，并包含大写、小写、数字和符号。"</p>
+                                                            <button class="button secondary" on:click=change_password>"更新密码"</button>
+                                                        </div>
+                                                    }.into_any()
+                                                } else {
+                                                    view! {
+                                                        <div class="admin-empty">"登录后才能修改密码。"</div>
+                                                    }.into_any()
                                                 }}
-                                            </div>
-                                        </section>
-                                    }.into_any()
-                                } else {
-                                    ().into_any()
-                                }}
+                                            </section>
+                                        }.into_any(),
+                                        "admin" => view! {
+                                            <section class="stack admin-panel">
+                                                <div class="row admin-panel-header">
+                                                    <h2>"用户审批"</h2>
+                                                    <button class="button ghost" on:click=refresh_admin_users disabled=move || loading_admin_users.get()>
+                                                        {move || if loading_admin_users.get() { "刷新中…" } else { "刷新列表" }}
+                                                    </button>
+                                                </div>
+                                                <div class="admin-user-list">
+                                                    {move || {
+                                                        let rows = admin_users.get();
+                                                        if rows.is_empty() {
+                                                            return vec![view! {
+                                                                <div class="admin-empty">
+                                                                    "还没有加载用户列表。点击“刷新列表”查看注册申请。"
+                                                                </div>
+                                                            }.into_any()];
+                                                        }
+                                                        rows.into_iter().map(|user| {
+                                                            let approve_id = user.id.clone();
+                                                            let disable_id = user.id.clone();
+                                                            let restore_id = user.id.clone();
+                                                            view! {
+                                                                <article class="admin-user-row">
+                                                                    <div class="admin-user-main">
+                                                                        <strong>{user.username}</strong>
+                                                                        <span class="muted">{format!("{} · {}", user.role, user.status)}</span>
+                                                                    </div>
+                                                                    <span class="tag">{format!("服务器图片 {} 张", user.image_count)}</span>
+                                                                    <span class="muted admin-user-date">{format!("注册 {}", user.created_at)}</span>
+                                                                    <div class="row admin-user-actions">
+                                                                        {if user.status == "pending" {
+                                                                            view! {
+                                                                                <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/approve", approve_id.clone())>
+                                                                                    "批准"
+                                                                                </button>
+                                                                            }.into_any()
+                                                                        } else if user.status == "disabled" {
+                                                                            view! {
+                                                                                <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/restore", restore_id.clone())>
+                                                                                    "恢复"
+                                                                                </button>
+                                                                            }.into_any()
+                                                                        } else {
+                                                                            view! {
+                                                                                <button class="button ghost danger" on:click=move |_| admin_user_action("/api/admin/users/disable", disable_id.clone())>
+                                                                                    "禁用"
+                                                                                </button>
+                                                                            }.into_any()
+                                                                        }}
+                                                                    </div>
+                                                                </article>
+                                                            }.into_any()
+                                                        }).collect::<Vec<_>>()
+                                                    }}
+                                                </div>
+                                            </section>
+                                        }.into_any(),
+                                        "about" => view! {
+                                            <section class="stack">
+                                                <div class="settings-about-card">
+                                                    <img class="settings-about-logo" src="/favicon/MewImage01.png" alt="MewImage" />
+                                                    <div class="stack">
+                                                        <h2>"关于 MewImage"</h2>
+                                                        <p class="status">"一个本地优先、登录后手动同步的可爱图片生成工作台。游客数据默认留在浏览器，服务器只承担代理、账号和可选同步职责。"</p>
+                                                        <span class="tag">"Rust · Leptos · Axum · SQLite"</span>
+                                                    </div>
+                                                </div>
+                                            </section>
+                                        }.into_any(),
+                                        _ => view! {
+                                            <section class="stack">
+                                                <div class="row">
+                                                    <h2>"服务商配置"</h2>
+                                                    <div class="row">
+                                                        <button class="button ghost" on:click=add_config>"新增配置"</button>
+                                                        <button class="button ghost danger" on:click=delete_config>"删除配置"</button>
+                                                    </div>
+                                                </div>
+                                                <select
+                                                    class="select-input"
+                                                    prop:value=move || current_config_id.get()
+                                                    on:change=move |ev| current_config_id.set(event_target_value(&ev))
+                                                >
+                                                    <For
+                                                        each=move || configs.get()
+                                                        key=|config| config.id.clone()
+                                                        children=move |config| view! {
+                                                            <option value=config.id.clone()>{config.name}</option>
+                                                        }
+                                                    />
+                                                </select>
+                                                <ConfigEditor
+                                                    configs=configs
+                                                    current_config_id=current_config_id
+                                                    current_config_snapshot=current_config
+                                                    templates=templates
+                                                    save_configs_only=move || persist_ui_state()
+                                                />
+                                            </section>
+                                        }.into_any(),
+                                    }}
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -4116,10 +4472,7 @@ fn ConfigEditor(
                     config.provider_kind = template.kind;
                     config.known_requires_proxy = template.known_requires_proxy;
                 }
-                config.name = name_draft
-                    .get_untracked()
-                    .trim()
-                    .to_string();
+                config.name = name_draft.get_untracked().trim().to_string();
                 config.base_url = base_url_draft.get_untracked().trim().to_string();
                 config.model = model_draft.get_untracked().trim().to_string();
                 config.access_mode = match access_mode_draft.get_untracked().as_str() {
@@ -4628,10 +4981,7 @@ fn strip_asset_payloads_for_snapshot(assets: &[ImageAssetRef]) -> Vec<ImageAsset
         .collect()
 }
 
-fn merge_asset_payloads(
-    assets: &mut [ImageAssetRef],
-    payloads: &HashMap<String, String>,
-) -> bool {
+fn merge_asset_payloads(assets: &mut [ImageAssetRef], payloads: &HashMap<String, String>) -> bool {
     let mut changed = false;
     for asset in assets {
         if asset.data_url.is_some() {
@@ -4658,10 +5008,12 @@ async fn ensure_asset_payloads_loaded(
             .iter()
             .filter(|asset_id| unique_ids.insert((*asset_id).clone()))
             .filter(|asset_id| {
-                items.iter()
+                items
+                    .iter()
                     .find(|asset| asset.id == **asset_id)
                     .map(|asset| {
-                        asset.data_url
+                        asset
+                            .data_url
                             .as_deref()
                             .map(|value| value.trim().is_empty())
                             .unwrap_or(true)
@@ -4689,9 +5041,7 @@ fn schedule_background_task(callback: impl FnOnce() + 'static) {
         callback();
         return;
     };
-    let callback = Rc::new(RefCell::new(Some(
-        Box::new(callback) as Box<dyn FnOnce()>,
-    )));
+    let callback = Rc::new(RefCell::new(Some(Box::new(callback) as Box<dyn FnOnce()>)));
     if let Ok(idle_callback) = Reflect::get(
         window.as_ref(),
         &wasm_bindgen::JsValue::from_str("requestIdleCallback"),
@@ -4826,9 +5176,8 @@ fn request_payload_flush(
                 .map(|(asset_id, data_url)| (asset_id.clone(), data_url.clone()))
                 .collect::<Vec<_>>()
         });
-        let deletes = payload_delete_queue.with_untracked(|queued| {
-            queued.iter().cloned().collect::<Vec<_>>()
-        });
+        let deletes = payload_delete_queue
+            .with_untracked(|queued| queued.iter().cloned().collect::<Vec<_>>());
         if writes.is_empty() && deletes.is_empty() {
             pending.set(false);
             return;
@@ -5026,6 +5375,18 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn validate_frontend_password_strength(password: &str, confirm: &str) -> Result<(), String> {
     if password != confirm {
         return Err("两次输入的密码不一致。".into());
@@ -5121,15 +5482,16 @@ fn format_duration_ms(duration_ms: u64) -> String {
 
 fn format_failure_raw_response(value: &serde_json::Value) -> String {
     let mut copy = value.clone();
-    if let Some(output) = copy.get_mut("output").and_then(|value| value.as_array_mut()) {
+    if let Some(output) = copy
+        .get_mut("output")
+        .and_then(|value| value.as_array_mut())
+    {
         for item in output {
             if let Some(result) = item.get_mut("result") {
                 if let Some(text) = result.as_str() {
                     if text.len() > 96 {
-                        *result = serde_json::Value::String(format!(
-                            "<base64_data len={}>",
-                            text.len()
-                        ));
+                        *result =
+                            serde_json::Value::String(format!("<base64_data len={}>", text.len()));
                     }
                 } else if let Some(object) = result.as_object_mut() {
                     redact_large_base64_values(object);

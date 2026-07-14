@@ -16,11 +16,11 @@ WORKDIR /app
 COPY --from=builder /app/target/release/mew-image-backend /usr/local/bin/mew-image-backend
 COPY --from=builder /app/frontend/dist-app /app/frontend/dist-app
 
-ENV MEW_IMAGE_LISTEN=0.0.0.0:3000
-ENV MEW_IMAGE_DATABASE_URL=sqlite:///data/mew-image.db
-ENV MEW_IMAGE_FRONTEND_DIST=/app/frontend/dist-app
-ENV MEW_IMAGE_ASSET_STORE=local
-ENV MEW_IMAGE_LOCAL_ASSET_DIR=/data/assets
+ENV MEW_LISTEN=0.0.0.0:3000
+ENV MEW_DATABASE_URL=sqlite:///data/mew-image.db
+ENV MEW_FRONTEND_DIST=/app/frontend/dist-app
+ENV MEW_ASSET_STORE=local
+ENV MEW_LOCAL_ASSET_DIR=/data/assets
 
 VOLUME ["/data"]
 

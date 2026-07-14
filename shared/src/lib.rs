@@ -120,7 +120,10 @@ impl ProviderTemplate {
             response_image_base64_path: Some("data[].b64_json".into()),
             response_revised_prompt_path: Some("data[0].revised_prompt".into()),
             known_requires_proxy: true,
-            notes: Some("内置 OpenAI Image 模板，用于 gpt-image 模型，支持 Images API 与 Responses API。".into()),
+            notes: Some(
+                "内置 OpenAI Image 模板，用于 gpt-image 模型，支持 Images API 与 Responses API。"
+                    .into(),
+            ),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -429,10 +432,7 @@ fn collect_gemini_image_payloads(
 ) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(inline_data) = map
-                .get("inline_data")
-                .or_else(|| map.get("inlineData"))
-            {
+            if let Some(inline_data) = map.get("inline_data").or_else(|| map.get("inlineData")) {
                 if let Some(data) = inline_data.get("data").and_then(|value| value.as_str()) {
                     let mime_type = inline_data
                         .get("mime_type")
@@ -591,9 +591,8 @@ pub fn extract_openai_compatible_result(
     response_json: serde_json::Value,
     output_format: Option<&str>,
 ) -> Result<GenerationResult, String> {
-    extract_nano_banana_result(request, response_json, output_format).map_err(|error| {
-        error.replace("nano banana", "OpenAI 兼容")
-    })
+    extract_nano_banana_result(request, response_json, output_format)
+        .map_err(|error| error.replace("nano banana", "OpenAI 兼容"))
 }
 
 fn collect_openai_response_images(
@@ -675,8 +674,7 @@ fn normalize_openai_response_image(
         });
     }
 
-    if looks_like_base64_payload(trimmed)
-        || (has_image_hint && looks_like_base64_fragment(trimmed))
+    if looks_like_base64_payload(trimmed) || (has_image_hint && looks_like_base64_fragment(trimmed))
     {
         if !is_root_payload && !has_image_hint {
             return None;
@@ -685,7 +683,10 @@ fn normalize_openai_response_image(
             url: None,
             data_url: Some(format!(
                 "data:{fallback_mime};base64,{}",
-                trimmed.chars().filter(|char| !char.is_whitespace()).collect::<String>()
+                trimmed
+                    .chars()
+                    .filter(|char| !char.is_whitespace())
+                    .collect::<String>()
             )),
         });
     }
@@ -709,26 +710,39 @@ fn looks_like_http_url(value: &str) -> bool {
 }
 
 fn looks_like_base64_payload(value: &str) -> bool {
-    let compact = value.chars().filter(|char| !char.is_whitespace()).collect::<String>();
+    let compact = value
+        .chars()
+        .filter(|char| !char.is_whitespace())
+        .collect::<String>();
     compact.len() >= 64
-        && compact.chars().all(|char| {
-            char.is_ascii_alphanumeric() || matches!(char, '+' | '/' | '=' | '-' | '_')
-        })
+        && compact
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '+' | '/' | '=' | '-' | '_'))
 }
 
 fn looks_like_base64_fragment(value: &str) -> bool {
-    let compact = value.chars().filter(|char| !char.is_whitespace()).collect::<String>();
+    let compact = value
+        .chars()
+        .filter(|char| !char.is_whitespace())
+        .collect::<String>();
     compact.len() >= 8
-        && compact.chars().all(|char| {
-            char.is_ascii_alphanumeric() || matches!(char, '+' | '/' | '=' | '-' | '_')
-        })
+        && compact
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '+' | '/' | '=' | '-' | '_'))
 }
 
 fn path_indicates_image(path: &[String]) -> bool {
     path.iter().any(|segment| {
         matches!(
             segment.as_str(),
-            "b64_json" | "base64" | "base64_json" | "image" | "image_url" | "url" | "data" | "result"
+            "b64_json"
+                | "base64"
+                | "base64_json"
+                | "image"
+                | "image_url"
+                | "url"
+                | "data"
+                | "result"
         )
     })
 }
@@ -931,6 +945,23 @@ pub struct ChangePasswordRequest {
     pub old_password: String,
     pub new_password: String,
     pub new_password_confirm: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminBootstrapRequest {
+    pub admin_setup_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsernameAvailabilityResponse {
+    pub username: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminSetupStatusResponse {
+    pub admin_exists: bool,
+    pub setup_allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

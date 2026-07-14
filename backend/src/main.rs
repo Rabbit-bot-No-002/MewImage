@@ -18,7 +18,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::DefaultBodyLimit,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -26,15 +26,16 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use mew_image_shared::{
-    AdminUserActionRequest, AdminUserSummary, AdminUsersResponse, AuthRequest, AuthResponse,
-    ChangePasswordRequest, GenerateViaProxyRequest, GeneratedImageResult, GenerationResult,
-    ImageAssetRef, MeResponse, MergePreviewResponse, ParameterSnapshot, ProviderEndpointMode,
-    ProviderKind, ProviderTemplate, ProviderTemplateImportRequest, RegisterRequest, SyncEnvelope,
-    SyncPullResponse, SyncPushRequest, UploadCompleteRequest, UploadCompleteResponse,
-    UploadInitRequest, UploadInitResponse, UserSummary,
-    aspect_ratio_from_dimensions, extract_gemini_generation_result,
-    extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes, new_id,
-    nano_banana_image_size_from_dimensions, now_rfc3339,
+    AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUserSummary,
+    AdminUsersResponse, AuthRequest, AuthResponse, ChangePasswordRequest, GenerateViaProxyRequest,
+    GeneratedImageResult, GenerationResult, ImageAssetRef, MeResponse, MergePreviewResponse,
+    ParameterSnapshot, ProviderEndpointMode, ProviderKind, ProviderTemplate,
+    ProviderTemplateImportRequest, RegisterRequest, SyncEnvelope, SyncPullResponse,
+    SyncPushRequest, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
+    UploadInitResponse, UserSummary, UsernameAvailabilityResponse, aspect_ratio_from_dimensions,
+    extract_gemini_generation_result, extract_openai_compatible_result,
+    extract_openai_responses_result, merge_envelopes, nano_banana_image_size_from_dimensions,
+    new_id, now_rfc3339,
 };
 use rand::distr::{Alphanumeric, SampleString};
 use reqwest::Url;
@@ -52,8 +53,8 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tower_sessions::{ExpiredDeletion, Session, SessionManagerLayer};
-use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
 use tower_sessions_sqlx_store::SqliteStore;
+use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -110,6 +111,9 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/register", post(register))
+        .route("/api/auth/check-username", get(check_username))
+        .route("/api/auth/setup-status", get(admin_setup_status))
+        .route("/api/auth/bootstrap-admin", post(bootstrap_admin))
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
@@ -155,7 +159,10 @@ fn ensure_sqlite_parent_dir(database_url: &str) -> anyhow::Result<()> {
     let path = path.split('?').next().unwrap_or(path);
     let path = path.strip_prefix("./").unwrap_or(path);
     let path = std::path::Path::new(path);
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
@@ -238,11 +245,18 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query(statement).execute(db).await?;
     }
     migrate_users_table(db).await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS users_single_admin ON users(role) WHERE role = 'admin'",
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
 async fn migrate_users_table(db: &SqlitePool) -> anyhow::Result<()> {
-    let rows = sqlx::query("PRAGMA table_info(users)").fetch_all(db).await?;
+    let rows = sqlx::query("PRAGMA table_info(users)")
+        .fetch_all(db)
+        .await?;
     let columns = rows
         .iter()
         .map(|row| row.get::<String, _>("name"))
@@ -290,17 +304,46 @@ fn build_cors_layer(config: &AppConfig) -> anyhow::Result<CorsLayer> {
     Ok(CorsLayer::new()
         .allow_credentials(true)
         .allow_headers(AllowHeaders::mirror_request())
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::OPTIONS,
-        ])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
         .allow_origin(AllowOrigin::list(origin_headers)))
 }
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UsernameAvailabilityQuery {
+    username: String,
+}
+
+async fn check_username(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UsernameAvailabilityQuery>,
+) -> Result<Json<UsernameAvailabilityResponse>, AppError> {
+    let username = query.username.trim().to_string();
+    if username.len() < 3 {
+        return Ok(Json(UsernameAvailabilityResponse {
+            username,
+            available: false,
+        }));
+    }
+    Ok(Json(UsernameAvailabilityResponse {
+        available: !username_exists(&state.db, &username).await?,
+        username,
+    }))
+}
+
+async fn admin_setup_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<AdminSetupStatusResponse>, AppError> {
+    let admin_exists = user_role_exists(&state.db, "admin").await?;
+    Ok(Json(AdminSetupStatusResponse {
+        admin_exists,
+        setup_allowed: state.config.allow_first_admin_setup
+            && !admin_exists
+            && state.config.admin_setup_token.is_some(),
+    }))
 }
 
 async fn register(
@@ -363,6 +406,56 @@ async fn register(
         .await
         .map_err(AppError::internal)?;
     Ok(Json(AuthResponse { user }))
+}
+
+async fn bootstrap_admin(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AdminBootstrapRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    let user = require_user(&state, &session).await?;
+    if user.role == "admin" {
+        return Ok(Json(AuthResponse { user }));
+    }
+    if !state.config.allow_first_admin_setup || user_role_exists(&state.db, "admin").await? {
+        return Err(AppError::unauthorized(
+            "系统已存在管理员，不能再使用初始化口令升级账号。",
+        ));
+    }
+    let expected = state
+        .config
+        .admin_setup_token
+        .as_deref()
+        .ok_or_else(|| AppError::unauthorized("服务器未配置管理员初始化口令。"))?;
+    if payload.admin_setup_token.trim() != expected {
+        return Err(AppError::unauthorized("管理员初始化口令不正确。"));
+    }
+
+    let now = now_rfc3339();
+    let result = sqlx::query(
+        "UPDATE users
+         SET role = 'admin', status = 'approved', approved_at = ?, approved_by = ?
+         WHERE id = ? AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')",
+    )
+    .bind(&now)
+    .bind(&user.id)
+    .bind(&user.id)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::unauthorized(
+            "系统已存在管理员，不能再使用初始化口令升级账号。",
+        ));
+    }
+
+    let upgraded = UserSummary {
+        role: "admin".into(),
+        status: "approved".into(),
+        image_count: user_image_count(&state.db, &user.id).await?,
+        ..user
+    };
+    Ok(Json(AuthResponse { user: upgraded }))
 }
 
 async fn login(
@@ -438,7 +531,10 @@ async fn change_password(
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::unauthorized("登录状态已失效，请重新登录。"))?;
 
-    verify_password(&payload.old_password, &row.get::<String, _>("password_hash"))?;
+    verify_password(
+        &payload.old_password,
+        &row.get::<String, _>("password_hash"),
+    )?;
     let password_hash = hash_password(&payload.new_password)?;
     sqlx::query("UPDATE users SET password_hash = ?, password_updated_at = ? WHERE id = ?")
         .bind(password_hash)
@@ -1130,9 +1226,9 @@ async fn put_object(
                 .map_err(AppError::internal)?;
             Ok(())
         }
-        AssetStoreKind::Disabled => {
-            Err(AppError::bad_request("服务器未启用远程资源存储，当前操作不可用。"))
-        }
+        AssetStoreKind::Disabled => Err(AppError::bad_request(
+            "服务器未启用远程资源存储，当前操作不可用。",
+        )),
     }
 }
 
@@ -1170,6 +1266,15 @@ async fn get_object_bytes(state: &AppState, object_key: &str) -> Result<Vec<u8>,
 async fn user_role_exists(db: &SqlitePool, role: &str) -> Result<bool, AppError> {
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE role = ?")
         .bind(role)
+        .fetch_one(db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(count > 0)
+}
+
+async fn username_exists(db: &SqlitePool, username: &str) -> Result<bool, AppError> {
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?")
+        .bind(username.trim())
         .fetch_one(db)
         .await
         .map_err(AppError::internal)?;
@@ -1339,7 +1444,10 @@ fn resolve_provider_base_url(
         user_present,
         false,
         state.config.enforce_provider_host_whitelist
-            && matches!(kind, ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp),
+            && matches!(
+                kind,
+                ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp
+            ),
     )?;
     Ok(target.base_url)
 }
@@ -1352,8 +1460,8 @@ fn resolve_upstream_target(
     require_https: bool,
     enforce_custom_whitelist: bool,
 ) -> Result<ResolvedUpstreamTarget, AppError> {
-    let url = Url::parse(base_url)
-        .map_err(|_| AppError::bad_request("当前配置的 Base URL 无效。"))?;
+    let url =
+        Url::parse(base_url).map_err(|_| AppError::bad_request("当前配置的 Base URL 无效。"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(AppError::provider_target_blocked(
             "仅允许 http/https 上游地址。",
@@ -1391,7 +1499,7 @@ fn resolve_upstream_target(
                 || user_present));
     if requires_trusted_host && !host_matches_allowlist(&host, &allowed_hosts) {
         return Err(AppError::provider_target_blocked(format!(
-            "上游 `{host}` 不在受信任白名单中；可关闭 `MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST`，或将该域名加入 `MEW_IMAGE_TRUSTED_PROVIDER_HOSTS`。"
+            "上游 `{host}` 不在受信任白名单中；可关闭 `MEW_ENFORCE_HOST_WHITELIST`，或将该域名加入 `MEW_TRUSTED_HOSTS`。"
         )));
     }
 
@@ -1455,18 +1563,17 @@ fn ensure_object_storage_ready(state: &AppState) -> Result<(), AppError> {
     match state.config.asset_store {
         AssetStoreKind::Local => Ok(()),
         AssetStoreKind::S3 if state.s3.is_some() => Ok(()),
-        _ => {
-            Err(AppError::bad_request(
-                "服务器未启用远程资源存储，请登录前确认资源存储配置完整。",
-            ))
-        }
+        _ => Err(AppError::bad_request(
+            "服务器未启用远程资源存储，请登录前确认资源存储配置完整。",
+        )),
     }
 }
 
 fn ensure_upload_token_not_expired(row: &sqlx::sqlite::SqliteRow) -> Result<(), AppError> {
     let expires_at = row.get::<String, _>("expires_at");
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at)
-        .map_err(|error| AppError::internal_message(format!("上传凭证过期时间解析失败：{error}")))?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at).map_err(|error| {
+        AppError::internal_message(format!("上传凭证过期时间解析失败：{error}"))
+    })?;
     if expires_at.with_timezone(&Utc) <= Utc::now() {
         return Err(AppError::bad_request("上传凭证已过期，请重新发起上传。"));
     }
@@ -1563,7 +1670,9 @@ fn openai_compatible_endpoint(request: &mew_image_shared::GenerationRequest) -> 
     }
 }
 
-fn openai_compatible_response_format(request: &mew_image_shared::GenerationRequest) -> &'static str {
+fn openai_compatible_response_format(
+    request: &mew_image_shared::GenerationRequest,
+) -> &'static str {
     if request.reference_assets.is_empty() {
         "url"
     } else {
@@ -1603,9 +1712,7 @@ fn normalize_google_image_model(model: &str) -> String {
 
 fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
     let (prefix, payload) = data_url.split_once(',')?;
-    let mime_type = prefix
-        .strip_prefix("data:")?
-        .strip_suffix(";base64")?;
+    let mime_type = prefix.strip_prefix("data:")?.strip_suffix(";base64")?;
     Some((mime_type, payload))
 }
 
@@ -1771,10 +1878,7 @@ async fn invoke_openai_compatible_image(
         &payload.config.base_url,
         true,
     )?;
-    let url = join_api_url(
-        &base_url,
-        openai_compatible_endpoint(&payload.request),
-    );
+    let url = join_api_url(&base_url, openai_compatible_endpoint(&payload.request));
 
     let response = if payload.request.reference_assets.is_empty() {
         state
@@ -1811,7 +1915,10 @@ async fn invoke_openai_compatible_image(
             )
             .text(
                 "image_size",
-                nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
+                nano_banana_image_size_from_dimensions(
+                    payload.request.width,
+                    payload.request.height,
+                ),
             )
             .text("n", payload.request.count.to_string());
         for asset in &payload.request.reference_assets {
@@ -1993,9 +2100,11 @@ async fn fetch_remote_image_bytes(
     allowed_hosts.insert("api.openai.com".into());
     allowed_hosts.insert("oaidalleapiprodscus.blob.core.windows.net".into());
     allowed_hosts.insert("generativelanguage.googleapis.com".into());
-    if state.config.enforce_provider_host_whitelist && !host_matches_allowlist(&host, &allowed_hosts) {
+    if state.config.enforce_provider_host_whitelist
+        && !host_matches_allowlist(&host, &allowed_hosts)
+    {
         return Err(AppError::provider_target_blocked(format!(
-            "上游返回的图片地址 `{host}` 不在允许的下载白名单中；可关闭 `MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST`，或将该域名加入 `MEW_IMAGE_TRUSTED_PROVIDER_HOSTS`。"
+            "上游返回的图片地址 `{host}` 不在允许的下载白名单中；可关闭 `MEW_ENFORCE_HOST_WHITELIST`，或将该域名加入 `MEW_TRUSTED_HOSTS`。"
         )));
     }
 
@@ -2076,25 +2185,21 @@ fn extract_generation_result(
         return result;
     }
     if request.endpoint_mode == ProviderEndpointMode::ResponsesApi {
-        let mut result = extract_openai_responses_result(
-            request,
-            response_json,
-            output_format,
-        )
-        .unwrap_or_else(|error| GenerationResult {
-            images: Vec::new(),
-            parameter_snapshot: ParameterSnapshot {
-                requested_width: Some(request.width),
-                requested_height: Some(request.height),
-                actual_width: Some(request.width),
-                actual_height: Some(request.height),
-                requested_quality: request.quality.clone(),
-                actual_quality: request.quality.clone(),
-                revised_prompt: None,
-                duration_ms: Some(duration_ms),
-            },
-            raw_response_json: Some(serde_json::json!({ "error": error })),
-        });
+        let mut result = extract_openai_responses_result(request, response_json, output_format)
+            .unwrap_or_else(|error| GenerationResult {
+                images: Vec::new(),
+                parameter_snapshot: ParameterSnapshot {
+                    requested_width: Some(request.width),
+                    requested_height: Some(request.height),
+                    actual_width: Some(request.width),
+                    actual_height: Some(request.height),
+                    requested_quality: request.quality.clone(),
+                    actual_quality: request.quality.clone(),
+                    revised_prompt: None,
+                    duration_ms: Some(duration_ms),
+                },
+                raw_response_json: Some(serde_json::json!({ "error": error })),
+            });
         result.parameter_snapshot.duration_ms = Some(duration_ms);
         return result;
     }
@@ -2357,8 +2462,8 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
     use mew_image_shared::{GenerationRequest, ProviderEndpointMode};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn data_url_can_be_decoded() {
@@ -2378,10 +2483,7 @@ mod tests {
 
     #[test]
     fn allowlist_matches_exact_host_and_subdomain() {
-        let allowed = BTreeSet::from([
-            "api.openai.com".to_string(),
-            "example.com".to_string(),
-        ]);
+        let allowed = BTreeSet::from(["api.openai.com".to_string(), "example.com".to_string()]);
         assert!(host_matches_allowlist("api.openai.com", &allowed));
         assert!(host_matches_allowlist("cdn.example.com", &allowed));
         assert!(!host_matches_allowlist("evil-example.com", &allowed));
@@ -2434,7 +2536,13 @@ mod tests {
 
         let result = extract_openai_responses_result(&request, response_json, Some("png")).unwrap();
         assert_eq!(result.images.len(), 1);
-        assert!(result.images[0].data_url.as_ref().unwrap().starts_with("data:image/png;base64,"));
+        assert!(
+            result.images[0]
+                .data_url
+                .as_ref()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
         assert_eq!(
             result.parameter_snapshot.revised_prompt.as_deref(),
             Some("better prompt")

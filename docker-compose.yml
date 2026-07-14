@@ -6,18 +6,18 @@ services:
     ports:
       - "3000:3000"
     environment:
-      MEW_IMAGE_LISTEN: 0.0.0.0:3000
-      MEW_IMAGE_DATABASE_URL: sqlite:///data/mew-image.db
-      MEW_IMAGE_FRONTEND_DIST: /app/frontend/dist-app
-      MEW_IMAGE_SESSION_SECURE: "false"
-      MEW_IMAGE_ADMIN_SETUP_TOKEN: "please-change-this-admin-bootstrap-token"
-      MEW_IMAGE_ALLOW_FIRST_ADMIN_SETUP: "true"
-      MEW_IMAGE_ALLOWED_WEB_ORIGINS: http://127.0.0.1:3000,http://localhost:3000
-      MEW_IMAGE_ENABLE_GUEST_PROXY: "true"
-      MEW_IMAGE_REQUIRE_LOGIN_FOR_CUSTOM_PROVIDER: "true"
-      MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST: "false"
-      MEW_IMAGE_TRUSTED_PROVIDER_HOSTS: ""
-      MEW_IMAGE_ASSET_STORE: local
-      MEW_IMAGE_LOCAL_ASSET_DIR: /data/assets
+      MEW_LISTEN: 0.0.0.0:3000
+      MEW_DATABASE_URL: sqlite:///data/mew-image.db
+      MEW_FRONTEND_DIST: /app/frontend/dist-app
+      MEW_SESSION_SECURE: "false"
+      MEW_ADMIN_TOKEN: "please-change-this-admin-bootstrap-token"
+      MEW_ALLOW_ADMIN_SETUP: "true"
+      MEW_ALLOWED_ORIGINS: http://127.0.0.1:3000,http://localhost:3000
+      MEW_GUEST_PROXY: "true"
+      MEW_CUSTOM_PROVIDER_LOGIN: "true"
+      MEW_ENFORCE_HOST_WHITELIST: "false"
+      MEW_TRUSTED_HOSTS: ""
+      MEW_ASSET_STORE: local
+      MEW_LOCAL_ASSET_DIR: /data/assets
     volumes:
       - ./data:/data

@@ -45,41 +45,52 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
-            listen_addr: std::env::var("MEW_IMAGE_LISTEN")
+            listen_addr: env_value("MEW_LISTEN", "MEW_IMAGE_LISTEN")
                 .unwrap_or_else(|_| "127.0.0.1:3000".into()),
-            database_url: std::env::var("MEW_IMAGE_DATABASE_URL")
+            database_url: env_value("MEW_DATABASE_URL", "MEW_IMAGE_DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://./data/mew-image.db?mode=rwc".into()),
-            frontend_dist: std::env::var("MEW_IMAGE_FRONTEND_DIST")
+            frontend_dist: env_value("MEW_FRONTEND_DIST", "MEW_IMAGE_FRONTEND_DIST")
                 .unwrap_or_else(|_| "./frontend/dist-app".into()),
-            session_secure: std::env::var("MEW_IMAGE_SESSION_SECURE")
+            session_secure: env_value("MEW_SESSION_SECURE", "MEW_IMAGE_SESSION_SECURE")
                 .map(|value| value == "true")
                 .unwrap_or(false),
-            allowed_web_origins: parse_csv_env("MEW_IMAGE_ALLOWED_WEB_ORIGINS"),
-            trusted_provider_hosts: parse_csv_env("MEW_IMAGE_TRUSTED_PROVIDER_HOSTS"),
-            enforce_provider_host_whitelist: std::env::var(
+            allowed_web_origins: parse_csv_env(
+                "MEW_ALLOWED_ORIGINS",
+                "MEW_IMAGE_ALLOWED_WEB_ORIGINS",
+            ),
+            trusted_provider_hosts: parse_csv_env(
+                "MEW_TRUSTED_HOSTS",
+                "MEW_IMAGE_TRUSTED_PROVIDER_HOSTS",
+            ),
+            enforce_provider_host_whitelist: env_value(
+                "MEW_ENFORCE_HOST_WHITELIST",
                 "MEW_IMAGE_ENFORCE_PROVIDER_HOST_WHITELIST",
             )
             .map(|value| value == "true")
             .unwrap_or(false),
-            enable_guest_proxy: std::env::var("MEW_IMAGE_ENABLE_GUEST_PROXY")
+            enable_guest_proxy: env_value("MEW_GUEST_PROXY", "MEW_IMAGE_ENABLE_GUEST_PROXY")
                 .map(|value| value != "false")
                 .unwrap_or(true),
-            require_login_for_custom_provider: std::env::var(
+            require_login_for_custom_provider: env_value(
+                "MEW_CUSTOM_PROVIDER_LOGIN",
                 "MEW_IMAGE_REQUIRE_LOGIN_FOR_CUSTOM_PROVIDER",
             )
             .map(|value| value != "false")
             .unwrap_or(true),
-            admin_setup_token: std::env::var("MEW_IMAGE_ADMIN_SETUP_TOKEN")
+            admin_setup_token: env_value("MEW_ADMIN_TOKEN", "MEW_IMAGE_ADMIN_SETUP_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            allow_first_admin_setup: std::env::var("MEW_IMAGE_ALLOW_FIRST_ADMIN_SETUP")
-                .map(|value| value != "false")
-                .unwrap_or(true),
-            asset_store: std::env::var("MEW_IMAGE_ASSET_STORE")
+            allow_first_admin_setup: env_value(
+                "MEW_ALLOW_ADMIN_SETUP",
+                "MEW_IMAGE_ALLOW_FIRST_ADMIN_SETUP",
+            )
+            .map(|value| value != "false")
+            .unwrap_or(true),
+            asset_store: env_value("MEW_ASSET_STORE", "MEW_IMAGE_ASSET_STORE")
                 .ok()
                 .map(|value| AssetStoreKind::from_env_value(&value))
                 .unwrap_or_else(|| {
-                    if std::env::var("MEW_IMAGE_S3_BUCKET")
+                    if env_value("MEW_S3_BUCKET", "MEW_IMAGE_S3_BUCKET")
                         .map(|value| !value.trim().is_empty())
                         .unwrap_or(false)
                     {
@@ -88,13 +99,14 @@ impl AppConfig {
                         AssetStoreKind::Local
                     }
                 }),
-            local_asset_dir: std::env::var("MEW_IMAGE_LOCAL_ASSET_DIR")
+            local_asset_dir: env_value("MEW_LOCAL_ASSET_DIR", "MEW_IMAGE_LOCAL_ASSET_DIR")
                 .unwrap_or_else(|_| "./data/assets".into()),
-            s3_bucket: std::env::var("MEW_IMAGE_S3_BUCKET").unwrap_or_default(),
-            s3_region: std::env::var("MEW_IMAGE_S3_REGION").unwrap_or_else(|_| "auto".into()),
-            s3_endpoint: std::env::var("MEW_IMAGE_S3_ENDPOINT").ok(),
-            s3_access_key: std::env::var("MEW_IMAGE_S3_ACCESS_KEY").ok(),
-            s3_secret_key: std::env::var("MEW_IMAGE_S3_SECRET_KEY").ok(),
+            s3_bucket: env_value("MEW_S3_BUCKET", "MEW_IMAGE_S3_BUCKET").unwrap_or_default(),
+            s3_region: env_value("MEW_S3_REGION", "MEW_IMAGE_S3_REGION")
+                .unwrap_or_else(|_| "auto".into()),
+            s3_endpoint: env_value("MEW_S3_ENDPOINT", "MEW_IMAGE_S3_ENDPOINT").ok(),
+            s3_access_key: env_value("MEW_S3_ACCESS_KEY", "MEW_IMAGE_S3_ACCESS_KEY").ok(),
+            s3_secret_key: env_value("MEW_S3_SECRET_KEY", "MEW_IMAGE_S3_SECRET_KEY").ok(),
         })
     }
 }
@@ -108,8 +120,12 @@ pub struct AppState {
     pub provider_builtins: Vec<ProviderTemplate>,
 }
 
-fn parse_csv_env(key: &str) -> Vec<String> {
-    std::env::var(key)
+fn env_value(short_key: &str, legacy_key: &str) -> Result<String, std::env::VarError> {
+    std::env::var(short_key).or_else(|_| std::env::var(legacy_key))
+}
+
+fn parse_csv_env(short_key: &str, legacy_key: &str) -> Vec<String> {
+    env_value(short_key, legacy_key)
         .ok()
         .map(|raw| {
             raw.split(',')
