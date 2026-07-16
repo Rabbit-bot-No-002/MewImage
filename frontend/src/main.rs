@@ -20,11 +20,11 @@ use mew_image_shared::{
     AdminUsersResponse, AppPreferences, AuthRequest, AuthResponse,
     BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, CloudDataClearRequest,
     CloudDataClearScope, CloudDataStatsResponse, ConversationThread, DEFAULT_FAVORITE_FOLDER_ID,
-    EncryptedApiConfig, FavoriteFolder, ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse,
-    ProviderAccessMode, ProviderEndpointMode, ProviderKind, ProviderTemplate, RegisterRequest,
-    SyncCheckpoint, SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus, ThemePreference,
-    UserSummary, UsernameAvailabilityResponse, clamp_size, new_id, normalize_api_config,
-    now_rfc3339,
+    EncryptedApiConfig, FavoriteFolder, GenerationSettingsSnapshot, ImageAssetRef, LocalAppState,
+    LocalTaskRecord, MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
+    ProviderTemplate, RegisterRequest, SyncCheckpoint, SyncEntityKind, SyncPullResponse,
+    SyncTombstone, TaskStatus, ThemePreference, UserSummary, UsernameAvailabilityResponse,
+    clamp_size, new_id, normalize_api_config, now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -135,6 +135,7 @@ struct TextPopoverState {
 
 #[derive(Clone, PartialEq)]
 enum ConfirmPopoverKind {
+    CancelGeneration,
     DeleteThread(String),
     DeleteFavoriteFolder(String),
     DeleteTask(String),
@@ -237,6 +238,8 @@ fn App() -> impl IntoView {
             .to_string(),
     );
     let generating = RwSignal::new(false);
+    let generation_cancel_requested = RwSignal::new(false);
+    let generation_abort_controller = RwSignal::new(None::<web_sys::AbortController>);
     let syncing = RwSignal::new(false);
     let show_favorites_panel = RwSignal::new(false);
     let favorite_folder_picker = RwSignal::new(None::<FavoriteFolderPickerState>);
@@ -805,9 +808,15 @@ fn App() -> impl IntoView {
                 .find(|config| config.id == task.config_id)
                 .cloned()
         });
-        let moderation_label = preview_config
+        let moderation_label = task
+            .generation_settings
             .as_ref()
-            .and_then(|config| config.moderation.clone())
+            .and_then(|settings| settings.moderation.clone())
+            .or_else(|| {
+                preview_config
+                    .as_ref()
+                    .and_then(|config| config.moderation.clone())
+            })
             .unwrap_or_else(|| "auto".into());
         let source_label = preview_config
             .as_ref()
@@ -857,9 +866,10 @@ fn App() -> impl IntoView {
             actual_quality_label,
             format_label: asset.mime_type.replace("image/", ""),
             image_count: task
-                .result
+                .generation_settings
                 .as_ref()
-                .map(|result| result.images.len())
+                .map(|settings| settings.count as usize)
+                .or_else(|| task.result.as_ref().map(|result| result.images.len()))
                 .unwrap_or(1),
             created_at: task.created_at.clone(),
             duration_label,
@@ -2437,6 +2447,13 @@ fn App() -> impl IntoView {
         };
         confirm_popover.set(None);
         match state.kind {
+            ConfirmPopoverKind::CancelGeneration => {
+                generation_cancel_requested.set(true);
+                if let Some(controller) = generation_abort_controller.get_untracked() {
+                    controller.abort();
+                }
+                status_text.set("正在停止当前生成任务……".into());
+            }
             ConfirmPopoverKind::DeleteThread(thread_id) => perform_delete_thread(thread_id),
             ConfirmPopoverKind::DeleteFavoriteFolder(folder_id) => {
                 perform_delete_favorite_folder(folder_id)
@@ -2627,8 +2644,17 @@ fn App() -> impl IntoView {
         );
         custom_width.set(resolved_width);
         custom_height.set(resolved_height);
+        let quality_value = quality.get_untracked();
+        let count_value = count.get_untracked();
+        let Ok(abort_controller) = web_sys::AbortController::new() else {
+            status_text.set("当前浏览器无法创建请求中止控制器。".into());
+            return;
+        };
+        let abort_signal = abort_controller.signal();
 
         let task_id = new_id();
+        generation_cancel_requested.set(false);
+        generation_abort_controller.set(Some(abort_controller));
         generating.set(true);
         status_text.set("正在发起生成请求，已优先启用更稳的代理策略……".into());
 
@@ -2652,6 +2678,17 @@ fn App() -> impl IntoView {
                 prompt: prompt.clone(),
                 requested_model: config.model.clone(),
                 reference_asset_ids: selected_ids.clone(),
+                generation_settings: Some(GenerationSettingsSnapshot {
+                    width: resolved_width,
+                    height: resolved_height,
+                    quality: Some(quality_value.clone()),
+                    count: count_value,
+                    endpoint_mode: config.endpoint_mode,
+                    output_format: config.output_format.clone(),
+                    output_compression: config.output_compression,
+                    moderation: config.moderation.clone(),
+                    responses_model: config.responses_model.clone(),
+                }),
                 result: None,
                 favorite: false,
                 favorite_folder_id: None,
@@ -2667,20 +2704,48 @@ fn App() -> impl IntoView {
         let assets_signal = assets;
         let status_signal = status_text;
         let generating_signal = generating;
+        let cancel_requested_signal = generation_cancel_requested;
+        let abort_controller_signal = generation_abort_controller;
         let continuation_signal = continuation_asset_id;
+        let threads_signal = threads;
+        let tombstones_signal = tombstones;
         let persist = persist_state;
-        let quality_value = quality.get_untracked();
-        let count_value = count.get_untracked();
         let selected_ids_for_request = selected_ids.clone();
         let continuation_asset_id_for_request = continuation_asset_id.get_untracked();
         spawn_local(async move {
+            let finish_cancelled = || {
+                if !cancel_requested_signal.get_untracked() {
+                    return false;
+                }
+                tasks_signal.update(|items| items.retain(|task| task.id != task_id));
+                threads_signal.update(|items| {
+                    if let Some(thread) = items.iter_mut().find(|thread| thread.id == thread_id) {
+                        thread.task_ids.retain(|id| id != &task_id);
+                        thread.updated_at = now_rfc3339();
+                    }
+                });
+                record_sync_tombstones(
+                    tombstones_signal,
+                    [(SyncEntityKind::Task, task_id.clone())],
+                );
+                persist();
+                status_signal.set("当前生成任务已停止。".into());
+                abort_controller_signal.set(None);
+                cancel_requested_signal.set(false);
+                generating_signal.set(false);
+                true
+            };
+
             let mut required_asset_ids = selected_ids_for_request.clone();
             if let Some(asset_id) = continuation_asset_id_for_request.clone() {
                 required_asset_ids.push(asset_id);
             }
-            if let Err(error) =
-                ensure_asset_payloads_loaded(assets_signal, &required_asset_ids).await
-            {
+            let payload_result =
+                ensure_asset_payloads_loaded(assets_signal, &required_asset_ids).await;
+            if finish_cancelled() {
+                return;
+            }
+            if let Err(error) = payload_result {
                 tasks_signal.update(|items| {
                     if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
                         task.status = TaskStatus::Failed;
@@ -2690,6 +2755,7 @@ fn App() -> impl IntoView {
                 });
                 persist();
                 status_signal.set(format!("生成失败：{error}"));
+                abort_controller_signal.set(None);
                 generating_signal.set(false);
                 return;
             }
@@ -2723,11 +2789,19 @@ fn App() -> impl IntoView {
                 endpoint_mode: config.endpoint_mode,
                 reference_assets: references,
             };
-            match generate_with_strategy(&template, &config, &request).await {
+            let generation_result =
+                generate_with_strategy(&template, &config, &request, Some(&abort_signal)).await;
+            if finish_cancelled() {
+                return;
+            }
+            match generation_result {
                 Ok((result, used_proxy)) => {
                     let mut produced_assets = Vec::new();
                     let mut asset_build_errors = Vec::new();
                     for (index, image) in result.images.iter().enumerate() {
+                        if cancel_requested_signal.get_untracked() {
+                            break;
+                        }
                         let asset_payload = match (image.data_url.clone(), image.url.clone()) {
                             (Some(data_url), _) => {
                                 let byte_len = data_url.len() as u64;
@@ -2811,6 +2885,9 @@ fn App() -> impl IntoView {
                             metadata,
                         });
                     }
+                    if finish_cancelled() {
+                        return;
+                    }
                     if produced_assets.is_empty() {
                         let upstream_count = result
                             .images
@@ -2849,6 +2926,7 @@ fn App() -> impl IntoView {
                         });
                         persist();
                         status_signal.set(format!("生成失败：{error}"));
+                        abort_controller_signal.set(None);
                         generating_signal.set(false);
                         return;
                     }
@@ -2898,13 +2976,58 @@ fn App() -> impl IntoView {
                     status_signal.set(format!("生成失败：{error}"));
                 }
             }
+            abort_controller_signal.set(None);
+            cancel_requested_signal.set(false);
             generating_signal.set(false);
         });
     };
 
     let rerun_task = move |task_id: String| {
-        continue_from_task(task_id);
-        run_generation();
+        let Some(task) = tasks
+            .get_untracked()
+            .into_iter()
+            .find(|task| task.id == task_id)
+        else {
+            status_text.set("未找到需要重新生成的历史任务。".into());
+            return;
+        };
+        let selected_config_id = current_config_id.get_untracked();
+        let Some(config) = configs
+            .get_untracked()
+            .into_iter()
+            .find(|config| config.id == selected_config_id)
+        else {
+            status_text.set("请先选择当前要用于重新生成的服务商配置。".into());
+            return;
+        };
+        let settings = generation_settings_for_rerun(&task, &config);
+
+        current_thread_id.set(task.thread_id.clone());
+        draft_prompt.set(task.prompt.clone());
+        if let Some(textarea) = draft_prompt_ref.get() {
+            textarea.set_value(&task.prompt);
+        }
+        selected_reference_ids.set(task.reference_asset_ids.clone());
+        continuation_asset_id.set(None);
+        reference_menu_asset_id.set(None);
+        quality.set(settings.quality.clone().unwrap_or_else(|| "high".into()));
+        count.set(settings.count.clamp(1, 4));
+        resolution_mode.set("custom".into());
+        custom_width.set(settings.width);
+        custom_height.set(settings.height);
+        threads.update(|items| {
+            if let Some(thread) = items.iter_mut().find(|thread| thread.id == task.thread_id) {
+                thread.draft_prompt = task.prompt.clone();
+                thread.updated_at = now_rfc3339();
+            }
+        });
+        persist_state();
+        status_text.set("已恢复历史生成条件，正在使用当前服务商配置重新生成。".into());
+
+        spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(0).await;
+            run_generation();
+        });
     };
 
     let generate = move |_| run_generation();
@@ -3451,7 +3574,10 @@ fn App() -> impl IntoView {
                                                 <div class="settings-about-card">
                                                     <img class="settings-about-logo" src="/favicon/MewImage04.svg" alt="MewImage" />
                                                     <div class="stack">
-                                                        <h2>"关于 MewImage"</h2>
+                                                        <div class="row settings-about-title">
+                                                            <h2>"关于 MewImage"</h2>
+                                                            <span class="tag settings-version-tag">"v1.00"</span>
+                                                        </div>
                                                         <p class="status">"一个本地优先、登录后手动同步的可爱图片生成工作台。游客数据默认留在浏览器，服务器只承担代理、账号和可选同步职责。"</p>
                                                         <span class="tag">"Rust · Leptos · Axum · SQLite"</span>
                                                     </div>
@@ -3701,6 +3827,11 @@ fn App() -> impl IntoView {
 
             {move || confirm_popover.get().map(|state| {
                 let style = format!("left: {}px; top: {}px;", state.x + 8.0, state.y + 8.0);
+                let confirm_label = if matches!(state.kind, ConfirmPopoverKind::CancelGeneration) {
+                    "确认停止"
+                } else {
+                    "确认删除"
+                };
                 view! {
                     <>
                         <button class="inline-popover-dismiss" aria-label="关闭确认弹窗" on:click=move |_| confirm_popover.set(None)></button>
@@ -3709,7 +3840,7 @@ fn App() -> impl IntoView {
                             <p class="muted">{state.message}</p>
                             <div class="row inline-popover-actions">
                                 <button class="button ghost" on:click=move |_| confirm_popover.set(None)>"取消"</button>
-                                <button class="button danger" on:click=move |_| submit_confirm_popover()>"确认删除"</button>
+                                <button class="button danger" on:click=move |_| submit_confirm_popover()>{confirm_label}</button>
                             </div>
                         </div>
                     </>
@@ -4488,9 +4619,33 @@ fn App() -> impl IntoView {
                         ().into_any()
                     }}
 
-                    <button class="button" on:click=generate disabled=move || generating.get()>
-                        {move || if generating.get() { "生成中…" } else { "开始生成" }}
-                    </button>
+                    {move || if generating.get() {
+                        view! {
+                            <button
+                                type="button"
+                                class="button generation-cancel-button"
+                                title="停止当前生成任务"
+                                on:click=move |ev: MouseEvent| {
+                                    confirm_popover.set(Some(ConfirmPopoverState {
+                                        kind: ConfirmPopoverKind::CancelGeneration,
+                                        title: "停止生成".into(),
+                                        message: "确定停止当前生成任务吗？已经发送到上游的请求可能仍会产生消耗。".into(),
+                                        x: ev.client_x() as f64,
+                                        y: ev.client_y() as f64,
+                                    }));
+                                }
+                            >
+                                <span class="generation-cancel-spinner">
+                                    <MaterialSymbolIcon name="stop" filled=true />
+                                </span>
+                                <span>"停止生成"</span>
+                            </button>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <button class="button" on:click=generate>"开始生成"</button>
+                        }.into_any()
+                    }}
                     <span class="status">{move || status_text.get()}</span>
                 </section>
 
@@ -5049,6 +5204,7 @@ fn ConfigEditor(
     let name_draft = RwSignal::new(String::new());
     let base_url_draft = RwSignal::new(String::new());
     let model_draft = RwSignal::new(String::new());
+    let responses_model_draft = RwSignal::new(String::new());
     let api_key_draft = RwSignal::new(String::new());
     let access_mode_draft = RwSignal::new(String::from("Smart"));
     let endpoint_mode_draft = RwSignal::new(String::from("ImagesApi"));
@@ -5064,6 +5220,7 @@ fn ConfigEditor(
             name_draft.set(config.name);
             base_url_draft.set(config.base_url);
             model_draft.set(config.model);
+            responses_model_draft.set(config.responses_model.unwrap_or_else(|| "gpt-5.5".into()));
             api_key_draft.set(config.api_key_plaintext.unwrap_or_default());
             access_mode_draft.set(format!("{:?}", config.access_mode));
             endpoint_mode_draft.set(format!("{:?}", config.endpoint_mode));
@@ -5081,6 +5238,9 @@ fn ConfigEditor(
         has_pending_changes.set(true);
     };
     let commit_model = move || {
+        has_pending_changes.set(true);
+    };
+    let commit_responses_model = move || {
         has_pending_changes.set(true);
     };
     let commit_api_key = move || {
@@ -5107,6 +5267,8 @@ fn ConfigEditor(
                 config.name = name_draft.get_untracked().trim().to_string();
                 config.base_url = base_url_draft.get_untracked().trim().to_string();
                 config.model = model_draft.get_untracked().trim().to_string();
+                config.responses_model =
+                    Some(responses_model_draft.get_untracked().trim().to_string());
                 config.access_mode = match access_mode_draft.get_untracked().as_str() {
                     "Proxy" => ProviderAccessMode::Proxy,
                     "Direct" => ProviderAccessMode::Direct,
@@ -5178,6 +5340,11 @@ fn ConfigEditor(
                             }
                             ProviderKind::CustomHttp => String::new(),
                         });
+                        responses_model_draft.set(if template.kind == ProviderKind::OpenAiImage {
+                            "gpt-5.5".into()
+                        } else {
+                            String::new()
+                        });
                     }
                 }
             >
@@ -5203,6 +5370,25 @@ fn ConfigEditor(
                 on:input=move |ev| model_draft.set(event_target_value(&ev))
                 on:blur=move |_| commit_model()
             />
+            {move || {
+                let show_responses_model = template_id_draft.get()
+                    == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID
+                    && endpoint_mode_draft.get() == "ResponsesApi";
+                if show_responses_model {
+                    view! {
+                        <input
+                            class="text-input"
+                            placeholder="Responses 主模型（例如 gpt-5.5）"
+                            prop:value=move || responses_model_draft.get()
+                            on:input=move |ev| responses_model_draft.set(event_target_value(&ev))
+                            on:blur=move |_| commit_responses_model()
+                        />
+                    }
+                    .into_any()
+                } else {
+                    ().into_any()
+                }
+            }}
             <input
                 class="text-input"
                 type="password"
@@ -5933,6 +6119,42 @@ fn apply_local_state(
     tombstones.set(state.tombstones);
 }
 
+fn generation_settings_for_rerun(
+    task: &LocalTaskRecord,
+    config: &EncryptedApiConfig,
+) -> GenerationSettingsSnapshot {
+    if let Some(settings) = &task.generation_settings {
+        return settings.clone();
+    }
+
+    let parameters = task
+        .result
+        .as_ref()
+        .map(|result| &result.parameter_snapshot);
+    GenerationSettingsSnapshot {
+        width: parameters
+            .and_then(|value| value.requested_width.or(value.actual_width))
+            .unwrap_or(1024),
+        height: parameters
+            .and_then(|value| value.requested_height.or(value.actual_height))
+            .unwrap_or(1024),
+        quality: parameters
+            .and_then(|value| value.requested_quality.clone())
+            .or_else(|| Some("high".into())),
+        count: task
+            .result
+            .as_ref()
+            .map(|result| result.images.len() as u32)
+            .unwrap_or(1)
+            .max(1),
+        endpoint_mode: config.endpoint_mode,
+        output_format: config.output_format.clone(),
+        output_compression: config.output_compression,
+        moderation: config.moderation.clone(),
+        responses_model: config.responses_model.clone(),
+    }
+}
+
 fn resolve_dimensions(
     mode: &str,
     group: &str,
@@ -5963,20 +6185,20 @@ fn resolve_dimensions(
 
 fn preset_dimensions(group: &str, ratio: &str) -> (u32, u32) {
     let size = match (group, ratio) {
-        ("1k", "3:2") => (1216, 832),
-        ("1k", "2:3") => (832, 1216),
-        ("1k", "16:9") => (1344, 768),
-        ("1k", "9:16") => (768, 1344),
-        ("2k", "3:2") => (1792, 1216),
-        ("2k", "2:3") => (1216, 1792),
-        ("2k", "16:9") => (1920, 1088),
-        ("2k", "9:16") => (1088, 1920),
-        ("4k", "3:2") => (3840, 2560),
-        ("4k", "2:3") => (2560, 3840),
+        ("1k", "3:2") => (1152, 768),
+        ("1k", "2:3") => (768, 1152),
+        ("1k", "16:9") => (1280, 720),
+        ("1k", "9:16") => (720, 1280),
+        ("2k", "3:2") => (2016, 1344),
+        ("2k", "2:3") => (1344, 2016),
+        ("2k", "16:9") => (2048, 1152),
+        ("2k", "9:16") => (1152, 2048),
+        ("4k", "3:2") => (3504, 2336),
+        ("4k", "2:3") => (2336, 3504),
         ("4k", "16:9") => (3840, 2160),
         ("4k", "9:16") => (2160, 3840),
-        ("2k", _) => (1536, 1536),
-        ("4k", _) => (4096, 4096),
+        ("2k", _) => (2048, 2048),
+        ("4k", _) => (2880, 2880),
         _ => (1024, 1024),
     };
     let result = clamp_size(size.0, size.1);
@@ -6799,4 +7021,66 @@ fn mask_key(value: &str) -> String {
         return "******".into();
     }
     format!("{}***{}", &value[..3], &value[value.len() - 3..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rerun_prefers_historical_generation_settings() {
+        let config = providers::default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        let expected = GenerationSettingsSnapshot {
+            width: 2048,
+            height: 1152,
+            quality: Some("medium".into()),
+            count: 3,
+            endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            output_format: Some("webp".into()),
+            output_compression: Some(90),
+            moderation: Some("low".into()),
+            responses_model: Some("gpt-5.6".into()),
+        };
+        let task = LocalTaskRecord {
+            id: "task-1".into(),
+            thread_id: "thread-1".into(),
+            config_id: config.id.clone(),
+            prompt: "test".into(),
+            requested_model: "gpt-image-2".into(),
+            reference_asset_ids: vec!["asset-1".into()],
+            generation_settings: Some(expected.clone()),
+            result: None,
+            favorite: false,
+            favorite_folder_id: None,
+            status: TaskStatus::Succeeded,
+            error_message: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+
+        assert_eq!(generation_settings_for_rerun(&task, &config), expected);
+    }
+
+    #[test]
+    fn openai_presets_fit_official_limits_and_ratios() {
+        for group in ["1k", "2k", "4k"] {
+            for (ratio, ratio_width, ratio_height) in [
+                ("1:1", 1_u64, 1_u64),
+                ("3:2", 3, 2),
+                ("2:3", 2, 3),
+                ("16:9", 16, 9),
+                ("9:16", 9, 16),
+            ] {
+                let (width, height) = preset_dimensions(group, ratio);
+                assert!(width <= 3840 && height <= 3840);
+                assert_eq!(width % 16, 0);
+                assert_eq!(height % 16, 0);
+                assert!((width as u64) * (height as u64) <= 8_294_400);
+                assert_eq!(width as u64 * ratio_height, height as u64 * ratio_width);
+            }
+        }
+        assert_eq!(preset_dimensions("2k", "1:1"), (2048, 2048));
+        assert_eq!(preset_dimensions("4k", "16:9"), (3840, 2160));
+        assert_eq!(preset_dimensions("4k", "1:1"), (2880, 2880));
+    }
 }

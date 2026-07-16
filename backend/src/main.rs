@@ -8,6 +8,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
@@ -27,16 +30,19 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use mew_image_shared::{
     AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUserSummary,
-    AdminUsersResponse, AuthRequest, AuthResponse, ChangePasswordRequest, CloudDataClearRequest,
-    CloudDataClearScope, CloudDataStatsResponse, GenerateViaProxyRequest, GeneratedImageResult,
-    GenerationResult, ImageAssetRef, MeResponse, MergePreviewResponse, ParameterSnapshot,
+    AdminUsersResponse, AuthRequest, AuthResponse, BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
+    ChangePasswordRequest, CloudDataClearRequest, CloudDataClearScope, CloudDataStatsResponse,
+    GenerateViaProxyRequest, GeneratedImageResult, GenerationResult, ImageAssetRef, MeResponse,
+    MergePreviewResponse, OpenAiResponsesStreamAccumulator, ParameterSnapshot,
     ProviderEndpointMode, ProviderKind, ProviderTemplate, ProviderTemplateImportRequest,
     RegisterRequest, SyncEntityKind, SyncEnvelope, SyncPullResponse, SyncPushRequest,
     UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
     UserSummary, UsernameAvailabilityResponse, aspect_ratio_from_dimensions,
-    extract_gemini_generation_result, extract_openai_compatible_result,
-    extract_openai_responses_result, merge_envelopes, nano_banana_image_size_from_dimensions,
-    new_id, now_rfc3339, parse_openai_responses_event_stream,
+    build_gemini_generation_request, extract_gemini_generation_result,
+    extract_openai_compatible_result, extract_openai_responses_result, gemini_auth_header,
+    gemini_generate_content_url, is_google_official_gemini_base_url, merge_envelopes,
+    nano_banana_image_size_from_dimensions, new_id, now_rfc3339,
+    parse_openai_responses_event_stream, resolve_responses_main_model,
 };
 use rand::distr::{Alphanumeric, SampleString};
 use reqwest::Url;
@@ -57,6 +63,35 @@ use tower_sessions::{ExpiredDeletion, Session, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
 use tracing::{error, info, warn};
+
+const MAX_CONCURRENT_PROXY_GENERATIONS: usize = 5;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static MALLOC_TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct GenerationMemoryTrimGuard;
+
+impl Drop for GenerationMemoryTrimGuard {
+    fn drop(&mut self) {
+        trim_process_heap();
+    }
+}
+
+fn trim_process_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if MALLOC_TRIM_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // 只在大型代理请求结束时整理 glibc 堆，避免并发触发全局内存扫描。
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        MALLOC_TRIM_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -90,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
         s3,
         http: reqwest::Client::builder().build()?,
         provider_builtins: builtins,
+        generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_PROXY_GENERATIONS,
+        )),
     });
 
     let session_pool = SessionSqlitePool::connect(&config.database_url).await?;
@@ -1185,14 +1223,20 @@ async fn generate_via_proxy(
     State(state): State<Arc<AppState>>,
     session: Session,
     multipart: Multipart,
-) -> Result<Json<GenerationResult>, AppError> {
+) -> Result<Response, AppError> {
+    let _generation_permit = state
+        .generation_semaphore
+        .acquire()
+        .await
+        .map_err(|_| AppError::internal_message("代理生成并发控制器已关闭"))?;
+    let _memory_trim_guard = GenerationMemoryTrimGuard;
     let payload = parse_generate_multipart(multipart).await?;
     let user = current_user(&state, &session).await?;
     validate_generate_request(&state, user.as_ref(), &payload)?;
     let started_at = Utc::now();
     let response_json = match payload.template.kind {
         ProviderKind::OpenAiImage => invoke_openai_image(&state, &payload).await?,
-        ProviderKind::NanoBanana => invoke_nano_banana_google(&state, &payload).await?,
+        ProviderKind::NanoBanana => invoke_nano_banana(&state, &payload).await?,
         ProviderKind::OpenAiCompatible => invoke_openai_compatible_image(&state, &payload).await?,
         ProviderKind::CustomHttp => invoke_custom_http(&state, &payload).await?,
     };
@@ -1206,7 +1250,7 @@ async fn generate_via_proxy(
         duration_ms,
     );
     let result = hydrate_proxy_result_images(&state, result).await?;
-    Ok(Json(result))
+    Ok(Json(result).into_response())
 }
 
 async fn parse_generate_multipart(
@@ -1649,13 +1693,17 @@ fn validate_template(
     if template.name.trim().is_empty() {
         return Err(AppError::bad_request("模板名称不能为空"));
     }
-    if template.base_url.trim().is_empty() {
+    let uses_configured_base_url = template_uses_configured_base_url(template);
+    if template.base_url.trim().is_empty() && !uses_configured_base_url {
         return Err(AppError::bad_request("模板基础地址不能为空"));
     }
-    if !template.base_url.starts_with("http://") && !template.base_url.starts_with("https://") {
+    if !template.base_url.trim().is_empty()
+        && !template.base_url.starts_with("http://")
+        && !template.base_url.starts_with("https://")
+    {
         return Err(AppError::bad_request("模板基础地址必须是 http/https"));
     }
-    if require_custom_host_whitelist {
+    if require_custom_host_whitelist && !template.base_url.trim().is_empty() {
         resolve_upstream_target(
             state,
             template.kind,
@@ -1666,6 +1714,11 @@ fn validate_template(
         )?;
     }
     Ok(())
+}
+
+fn template_uses_configured_base_url(template: &ProviderTemplate) -> bool {
+    template.kind == ProviderKind::OpenAiCompatible
+        && template.id == BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID
 }
 
 fn validate_generate_request(
@@ -1975,21 +2028,6 @@ fn openai_compatible_response_format(
     }
 }
 
-fn google_image_size_value(
-    model: &str,
-    request: &mew_image_shared::GenerationRequest,
-) -> Option<String> {
-    let normalized = model.trim().to_ascii_lowercase();
-    if normalized.contains("gemini-3") {
-        Some(nano_banana_image_size_from_dimensions(
-            request.width,
-            request.height,
-        ))
-    } else {
-        None
-    }
-}
-
 fn normalize_google_image_model(model: &str) -> String {
     let trimmed = model.trim();
     if trimmed.is_empty() {
@@ -2002,12 +2040,6 @@ fn normalize_google_image_model(model: &str) -> String {
         return format!("{trimmed}-preview");
     }
     trimmed.to_string()
-}
-
-fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
-    let (prefix, payload) = data_url.split_once(',')?;
-    let mime_type = prefix.strip_prefix("data:")?.strip_suffix(";base64")?;
-    Some((mime_type, payload))
 }
 
 async fn invoke_openai_image(
@@ -2108,10 +2140,8 @@ async fn invoke_openai_image(
             "moderation": payload.config.moderation.clone().unwrap_or_else(|| "auto".into()),
             "partial_images": 1,
         });
-        if !payload.config.prompt_guard_enabled {
-            if let Some(quality) = &payload.request.quality {
-                tool["quality"] = json!(quality);
-            }
+        if let Some(quality) = &payload.request.quality {
+            tool["quality"] = json!(quality);
         }
         if payload.config.output_format.as_deref() != Some("png") {
             if let Some(compression) = payload.config.output_compression {
@@ -2119,11 +2149,7 @@ async fn invoke_openai_image(
             }
         }
         let body = json!({
-            "model": if payload.request.model.trim().starts_with("gpt-") && !payload.request.model.trim().starts_with("gpt-image-") {
-                payload.request.model.clone()
-            } else {
-                "gpt-5.5".to_string()
-            },
+            "model": resolve_responses_main_model(&payload.config, &payload.request.model),
             "input": if payload.request.reference_assets.is_empty() {
                 content[0]["text"].clone()
             } else {
@@ -2165,13 +2191,26 @@ async fn invoke_openai_image(
             .and_then(|value| value.to_str().ok())
             .map(|value| value.contains("text/event-stream"))
             .unwrap_or(false);
-        let body = response.text().await.map_err(AppError::internal)?;
         if !status.is_success() {
+            let body = response.text().await.map_err(AppError::internal)?;
             return Err(AppError::bad_gateway(format!(
                 "Responses API 上游请求失败：HTTP {status}，{body}"
             )));
         }
-        if is_event_stream || body.trim_start().starts_with("data:") {
+        if is_event_stream {
+            let mut response = response;
+            let mut accumulator = OpenAiResponsesStreamAccumulator::new();
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                AppError::bad_gateway(format!("Responses API 流读取失败：{error}"))
+            })? {
+                accumulator
+                    .push_chunk(&chunk)
+                    .map_err(AppError::bad_gateway)?;
+            }
+            return accumulator.finish().map_err(AppError::bad_gateway);
+        }
+        let body = response.text().await.map_err(AppError::internal)?;
+        if body.trim_start().starts_with("data:") {
             return parse_openai_responses_event_stream(&body).map_err(AppError::bad_gateway);
         }
         return serde_json::from_str(&body).map_err(AppError::internal);
@@ -2263,7 +2302,7 @@ async fn invoke_openai_compatible_image(
     response.json().await.map_err(AppError::internal)
 }
 
-async fn invoke_nano_banana_google(
+async fn invoke_nano_banana(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
 ) -> Result<serde_json::Value, AppError> {
@@ -2272,22 +2311,28 @@ async fn invoke_nano_banana_google(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let model = normalize_google_image_model(&payload.request.model);
     let base_url = resolve_provider_base_url(
         state,
         ProviderKind::NanoBanana,
         &payload.config.base_url,
         true,
     )?;
-    let url = join_api_url(
-        &base_url,
-        &format!("/v1beta/models/{model}:generateContent"),
-    );
-    let body = build_gemini_payload(state, payload).await?;
+    let model = if is_google_official_gemini_base_url(&base_url) {
+        normalize_google_image_model(&payload.request.model)
+    } else {
+        payload.request.model.trim().to_string()
+    };
+    if model.is_empty() {
+        return Err(AppError::bad_request("当前配置缺少 Gemini 模型名称"));
+    }
+    let url = gemini_generate_content_url(&base_url, &model);
+    let body = build_gemini_payload(state, payload, &model).await?;
+    let (auth_header, auth_value) = gemini_auth_header(&base_url, &api_key);
     let response = state
         .http
         .post(url)
-        .header("x-goog-api-key", api_key)
+        .header("Accept", "application/json")
+        .header(auth_header, auth_value)
         .json(&body)
         .send()
         .await
@@ -2502,25 +2547,27 @@ fn extract_generation_result(
         return result;
     }
     if request.endpoint_mode == ProviderEndpointMode::ResponsesApi {
-        let upstream_response = response_json.clone();
-        let mut result = extract_openai_responses_result(request, response_json, output_format)
-            .unwrap_or_else(|error| GenerationResult {
-                images: Vec::new(),
-                parameter_snapshot: ParameterSnapshot {
-                    requested_width: Some(request.width),
-                    requested_height: Some(request.height),
-                    actual_width: Some(request.width),
-                    actual_height: Some(request.height),
-                    requested_quality: request.quality.clone(),
-                    actual_quality: request.quality.clone(),
-                    revised_prompt: None,
-                    duration_ms: Some(duration_ms),
+        let mut result =
+            match extract_openai_responses_result(request, &response_json, output_format) {
+                Ok(result) => result,
+                Err(error) => GenerationResult {
+                    images: Vec::new(),
+                    parameter_snapshot: ParameterSnapshot {
+                        requested_width: Some(request.width),
+                        requested_height: Some(request.height),
+                        actual_width: Some(request.width),
+                        actual_height: Some(request.height),
+                        requested_quality: request.quality.clone(),
+                        actual_quality: request.quality.clone(),
+                        revised_prompt: None,
+                        duration_ms: Some(duration_ms),
+                    },
+                    raw_response_json: Some(serde_json::json!({
+                        "parse_error": error,
+                        "upstream_response": response_json,
+                    })),
                 },
-                raw_response_json: Some(serde_json::json!({
-                    "parse_error": error,
-                    "upstream_response": upstream_response,
-                })),
-            });
+            };
         result.parameter_snapshot.duration_ms = Some(duration_ms);
         return result;
     }
@@ -2594,43 +2641,14 @@ async fn gather_data_urls(
 async fn build_gemini_payload(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
+    model: &str,
 ) -> Result<serde_json::Value, AppError> {
-    let model = normalize_google_image_model(&payload.request.model);
-    let mut parts = vec![json!({
-        "text": payload.request.prompt.clone(),
-    })];
     let data_urls = gather_data_urls(state, &payload.request.reference_assets).await?;
-    for data_url in data_urls {
-        if let Some((mime_type, data)) = split_data_url_payload(&data_url) {
-            parts.push(json!({
-                "inline_data": {
-                    "mime_type": mime_type,
-                    "data": data,
-                }
-            }));
-        }
-    }
-
-    let mut generation_config = json!({
-        "responseModalities": ["TEXT", "IMAGE"],
-        "imageConfig": {
-            "aspectRatio": aspect_ratio_from_dimensions(
-                payload.request.width,
-                payload.request.height,
-            ),
-        }
-    });
-    if let Some(image_size) = google_image_size_value(&model, &payload.request) {
-        generation_config["imageConfig"]["imageSize"] = json!(image_size);
-    }
-
-    Ok(json!({
-        "contents": [{
-            "role": "user",
-            "parts": parts,
-        }],
-        "generationConfig": generation_config,
-    }))
+    Ok(build_gemini_generation_request(
+        &payload.request,
+        model,
+        &data_urls,
+    ))
 }
 
 async fn resolve_asset_bytes(
@@ -2787,6 +2805,52 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
+    fn builtin_openai_compatible_template_uses_config_base_url() {
+        let builtin = ProviderTemplate::builtin_openai_compatible();
+        assert!(builtin.base_url.is_empty());
+        assert!(template_uses_configured_base_url(&builtin));
+
+        let mut imported = builtin;
+        imported.id = "imported-openai-compatible".into();
+        assert!(!template_uses_configured_base_url(&imported));
+    }
+
+    #[test]
+    fn regular_openai_compatible_endpoints_remain_unchanged() {
+        let mut request = GenerationRequest {
+            prompt: "test".into(),
+            model: "gemini-2.5-flash-image".into(),
+            width: 1024,
+            height: 1024,
+            quality: None,
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::CustomJson,
+            reference_assets: Vec::new(),
+        };
+        assert_eq!(
+            openai_compatible_endpoint(&request),
+            "/v1/images/generations"
+        );
+
+        request.reference_assets.push(ImageAssetRef {
+            id: "asset-1".into(),
+            sha256: "hash".into(),
+            mime_type: "image/png".into(),
+            byte_len: 1,
+            width: None,
+            height: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            data_url: Some("data:image/png;base64,AA==".into()),
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        });
+        assert_eq!(openai_compatible_endpoint(&request), "/v1/images/edits");
+    }
+
+    #[test]
     fn data_url_can_be_decoded() {
         let (mime, bytes) = decode_data_url("data:text/plain;base64,aGVsbG8=").unwrap();
         assert_eq!(mime, "text/plain");
@@ -2855,7 +2919,8 @@ mod tests {
             }]
         });
 
-        let result = extract_openai_responses_result(&request, response_json, Some("png")).unwrap();
+        let result =
+            extract_openai_responses_result(&request, &response_json, Some("png")).unwrap();
         assert_eq!(result.images.len(), 1);
         assert!(
             result.images[0]
@@ -2905,6 +2970,9 @@ mod tests {
             s3: None,
             http: reqwest::Client::new(),
             provider_builtins: Vec::new(),
+            generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PROXY_GENERATIONS,
+            )),
         };
         let object_key = "users/user-1/assets/shared.bin";
         put_object(&state, object_key, "image/png", b"image".to_vec())

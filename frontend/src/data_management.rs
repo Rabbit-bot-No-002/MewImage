@@ -426,6 +426,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "test".into(),
             reference_asset_ids: vec!["imported-asset".into()],
+            generation_settings: None,
             result: None,
             favorite: false,
             favorite_folder_id: None,

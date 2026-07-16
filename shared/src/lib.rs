@@ -149,7 +149,7 @@ impl ProviderTemplate {
             response_image_base64_path: None,
             response_revised_prompt_path: None,
             known_requires_proxy: true,
-            notes: Some("内置 Nano Banana 模板，使用谷歌官方图像接口。".into()),
+            notes: Some("Nano Banana 原生接口，可使用 Google 官方或兼容中转地址。".into()),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -191,6 +191,8 @@ pub struct EncryptedApiConfig {
     pub endpoint_mode: ProviderEndpointMode,
     pub base_url: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_model: Option<String>,
     pub access_mode: ProviderAccessMode,
     pub known_requires_proxy: bool,
     pub output_format: Option<String>,
@@ -262,9 +264,6 @@ pub fn image_mime_from_output_format(output_format: Option<&str>) -> &'static st
 }
 
 pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
-    let base_url = config.base_url.trim();
-    let is_google_official = base_url.contains("generativelanguage.googleapis.com");
-
     if config.provider_template_id == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID {
         config.provider_kind = ProviderKind::OpenAiImage;
         config.endpoint_mode = match config.endpoint_mode {
@@ -278,23 +277,18 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
         if config.model.trim().is_empty() {
             config.model = "gpt-image-2".into();
         }
+        normalize_responses_model(config);
         return;
     }
 
     if config.provider_template_id == BUILTIN_NANO_BANANA_TEMPLATE_ID {
-        if is_google_official {
-            config.provider_kind = ProviderKind::NanoBanana;
-            config.endpoint_mode = ProviderEndpointMode::CustomJson;
-            if config.model.trim().is_empty() {
-                config.model = "gemini-2.5-flash-image".into();
-            }
-        } else {
-            config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
-            config.provider_kind = ProviderKind::OpenAiCompatible;
-            config.endpoint_mode = ProviderEndpointMode::CustomJson;
-            if config.model.trim().is_empty() {
-                config.model = "gemini-2.5-flash-image".into();
-            }
+        config.provider_kind = ProviderKind::NanoBanana;
+        config.endpoint_mode = ProviderEndpointMode::CustomJson;
+        if config.base_url.trim().is_empty() {
+            config.base_url = "https://generativelanguage.googleapis.com".into();
+        }
+        if config.model.trim().is_empty() {
+            config.model = "gemini-2.5-flash-image".into();
         }
         return;
     }
@@ -317,25 +311,20 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
             if config.model.trim().is_empty() {
                 config.model = "gpt-image-2".into();
             }
+            normalize_responses_model(config);
             config.endpoint_mode = match config.endpoint_mode {
                 ProviderEndpointMode::ResponsesApi => ProviderEndpointMode::ResponsesApi,
                 _ => ProviderEndpointMode::ImagesApi,
             };
         }
         ProviderKind::NanoBanana => {
-            if is_google_official {
-                config.provider_template_id = BUILTIN_NANO_BANANA_TEMPLATE_ID.into();
-                config.endpoint_mode = ProviderEndpointMode::CustomJson;
-                if config.model.trim().is_empty() {
-                    config.model = "gemini-2.5-flash-image".into();
-                }
-            } else {
-                config.provider_template_id = BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID.into();
-                config.provider_kind = ProviderKind::OpenAiCompatible;
-                config.endpoint_mode = ProviderEndpointMode::CustomJson;
-                if config.model.trim().is_empty() {
-                    config.model = "gemini-2.5-flash-image".into();
-                }
+            config.provider_template_id = BUILTIN_NANO_BANANA_TEMPLATE_ID.into();
+            config.endpoint_mode = ProviderEndpointMode::CustomJson;
+            if config.base_url.trim().is_empty() {
+                config.base_url = "https://generativelanguage.googleapis.com".into();
+            }
+            if config.model.trim().is_empty() {
+                config.model = "gemini-2.5-flash-image".into();
             }
         }
         ProviderKind::OpenAiCompatible => {
@@ -346,6 +335,35 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
             }
         }
         ProviderKind::CustomHttp => {}
+    }
+}
+
+fn normalize_responses_model(config: &mut EncryptedApiConfig) {
+    let has_model = config
+        .responses_model
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|model| !model.is_empty());
+    if !has_model {
+        config.responses_model = Some("gpt-5.5".into());
+    }
+}
+
+pub fn resolve_responses_main_model(config: &EncryptedApiConfig, request_model: &str) -> String {
+    if let Some(model) = config
+        .responses_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        return model.to_string();
+    }
+
+    let request_model = request_model.trim();
+    if request_model.starts_with("gpt-") && !request_model.starts_with("gpt-image-") {
+        request_model.to_string()
+    } else {
+        "gpt-5.5".into()
     }
 }
 
@@ -390,6 +408,93 @@ pub fn nano_banana_image_size_from_dimensions(width: u32, height: u32) -> String
     } else {
         "1K".into()
     }
+}
+
+pub fn is_google_official_gemini_base_url(base_url: &str) -> bool {
+    let Some((scheme, remainder)) = base_url.trim().split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let host_with_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = host_with_port
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| host_with_port.split(':').next().unwrap_or_default())
+        .to_ascii_lowercase();
+    host == "generativelanguage.googleapis.com"
+}
+
+pub fn gemini_auth_header(base_url: &str, api_key: &str) -> (&'static str, String) {
+    if is_google_official_gemini_base_url(base_url) {
+        ("x-goog-api-key", api_key.to_string())
+    } else {
+        ("Authorization", format!("Bearer {api_key}"))
+    }
+}
+
+pub fn gemini_generate_content_url(base_url: &str, model: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let model = model.trim();
+    if base.ends_with("/v1beta/models") {
+        format!("{base}/{model}:generateContent")
+    } else if base.ends_with("/v1beta") {
+        format!("{base}/models/{model}:generateContent")
+    } else {
+        format!("{base}/v1beta/models/{model}:generateContent")
+    }
+}
+
+pub fn build_gemini_generation_request<T: AsRef<str>>(
+    request: &GenerationRequest,
+    model: &str,
+    reference_data_urls: &[T],
+) -> serde_json::Value {
+    let mut parts = vec![serde_json::json!({
+        "text": request.prompt,
+    })];
+    for data_url in reference_data_urls {
+        let Some((mime_type, data)) = split_data_url_payload(data_url.as_ref()) else {
+            continue;
+        };
+        parts.push(serde_json::json!({
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": data,
+            }
+        }));
+    }
+
+    let mut image_config = serde_json::json!({
+        "aspectRatio": aspect_ratio_from_dimensions(request.width, request.height),
+    });
+    if model.trim().to_ascii_lowercase().contains("gemini-3") {
+        image_config["imageSize"] = serde_json::json!(nano_banana_image_size_from_dimensions(
+            request.width,
+            request.height,
+        ));
+    }
+
+    serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": parts,
+        }],
+        "generationConfig": {
+            "responseModalities": ["TEXT", "IMAGE"],
+            "imageConfig": image_config,
+        },
+    })
+}
+
+fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
+    let (prefix, payload) = data_url.split_once(',')?;
+    let mime_type = prefix.strip_prefix("data:")?.strip_suffix(";base64")?;
+    Some((mime_type, payload))
 }
 
 pub fn extract_gemini_generation_result(
@@ -463,7 +568,7 @@ fn collect_gemini_image_payloads(
 
 pub fn extract_openai_responses_result(
     request: &GenerationRequest,
-    response_json: serde_json::Value,
+    response_json: &serde_json::Value,
     output_format: Option<&str>,
 ) -> Result<GenerationResult, String> {
     let mut images = Vec::new();
@@ -475,7 +580,7 @@ pub fn extract_openai_responses_result(
     let fallback_mime = image_mime_from_output_format(output_format);
 
     let mut output_groups = Vec::new();
-    collect_responses_output_groups(&response_json, &mut output_groups);
+    collect_responses_output_groups(response_json, &mut output_groups);
     for output_items in output_groups {
         for item in output_items {
             if item.get("type").and_then(|value| value.as_str()) != Some("image_generation_call") {
@@ -517,7 +622,8 @@ pub fn extract_openai_responses_result(
             revised_prompt,
             duration_ms: None,
         },
-        raw_response_json: Some(response_json),
+        // 成功响应中的 Base64 已进入 images，不再重复保留整份原始载荷。
+        raw_response_json: None,
     })
 }
 
@@ -543,72 +649,207 @@ fn collect_responses_output_groups<'a>(
     }
 }
 
-pub fn parse_openai_responses_event_stream(body: &str) -> Result<serde_json::Value, String> {
-    let mut completed_response = None;
-    let mut completed_items = Vec::new();
-    let mut partial_images = BTreeMap::<u64, String>::new();
+#[derive(Debug, Default)]
+pub struct OpenAiResponsesStreamAccumulator {
+    buffer: Vec<u8>,
+    has_data_line: bool,
+    completed_response: Option<serde_json::Value>,
+    completed_items: Vec<serde_json::Value>,
+    latest_partial_image: Option<(u64, String)>,
+}
 
-    for line in body.lines() {
-        let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
-        if data.is_empty() || data == "[DONE]" {
-            continue;
+impl OpenAiResponsesStreamAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 增量接收上游 SSE 字节，只在完整事件块到达后解析 JSON。
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), String> {
+        self.buffer.extend_from_slice(chunk);
+        while let Some((separator_index, separator_length)) = find_sse_separator(&self.buffer) {
+            let event = parse_responses_sse_block(&self.buffer[..separator_index])?;
+            self.buffer
+                .drain(..separator_index.saturating_add(separator_length));
+            self.has_data_line |= event.had_data_line;
+            if let Some(payload) = event.payload {
+                self.apply_event(payload)?;
+            }
         }
-        let event: serde_json::Value = serde_json::from_str(data)
-            .map_err(|error| format!("Responses SSE 事件解析失败：{error}"))?;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<serde_json::Value, String> {
+        if self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            let event = parse_responses_sse_block(&self.buffer)?;
+            self.has_data_line |= event.had_data_line;
+            if let Some(payload) = event.payload {
+                self.apply_event(payload)?;
+            }
+        }
+
+        if !self.has_data_line {
+            return Err("Responses SSE 没有返回有效的 data 事件。".into());
+        }
+        if let Some(response) = self.completed_response {
+            return Ok(response);
+        }
+        if !self.completed_items.is_empty() {
+            return Ok(serde_json::json!({ "output": self.completed_items }));
+        }
+        if let Some((_, image)) = self.latest_partial_image {
+            return Ok(serde_json::json!({
+                "output": [{
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "result": image,
+                }]
+            }));
+        }
+        Err("Responses SSE 没有返回可用的最终响应。".into())
+    }
+
+    fn apply_event(&mut self, mut event: serde_json::Value) -> Result<(), String> {
+        if let Some(message) = responses_stream_error_message(&event) {
+            return Err(format!("Responses SSE 上游返回错误：{message}"));
+        }
+
         match event.get("type").and_then(|value| value.as_str()) {
             Some("response.completed") => {
-                if let Some(response) = event.get("response").filter(|value| value.is_object()) {
-                    completed_response = Some(response.clone());
+                let response = event
+                    .get_mut("response")
+                    .map(serde_json::Value::take)
+                    .filter(responses_payload_has_image_result);
+                if response.is_some() {
+                    self.completed_response = response;
+                    self.completed_items.clear();
+                    self.latest_partial_image = None;
                 }
             }
-            Some("response.output_item.done") => {
-                if let Some(item) = event.get("item").filter(|value| {
-                    value.get("type").and_then(|value| value.as_str())
-                        == Some("image_generation_call")
-                }) {
-                    completed_items.push(item.clone());
+            Some("response.output_item.done") if self.completed_response.is_none() => {
+                let item = event
+                    .get_mut("item")
+                    .map(serde_json::Value::take)
+                    .filter(|value| {
+                        value.get("type").and_then(|value| value.as_str())
+                            == Some("image_generation_call")
+                            && responses_payload_has_image_result(value)
+                    });
+                if let Some(item) = item {
+                    self.completed_items.push(item);
+                    self.latest_partial_image = None;
                 }
             }
-            Some("response.image_generation_call.partial_image") => {
-                if let Some(image) = event
-                    .get("partial_image_b64")
-                    .and_then(|value| value.as_str())
+            Some("response.image_generation_call.partial_image")
+                if self.completed_response.is_none() && self.completed_items.is_empty() =>
+            {
+                let image = match event
+                    .get_mut("partial_image_b64")
+                    .map(serde_json::Value::take)
                 {
-                    let index = event
-                        .get("partial_image_index")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0);
-                    partial_images.insert(index, image.to_string());
+                    Some(serde_json::Value::String(image)) if !image.trim().is_empty() => image,
+                    _ => return Ok(()),
+                };
+                let index = event
+                    .get("partial_image_index")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                let should_replace = match self.latest_partial_image.as_ref() {
+                    Some((current_index, _)) => index >= *current_index,
+                    None => true,
+                };
+                if !should_replace {
+                    return Ok(());
                 }
+                self.latest_partial_image = Some((index, image));
             }
             _ => {}
         }
+        Ok(())
     }
+}
 
-    if let Some(response) = completed_response {
-        if responses_payload_has_image_result(&response) {
-            return Ok(response);
+struct ParsedSseBlock {
+    had_data_line: bool,
+    payload: Option<serde_json::Value>,
+}
+
+fn find_sse_separator(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        if buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
         }
     }
-    let usable_completed_items = completed_items
-        .into_iter()
-        .filter(responses_payload_has_image_result)
+    None
+}
+
+fn parse_responses_sse_block(block: &[u8]) -> Result<ParsedSseBlock, String> {
+    let block = std::str::from_utf8(block)
+        .map_err(|error| format!("Responses SSE 文本不是有效 UTF-8：{error}"))?;
+    let data_lines = block
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("data:")
+                .map(|data| data.strip_prefix(' ').unwrap_or(data))
+        })
         .collect::<Vec<_>>();
-    if !usable_completed_items.is_empty() {
-        return Ok(serde_json::json!({ "output": usable_completed_items }));
+    if data_lines.is_empty() {
+        return Ok(ParsedSseBlock {
+            had_data_line: false,
+            payload: None,
+        });
     }
-    if let Some((_, image)) = partial_images.last_key_value() {
-        return Ok(serde_json::json!({
-            "output": [{
-                "type": "image_generation_call",
-                "status": "completed",
-                "result": image,
-            }]
-        }));
+
+    let joined_data;
+    let data = if data_lines.len() == 1 {
+        data_lines[0].trim()
+    } else {
+        joined_data = data_lines.join("\n");
+        joined_data.trim()
+    };
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(ParsedSseBlock {
+            had_data_line: true,
+            payload: None,
+        });
     }
-    Err("Responses SSE 没有返回可用的最终响应。".into())
+
+    let payload = serde_json::from_str(data)
+        .map_err(|error| format!("Responses SSE 事件解析失败：{error}"))?;
+    Ok(ParsedSseBlock {
+        had_data_line: true,
+        payload: Some(payload),
+    })
+}
+
+fn responses_stream_error_message(event: &serde_json::Value) -> Option<String> {
+    if let Some(error) = event.get("error") {
+        if let Some(message) = error.get("message").and_then(|value| value.as_str()) {
+            return Some(message.to_string());
+        }
+        if let Some(message) = error.as_str() {
+            return Some(message.to_string());
+        }
+    }
+    let event_type = event.get("type").and_then(|value| value.as_str())?;
+    if event_type.ends_with(".failed") {
+        return Some(
+            event
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("流式请求失败")
+                .to_string(),
+        );
+    }
+    None
+}
+
+pub fn parse_openai_responses_event_stream(body: &str) -> Result<serde_json::Value, String> {
+    let mut accumulator = OpenAiResponsesStreamAccumulator::new();
+    accumulator.push_chunk(body.as_bytes())?;
+    accumulator.finish()
 }
 
 fn responses_payload_has_image_result(value: &serde_json::Value) -> bool {
@@ -911,6 +1152,19 @@ pub struct GenerateViaProxyRequest {
     pub request: GenerationRequest,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerationSettingsSnapshot {
+    pub width: u32,
+    pub height: u32,
+    pub quality: Option<String>,
+    pub count: u32,
+    pub endpoint_mode: ProviderEndpointMode,
+    pub output_format: Option<String>,
+    pub output_compression: Option<u8>,
+    pub moderation: Option<String>,
+    pub responses_model: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocalTaskRecord {
     pub id: String,
@@ -919,6 +1173,8 @@ pub struct LocalTaskRecord {
     pub prompt: String,
     pub requested_model: String,
     pub reference_asset_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_settings: Option<GenerationSettingsSnapshot>,
     pub result: Option<GenerationResult>,
     pub favorite: bool,
     #[serde(default)]
@@ -1394,6 +1650,125 @@ pub fn clamp_size(width: u32, height: u32) -> SizeClampResult {
 mod tests {
     use super::*;
 
+    fn gemini_request() -> GenerationRequest {
+        GenerationRequest {
+            prompt: "参考这张图调整配色".into(),
+            model: "gemini-3.1-flash-image".into(),
+            width: 3840,
+            height: 2160,
+            quality: Some("high".into()),
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::CustomJson,
+            reference_assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn google_official_gemini_host_is_matched_exactly() {
+        assert!(is_google_official_gemini_base_url(
+            "https://generativelanguage.googleapis.com"
+        ));
+        assert!(is_google_official_gemini_base_url(
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
+        assert!(!is_google_official_gemini_base_url(
+            "https://generativelanguage.googleapis.com.evil.example"
+        ));
+        assert!(!is_google_official_gemini_base_url(
+            "https://img-api.apinebula.com"
+        ));
+    }
+
+    #[test]
+    fn gemini_auth_depends_on_official_or_custom_gateway() {
+        assert_eq!(
+            gemini_auth_header("https://generativelanguage.googleapis.com", "secret"),
+            ("x-goog-api-key", "secret".into())
+        );
+        assert_eq!(
+            gemini_auth_header("https://gateway.example.com", "secret"),
+            ("Authorization", "Bearer secret".into())
+        );
+    }
+
+    #[test]
+    fn gemini_gateway_url_does_not_duplicate_v1beta() {
+        let expected =
+            "https://img-api.apinebula.com/v1beta/models/gemini-3.1-flash-image:generateContent";
+        assert_eq!(
+            gemini_generate_content_url("https://img-api.apinebula.com", "gemini-3.1-flash-image"),
+            expected
+        );
+        assert_eq!(
+            gemini_generate_content_url(
+                "https://img-api.apinebula.com/v1beta",
+                "gemini-3.1-flash-image"
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn gemini_request_uses_documented_image_fields() {
+        let request = gemini_request();
+        let body = build_gemini_generation_request(
+            &request,
+            &request.model,
+            &["data:image/png;base64,aGVsbG8="],
+        );
+
+        assert_eq!(
+            body.pointer("/contents/0/parts/1/inlineData/mimeType"),
+            Some(&serde_json::json!("image/png"))
+        );
+        assert_eq!(
+            body.pointer("/generationConfig/imageConfig/aspectRatio"),
+            Some(&serde_json::json!("16:9"))
+        );
+        assert_eq!(
+            body.pointer("/generationConfig/imageConfig/imageSize"),
+            Some(&serde_json::json!("4K"))
+        );
+    }
+
+    #[test]
+    fn gemini_2_5_request_omits_unsupported_image_size() {
+        let request = gemini_request();
+        let body =
+            build_gemini_generation_request(&request, "gemini-2.5-flash-image", &[] as &[String]);
+        assert!(
+            body.pointer("/generationConfig/imageConfig/imageSize")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gemini_response_reads_documented_inline_data() {
+        let request = gemini_request();
+        let result = extract_gemini_generation_result(
+            &request,
+            serde_json::json!({
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "inlineData": {
+                                "mimeType": "image/webp",
+                                "data": "aGVsbG8=",
+                            }
+                        }]
+                    }
+                }]
+            }),
+            Some("png"),
+        )
+        .unwrap();
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(
+            result.images[0].data_url.as_deref(),
+            Some("data:image/webp;base64,aGVsbG8=")
+        );
+    }
+
     #[test]
     fn clamp_size_aligns_to_16() {
         let result = clamp_size(1033, 777);
@@ -1452,6 +1827,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "test".into(),
             reference_asset_ids: Vec::new(),
+            generation_settings: None,
             result: None,
             favorite: false,
             favorite_folder_id: None,
@@ -1502,6 +1878,7 @@ mod tests {
             prompt: "restored".into(),
             requested_model: "test".into(),
             reference_asset_ids: Vec::new(),
+            generation_settings: None,
             result: None,
             favorite: false,
             favorite_folder_id: None,
@@ -1572,7 +1949,8 @@ mod tests {
             }]
         });
 
-        let result = extract_openai_responses_result(&request, response_json, Some("png")).unwrap();
+        let result =
+            extract_openai_responses_result(&request, &response_json, Some("png")).unwrap();
         assert_eq!(result.images.len(), 1);
         assert_eq!(
             result.images[0].data_url.as_deref(),
@@ -1582,6 +1960,7 @@ mod tests {
             result.parameter_snapshot.actual_quality.as_deref(),
             Some("medium")
         );
+        assert!(result.raw_response_json.is_none());
     }
 
     #[test]
@@ -1607,7 +1986,8 @@ mod tests {
             }
         });
 
-        let result = extract_openai_responses_result(&request, response_json, Some("png")).unwrap();
+        let result =
+            extract_openai_responses_result(&request, &response_json, Some("png")).unwrap();
         assert_eq!(result.images.len(), 1);
     }
 
@@ -1650,6 +2030,62 @@ mod tests {
     }
 
     #[test]
+    fn responses_sse_accumulator_handles_arbitrary_chunk_boundaries() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"YWJjZGVmZw==\"}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        );
+        let mut accumulator = OpenAiResponsesStreamAccumulator::new();
+        for chunk in stream.as_bytes().chunks(3) {
+            accumulator.push_chunk(chunk).unwrap();
+        }
+        assert!(accumulator.buffer.is_empty());
+
+        let payload = accumulator.finish().unwrap();
+        assert_eq!(payload["output"][0]["result"], "YWJjZGVmZw==");
+    }
+
+    #[test]
+    fn responses_sse_accumulator_supports_multiline_data() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_item.done\",\r\n",
+            "data: \"item\":{\"type\":\"image_generation_call\",\"result\":\"bXVsdGlsaW5l\"}}\r\n\r\n",
+        );
+        let mut accumulator = OpenAiResponsesStreamAccumulator::new();
+        for byte in stream.as_bytes() {
+            accumulator.push_chunk(std::slice::from_ref(byte)).unwrap();
+        }
+
+        let payload = accumulator.finish().unwrap();
+        assert_eq!(payload["output"][0]["result"], "bXVsdGlsaW5l");
+    }
+
+    #[test]
+    fn responses_sse_accumulator_releases_fallback_images_after_completion() {
+        let stream = concat!(
+            "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_index\":0,\"partial_image_b64\":\"cGFydGlhbA==\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"ZG9uZQ==\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}]}}\n\n",
+        );
+        let mut accumulator = OpenAiResponsesStreamAccumulator::new();
+        accumulator.push_chunk(stream.as_bytes()).unwrap();
+
+        assert!(accumulator.latest_partial_image.is_none());
+        assert!(accumulator.completed_items.is_empty());
+        let payload = accumulator.finish().unwrap();
+        assert_eq!(payload["output"][0]["result"], "ZmluYWw=");
+    }
+
+    #[test]
+    fn responses_sse_accumulator_surfaces_upstream_errors() {
+        let stream =
+            "data: {\"type\":\"response.failed\",\"error\":{\"message\":\"quota exceeded\"}}\n\n";
+        let mut accumulator = OpenAiResponsesStreamAccumulator::new();
+        let error = accumulator.push_chunk(stream.as_bytes()).unwrap_err();
+        assert!(error.contains("quota exceeded"));
+    }
+
+    #[test]
     fn normalize_legacy_openai_config_to_openai_image() {
         let mut config = EncryptedApiConfig {
             id: "config-1".into(),
@@ -1659,6 +2095,7 @@ mod tests {
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
             base_url: "https://api.openai.com".into(),
             model: "gpt-image-2".into(),
+            responses_model: None,
             access_mode: ProviderAccessMode::Smart,
             known_requires_proxy: true,
             output_format: Some("png".into()),
@@ -1674,10 +2111,11 @@ mod tests {
         normalize_api_config(&mut config);
         assert_eq!(config.provider_kind, ProviderKind::OpenAiImage);
         assert_eq!(config.endpoint_mode, ProviderEndpointMode::ResponsesApi);
+        assert_eq!(config.responses_model.as_deref(), Some("gpt-5.5"));
     }
 
     #[test]
-    fn normalize_gateway_config_to_openai_compatible() {
+    fn normalize_custom_nano_banana_keeps_native_protocol() {
         let mut config = EncryptedApiConfig {
             id: "config-2".into(),
             name: "旧香蕉中转".into(),
@@ -1686,6 +2124,7 @@ mod tests {
             endpoint_mode: ProviderEndpointMode::CustomJson,
             base_url: "https://example.com".into(),
             model: String::new(),
+            responses_model: None,
             access_mode: ProviderAccessMode::Smart,
             known_requires_proxy: true,
             output_format: Some("png".into()),
@@ -1699,11 +2138,8 @@ mod tests {
             updated_at: now_rfc3339(),
         };
         normalize_api_config(&mut config);
-        assert_eq!(config.provider_kind, ProviderKind::OpenAiCompatible);
-        assert_eq!(
-            config.provider_template_id,
-            BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID
-        );
+        assert_eq!(config.provider_kind, ProviderKind::NanoBanana);
+        assert_eq!(config.provider_template_id, BUILTIN_NANO_BANANA_TEMPLATE_ID);
         assert_eq!(config.model, "gemini-2.5-flash-image");
     }
 }

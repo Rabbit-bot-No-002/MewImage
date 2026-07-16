@@ -270,6 +270,7 @@ docker compose up --build
 - 应用默认监听 `3000`
 - `docker-compose.yml` 默认使用 `MEW_ASSET_STORE=local`
 - 持久数据默认挂载到宿主机 `./data`
+- 容器默认设置 `1GB` 内存上限，代理生成超过 5 个并发时会在后端排队
 - SQLite 在容器内路径为 `/data/mew-image.db`
 - 同步图片在容器内路径为 `/data/assets`
 - 本地与 S3 对象键统一为 `users/{user_id}/assets/...`，不同用户资源按目录隔离

@@ -1,6 +1,8 @@
 use aws_sdk_s3::Client as S3Client;
 use mew_image_shared::ProviderTemplate;
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetStoreKind {
@@ -118,6 +120,7 @@ pub struct AppState {
     pub s3: Option<S3Client>,
     pub http: reqwest::Client,
     pub provider_builtins: Vec<ProviderTemplate>,
+    pub generation_semaphore: Arc<Semaphore>,
 }
 
 fn env_value(short_key: &str, legacy_key: &str) -> Result<String, std::env::VarError> {

@@ -4,10 +4,12 @@ use mew_image_shared::{
     BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, EncryptedApiConfig, GenerateViaProxyRequest,
     GenerationRequest, GenerationResult, ImageAssetRef, LocalAppState, ProviderAccessMode,
     ProviderEndpointMode, ProviderKind, ProviderTemplate, SyncCheckpoint, SyncEnvelope,
-    aspect_ratio_from_dimensions, extract_gemini_generation_result,
-    extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes,
-    nano_banana_image_size_from_dimensions, new_id, normalize_api_config, now_rfc3339,
-    parse_openai_responses_event_stream,
+    aspect_ratio_from_dimensions, build_gemini_generation_request,
+    extract_gemini_generation_result, extract_openai_compatible_result,
+    extract_openai_responses_result, gemini_auth_header, gemini_generate_content_url,
+    is_google_official_gemini_base_url, merge_envelopes, nano_banana_image_size_from_dimensions,
+    new_id, normalize_api_config, now_rfc3339, parse_openai_responses_event_stream,
+    resolve_responses_main_model,
 };
 use serde_json::json;
 
@@ -34,6 +36,7 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
         endpoint_mode: ProviderEndpointMode::ImagesApi,
         base_url: String::new(),
         model: String::new(),
+        responses_model: None,
         access_mode: ProviderAccessMode::Smart,
         known_requires_proxy: true,
         output_format: Some("png".into()),
@@ -193,10 +196,11 @@ pub async fn generate_with_strategy(
     template: &ProviderTemplate,
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
+    abort_signal: Option<&web_sys::AbortSignal>,
 ) -> Result<(GenerationResult, bool), String> {
     let requested_count = request.count.max(1);
     if requested_count <= 1 {
-        return generate_once_with_strategy(template, config, request).await;
+        return generate_once_with_strategy(template, config, request, abort_signal).await;
     }
 
     let mut images = Vec::new();
@@ -219,7 +223,7 @@ pub async fn generate_with_strategy(
             remaining
         };
 
-        match generate_once_with_strategy(template, config, &next_request).await {
+        match generate_once_with_strategy(template, config, &next_request, abort_signal).await {
             Ok((mut result, used_proxy)) => {
                 if used_proxy {
                     any_proxy = true;
@@ -263,62 +267,69 @@ async fn generate_once_with_strategy(
     template: &ProviderTemplate,
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
+    abort_signal: Option<&web_sys::AbortSignal>,
 ) -> Result<(GenerationResult, bool), String> {
     if config.provider_kind == ProviderKind::NanoBanana {
         return match config.access_mode {
-            ProviderAccessMode::Proxy => proxy_generate(template, config, request)
+            ProviderAccessMode::Proxy => proxy_generate(template, config, request, abort_signal)
                 .await
                 .map(|result| (result, true)),
-            ProviderAccessMode::Direct => direct_generate(template, config, request)
+            ProviderAccessMode::Direct => direct_generate(template, config, request, abort_signal)
                 .await
                 .map(|result| (result, false)),
-            ProviderAccessMode::Smart => match direct_generate(template, config, request).await {
-                Ok(result) => Ok((result, false)),
-                Err(_) => proxy_generate(template, config, request)
-                    .await
-                    .map(|result| (result, true)),
-            },
+            ProviderAccessMode::Smart => {
+                match direct_generate(template, config, request, abort_signal).await {
+                    Ok(result) => Ok((result, false)),
+                    Err(_) => proxy_generate(template, config, request, abort_signal)
+                        .await
+                        .map(|result| (result, true)),
+                }
+            }
         };
     }
     if config.endpoint_mode == ProviderEndpointMode::ResponsesApi {
         return match config.access_mode {
-            ProviderAccessMode::Direct => direct_generate(template, config, request)
+            ProviderAccessMode::Direct => direct_generate(template, config, request, abort_signal)
                 .await
                 .map(|result| (result, false)),
-            ProviderAccessMode::Proxy => proxy_generate(template, config, request)
+            ProviderAccessMode::Proxy => proxy_generate(template, config, request, abort_signal)
                 .await
                 .map(|result| (result, true)),
-            ProviderAccessMode::Smart => match proxy_generate(template, config, request).await {
-                Ok(result) => Ok((result, true)),
-                Err(_) => direct_generate(template, config, request)
-                    .await
-                    .map(|result| (result, false)),
-            },
+            ProviderAccessMode::Smart => {
+                match proxy_generate(template, config, request, abort_signal).await {
+                    Ok(result) => Ok((result, true)),
+                    Err(_) => direct_generate(template, config, request, abort_signal)
+                        .await
+                        .map(|result| (result, false)),
+                }
+            }
         };
     }
     if !request.reference_assets.is_empty() {
-        return proxy_generate(template, config, request)
+        return proxy_generate(template, config, request, abort_signal)
             .await
             .map(|result| (result, true));
     }
     if matches!(config.access_mode, ProviderAccessMode::Smart) && config.known_requires_proxy {
-        return proxy_generate(template, config, request)
+        return proxy_generate(template, config, request, abort_signal)
             .await
             .map(|result| (result, true));
     }
     match config.access_mode {
-        ProviderAccessMode::Proxy => proxy_generate(template, config, request)
+        ProviderAccessMode::Proxy => proxy_generate(template, config, request, abort_signal)
             .await
             .map(|result| (result, true)),
-        ProviderAccessMode::Direct => direct_generate(template, config, request)
+        ProviderAccessMode::Direct => direct_generate(template, config, request, abort_signal)
             .await
             .map(|result| (result, false)),
-        ProviderAccessMode::Smart => match direct_generate(template, config, request).await {
-            Ok(result) => Ok((result, false)),
-            Err(_) => proxy_generate(template, config, request)
-                .await
-                .map(|result| (result, true)),
-        },
+        ProviderAccessMode::Smart => {
+            match direct_generate(template, config, request, abort_signal).await {
+                Ok(result) => Ok((result, false)),
+                Err(_) => proxy_generate(template, config, request, abort_signal)
+                    .await
+                    .map(|result| (result, true)),
+            }
+        }
     }
 }
 
@@ -326,16 +337,29 @@ async fn direct_generate(
     template: &ProviderTemplate,
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
+    abort_signal: Option<&web_sys::AbortSignal>,
 ) -> Result<GenerationResult, String> {
     let api_key = config
         .api_key_plaintext
         .clone()
         .ok_or_else(|| "请先填写 API Key。".to_string())?;
+    let gemini_model = if config.provider_kind == ProviderKind::NanoBanana {
+        let model = if is_google_official_gemini_base_url(&config.base_url) {
+            normalize_google_image_model(&request.model)
+        } else {
+            request.model.trim().to_string()
+        };
+        if model.is_empty() {
+            return Err("当前配置缺少 Gemini 模型名称。".into());
+        }
+        Some(model)
+    } else {
+        None
+    };
     let url = if config.provider_kind == ProviderKind::NanoBanana {
-        let model = normalize_google_image_model(&request.model);
-        join_api_url(
+        gemini_generate_content_url(
             &config.base_url,
-            &format!("/v1beta/models/{model}:generateContent"),
+            gemini_model.as_deref().unwrap_or_default(),
         )
     } else {
         join_api_url(
@@ -344,11 +368,13 @@ async fn direct_generate(
         )
     };
     let response = if config.provider_kind == ProviderKind::NanoBanana {
-        let body = build_gemini_json(config, request);
+        let body = build_gemini_json(request, gemini_model.as_deref().unwrap_or_default());
+        let (auth_header, auth_value) = gemini_auth_header(&config.base_url, &api_key);
         Request::post(&url)
-            .header("x-goog-api-key", &api_key)
+            .abort_signal(abort_signal)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
+            .header(auth_header, &auth_value)
             .json(&body)
             .map_err(|error| error.to_string())?
             .send()
@@ -357,6 +383,7 @@ async fn direct_generate(
     } else if config.provider_kind == ProviderKind::OpenAiCompatible {
         if request.reference_assets.is_empty() {
             Request::post(&url)
+                .abort_signal(abort_signal)
                 .header("Authorization", &format!("Bearer {api_key}"))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
@@ -399,6 +426,7 @@ async fn direct_generate(
                 .map_err(|error| format!("{error:?}"))?;
             }
             Request::post(&url)
+                .abort_signal(abort_signal)
                 .header("Authorization", &format!("Bearer {api_key}"))
                 .header("Accept", "application/json")
                 .body(form)
@@ -416,7 +444,9 @@ async fn direct_generate(
             }
         };
 
-        let builder = Request::post(&url).header("Content-Type", "application/json");
+        let builder = Request::post(&url)
+            .abort_signal(abort_signal)
+            .header("Content-Type", "application/json");
         let builder = builder.header("Authorization", &format!("Bearer {api_key}"));
         builder
             .json(&body)
@@ -459,6 +489,7 @@ async fn proxy_generate(
     template: &ProviderTemplate,
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
+    abort_signal: Option<&web_sys::AbortSignal>,
 ) -> Result<GenerationResult, String> {
     let config = config.clone();
     if config.api_key_plaintext.is_none() {
@@ -501,6 +532,7 @@ async fn proxy_generate(
             .map_err(|error| format!("{error:?}"))?;
         }
         let builder = Request::post(&url)
+            .abort_signal(abort_signal)
             .credentials(web_sys::RequestCredentials::Include)
             .body(form)
             .map_err(|error| error.to_string())?;
@@ -621,18 +653,6 @@ fn normalize_google_image_model(model: &str) -> String {
     trimmed.to_string()
 }
 
-fn google_image_size_value(model: &str, request: &GenerationRequest) -> Option<String> {
-    let normalized = model.trim().to_ascii_lowercase();
-    if normalized.contains("gemini-3") {
-        Some(nano_banana_image_size_from_dimensions(
-            request.width,
-            request.height,
-        ))
-    } else {
-        None
-    }
-}
-
 fn build_openai_responses_json(
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
@@ -678,10 +698,8 @@ fn build_openai_responses_json(
         "partial_images": 1,
     });
 
-    if !config.prompt_guard_enabled {
-        if let Some(quality) = &request.quality {
-            tool["quality"] = json!(quality);
-        }
+    if let Some(quality) = &request.quality {
+        tool["quality"] = json!(quality);
     }
     if config.output_format.as_deref() != Some("png") {
         if let Some(compression) = config.output_compression {
@@ -690,7 +708,7 @@ fn build_openai_responses_json(
     }
 
     json!({
-        "model": resolve_responses_model(&request.model),
+        "model": resolve_responses_main_model(config, &request.model),
         "input": input,
         "tools": [tool],
         "tool_choice": "required",
@@ -698,55 +716,13 @@ fn build_openai_responses_json(
     })
 }
 
-fn build_gemini_json(
-    _config: &EncryptedApiConfig,
-    request: &GenerationRequest,
-) -> serde_json::Value {
-    let model = normalize_google_image_model(&request.model);
-    let mut parts = vec![json!({
-        "text": request.prompt,
-    })];
-    for asset in &request.reference_assets {
-        if let Some(data_url) = asset.data_url.as_deref() {
-            if let Some((mime_type, data)) = split_data_url_payload(data_url) {
-                parts.push(json!({
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": data,
-                    }
-                }));
-            }
-        }
-    }
-
-    let mut generation_config = json!({
-        "responseModalities": ["TEXT", "IMAGE"],
-        "imageConfig": {
-            "aspectRatio": aspect_ratio_from_dimensions(request.width, request.height),
-        }
-    });
-    if let Some(image_size) = google_image_size_value(&model, request) {
-        generation_config["imageConfig"]["imageSize"] = json!(image_size);
-    }
-
-    json!({
-        "contents": [{
-            "role": "user",
-            "parts": parts,
-        }],
-        "generationConfig": generation_config,
-    })
-}
-
-fn resolve_responses_model(request_model: &str) -> String {
-    let trimmed = request_model.trim();
-    if trimmed.is_empty() {
-        return "gpt-5.5".into();
-    }
-    if trimmed.starts_with("gpt-image-") {
-        return "gpt-5.5".into();
-    }
-    trimmed.to_string()
+fn build_gemini_json(request: &GenerationRequest, model: &str) -> serde_json::Value {
+    let data_urls = request
+        .reference_assets
+        .iter()
+        .filter_map(|asset| asset.data_url.as_deref())
+        .collect::<Vec<_>>();
+    build_gemini_generation_request(request, model, &data_urls)
 }
 
 fn openai_images_endpoint(request: &GenerationRequest) -> &'static str {
@@ -816,7 +792,7 @@ fn extract_result(
     {
         return extract_openai_responses_result(
             request,
-            response_json,
+            &response_json,
             config.output_format.as_deref(),
         );
     }
@@ -898,12 +874,6 @@ fn direct_endpoint_path<'a>(
     }
 }
 
-fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
-    let (prefix, payload) = data_url.split_once(',')?;
-    let mime_type = prefix.strip_prefix("data:")?.strip_suffix(";base64")?;
-    Some((mime_type, payload))
-}
-
 fn set_json_path(target: &mut serde_json::Value, path: &str, value: serde_json::Value) {
     let mut current = target;
     let segments: Vec<&str> = path.split('.').collect();
@@ -972,6 +942,29 @@ fn mask_key(value: &str) -> String {
 mod tests {
     use super::*;
     use mew_image_shared::{SyncEntityKind, SyncTombstone};
+
+    #[test]
+    fn responses_request_keeps_quality_with_prompt_guard() {
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        config.prompt_guard_enabled = true;
+        config.responses_model = Some("gpt-5.6".into());
+        let request = GenerationRequest {
+            prompt: "test".into(),
+            model: "gpt-image-2".into(),
+            width: 3840,
+            height: 2160,
+            quality: Some("high".into()),
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            reference_assets: Vec::new(),
+        };
+
+        let body = build_openai_responses_json(&config, &request);
+        assert_eq!(body["model"], "gpt-5.6");
+        assert_eq!(body["tools"][0]["size"], "3840x2160");
+        assert_eq!(body["tools"][0]["quality"], "high");
+    }
 
     #[test]
     fn hydrate_does_not_restore_local_asset_removed_by_remote_tombstone() {
