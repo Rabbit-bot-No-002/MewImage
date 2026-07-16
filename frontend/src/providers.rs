@@ -7,7 +7,7 @@ use mew_image_shared::{
     aspect_ratio_from_dimensions, extract_gemini_generation_result,
     extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes,
     merge_records, nano_banana_image_size_from_dimensions, new_id, normalize_api_config,
-    now_rfc3339,
+    now_rfc3339, parse_openai_responses_event_stream,
 };
 use serde_json::json;
 
@@ -330,7 +330,10 @@ async fn direct_generate(
         .ok_or_else(|| "请先填写 API Key。".to_string())?;
     let url = if config.provider_kind == ProviderKind::NanoBanana {
         let model = normalize_google_image_model(&request.model);
-        join_api_url(&config.base_url, &format!("/v1beta/models/{model}:generateContent"))
+        join_api_url(
+            &config.base_url,
+            &format!("/v1beta/models/{model}:generateContent"),
+        )
     } else {
         join_api_url(
             &config.base_url,
@@ -426,10 +429,26 @@ async fn direct_generate(
             .await
             .unwrap_or_else(|_| "上游请求失败".into()));
     }
-    let value = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| error.to_string())?;
+    let value = if config.provider_kind == ProviderKind::OpenAiImage
+        && config.endpoint_mode == ProviderEndpointMode::ResponsesApi
+    {
+        let is_event_stream = response
+            .headers()
+            .get("content-type")
+            .map(|value| value.contains("text/event-stream"))
+            .unwrap_or(false);
+        let body = response.text().await.map_err(|error| error.to_string())?;
+        if is_event_stream || body.trim_start().starts_with("data:") {
+            parse_openai_responses_event_stream(&body)?
+        } else {
+            serde_json::from_str(&body).map_err(|error| error.to_string())?
+        }
+    } else {
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| error.to_string())?
+    };
     extract_result(template, config, request, value)
 }
 
@@ -652,6 +671,8 @@ fn build_openai_responses_json(
         "action": if request.reference_assets.is_empty() { "generate" } else { "edit" },
         "size": format!("{}x{}", request.width, request.height),
         "output_format": config.output_format.clone().unwrap_or_else(|| "png".into()),
+        "moderation": config.moderation.clone().unwrap_or_else(|| "auto".into()),
+        "partial_images": 1,
     });
 
     if !config.prompt_guard_enabled {
@@ -670,6 +691,7 @@ fn build_openai_responses_json(
         "input": input,
         "tools": [tool],
         "tool_choice": "required",
+        "stream": true,
     })
 }
 
@@ -875,9 +897,7 @@ fn direct_endpoint_path<'a>(
 
 fn split_data_url_payload(data_url: &str) -> Option<(&str, &str)> {
     let (prefix, payload) = data_url.split_once(',')?;
-    let mime_type = prefix
-        .strip_prefix("data:")?
-        .strip_suffix(";base64")?;
+    let mime_type = prefix.strip_prefix("data:")?.strip_suffix(";base64")?;
     Some((mime_type, payload))
 }
 

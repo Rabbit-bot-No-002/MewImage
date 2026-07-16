@@ -27,15 +27,16 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use mew_image_shared::{
     AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUserSummary,
-    AdminUsersResponse, AuthRequest, AuthResponse, ChangePasswordRequest, GenerateViaProxyRequest,
-    GeneratedImageResult, GenerationResult, ImageAssetRef, MeResponse, MergePreviewResponse,
-    ParameterSnapshot, ProviderEndpointMode, ProviderKind, ProviderTemplate,
-    ProviderTemplateImportRequest, RegisterRequest, SyncEnvelope, SyncPullResponse,
-    SyncPushRequest, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
-    UploadInitResponse, UserSummary, UsernameAvailabilityResponse, aspect_ratio_from_dimensions,
-    extract_gemini_generation_result, extract_openai_compatible_result,
-    extract_openai_responses_result, merge_envelopes, nano_banana_image_size_from_dimensions,
-    new_id, now_rfc3339,
+    AdminUsersResponse, AuthRequest, AuthResponse, ChangePasswordRequest, CloudDataClearRequest,
+    CloudDataClearScope, CloudDataStatsResponse, GenerateViaProxyRequest, GeneratedImageResult,
+    GenerationResult, ImageAssetRef, MeResponse, MergePreviewResponse, ParameterSnapshot,
+    ProviderEndpointMode, ProviderKind, ProviderTemplate, ProviderTemplateImportRequest,
+    RegisterRequest, SyncEnvelope, SyncPullResponse, SyncPushRequest, UploadCompleteRequest,
+    UploadCompleteResponse, UploadInitRequest, UploadInitResponse, UserSummary,
+    UsernameAvailabilityResponse, aspect_ratio_from_dimensions, extract_gemini_generation_result,
+    extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes,
+    nano_banana_image_size_from_dimensions, new_id, now_rfc3339,
+    parse_openai_responses_event_stream,
 };
 use rand::distr::{Alphanumeric, SampleString};
 use reqwest::Url;
@@ -122,9 +123,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/users/approve", post(admin_approve_user))
         .route("/api/admin/users/disable", post(admin_disable_user))
         .route("/api/admin/users/restore", post(admin_restore_user))
+        .route("/api/admin/users/delete", post(admin_delete_user))
         .route("/api/sync/push", post(sync_push))
         .route("/api/sync/pull", get(sync_pull))
         .route("/api/sync/merge-preview", post(sync_merge_preview))
+        .route("/api/data/stats", get(cloud_data_stats))
+        .route("/api/data/clear", post(clear_cloud_data))
         .route(
             "/api/providers/templates",
             get(list_provider_templates).post(import_provider_template),
@@ -620,6 +624,69 @@ async fn admin_restore_user(
     .await
 }
 
+async fn admin_delete_user(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AdminUserActionRequest>,
+) -> Result<StatusCode, AppError> {
+    let admin = require_admin(&state, &session).await?;
+    if payload.user_id == admin.id {
+        return Err(AppError::bad_request("不能删除当前登录的管理员账号。"));
+    }
+
+    let role = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = ?")
+        .bind(&payload.user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("用户不存在"))?;
+    if role == "admin" {
+        return Err(AppError::bad_request(
+            "管理员账号不能通过用户管理页面删除。",
+        ));
+    }
+
+    let mut object_keys = BTreeSet::new();
+    for table in ["assets", "upload_tokens"] {
+        let query = format!("SELECT object_key FROM {table} WHERE user_id = ?");
+        let rows = sqlx::query(&query)
+            .bind(&payload.user_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        object_keys.extend(
+            rows.into_iter()
+                .map(|row| row.get::<String, _>("object_key")),
+        );
+    }
+    for object_key in object_keys {
+        delete_object(&state, &object_key).await?;
+    }
+    delete_user_object_namespace(&state, &payload.user_id).await?;
+
+    let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
+    for table in [
+        "upload_tokens",
+        "assets",
+        "sync_snapshots",
+        "provider_templates",
+    ] {
+        let query = format!("DELETE FROM {table} WHERE user_id = ?");
+        sqlx::query(&query)
+            .bind(&payload.user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&payload.user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(AppError::internal)?;
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn update_user_status(
     state: &AppState,
     user_id: &str,
@@ -698,6 +765,97 @@ async fn sync_pull(
             ..Default::default()
         },
     }))
+}
+
+async fn cloud_data_stats(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<CloudDataStatsResponse>, AppError> {
+    let user = require_approved_user(&state, &session).await?;
+    Ok(Json(load_cloud_data_stats(&state.db, &user.id).await?))
+}
+
+async fn clear_cloud_data(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<CloudDataClearRequest>,
+) -> Result<Json<CloudDataStatsResponse>, AppError> {
+    let user = require_approved_user(&state, &session).await?;
+    match payload.scope {
+        CloudDataClearScope::SyncData => clear_user_sync_data(&state, &user.id).await?,
+        CloudDataClearScope::ProviderTemplates => {
+            delete_user_rows(&state.db, &user.id, &["provider_templates"]).await?
+        }
+        CloudDataClearScope::All => {
+            clear_user_sync_data(&state, &user.id).await?;
+            delete_user_rows(&state.db, &user.id, &["provider_templates"]).await?;
+        }
+    }
+    Ok(Json(load_cloud_data_stats(&state.db, &user.id).await?))
+}
+
+async fn clear_user_sync_data(state: &AppState, user_id: &str) -> Result<(), AppError> {
+    // 先清理对象命名空间，再删除索引，避免数据库成功后遗留无法定位的云端文件。
+    delete_user_object_namespace(state, user_id).await?;
+    delete_user_rows(
+        &state.db,
+        user_id,
+        &["upload_tokens", "assets", "sync_snapshots"],
+    )
+    .await
+}
+
+async fn delete_user_rows(db: &SqlitePool, user_id: &str, tables: &[&str]) -> Result<(), AppError> {
+    let mut transaction = db.begin().await.map_err(AppError::internal)?;
+    for table in tables {
+        let query = format!("DELETE FROM {table} WHERE user_id = ?");
+        sqlx::query(&query)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    transaction.commit().await.map_err(AppError::internal)
+}
+
+async fn load_cloud_data_stats(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<CloudDataStatsResponse, AppError> {
+    let (image_count, image_bytes) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*), COALESCE(SUM(byte_len), 0) FROM assets WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_one(db)
+    .await
+    .map_err(AppError::internal)?;
+    let provider_template_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_templates WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(db)
+            .await
+            .map_err(AppError::internal)?;
+    let pending_upload_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_tokens WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(db)
+            .await
+            .map_err(AppError::internal)?;
+    let has_sync_snapshot =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_snapshots WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(db)
+            .await
+            .map_err(AppError::internal)?
+            > 0;
+
+    Ok(CloudDataStatsResponse {
+        image_count: image_count.max(0) as usize,
+        image_bytes: image_bytes.max(0) as u64,
+        provider_template_count: provider_template_count.max(0) as usize,
+        pending_upload_count: pending_upload_count.max(0) as usize,
+        has_sync_snapshot,
+    })
 }
 
 async fn sync_merge_preview(
@@ -1263,6 +1421,80 @@ async fn get_object_bytes(state: &AppState, object_key: &str) -> Result<Vec<u8>,
     }
 }
 
+async fn delete_object(state: &AppState, object_key: &str) -> Result<(), AppError> {
+    match state.config.asset_store {
+        AssetStoreKind::Local => {
+            let path = local_object_path(&state.config.local_asset_dir, object_key)?;
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(AppError::internal(error)),
+            }
+        }
+        AssetStoreKind::S3 => {
+            let client = state.s3.as_ref().ok_or_else(|| {
+                AppError::bad_request("服务器未启用远程资源存储，无法删除用户图片。")
+            })?;
+            client
+                .delete_object()
+                .bucket(&state.config.s3_bucket)
+                .key(object_key)
+                .send()
+                .await
+                .map_err(AppError::internal)?;
+            Ok(())
+        }
+        AssetStoreKind::Disabled => Ok(()),
+    }
+}
+
+async fn delete_user_object_namespace(state: &AppState, user_id: &str) -> Result<(), AppError> {
+    let prefix = format!("users/{user_id}/");
+    match state.config.asset_store {
+        AssetStoreKind::Local => {
+            let path = local_object_path(&state.config.local_asset_dir, &prefix)?;
+            match tokio::fs::remove_dir_all(path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(AppError::internal(error)),
+            }
+        }
+        AssetStoreKind::S3 => {
+            let client = state.s3.as_ref().ok_or_else(|| {
+                AppError::bad_request("服务器未启用远程资源存储，无法删除用户图片。")
+            })?;
+            let mut continuation_token = None;
+            loop {
+                let mut request = client
+                    .list_objects_v2()
+                    .bucket(&state.config.s3_bucket)
+                    .prefix(&prefix);
+                if let Some(token) = continuation_token.as_deref() {
+                    request = request.continuation_token(token);
+                }
+                let response = request.send().await.map_err(AppError::internal)?;
+                for object in response.contents() {
+                    if let Some(key) = object.key() {
+                        client
+                            .delete_object()
+                            .bucket(&state.config.s3_bucket)
+                            .key(key)
+                            .send()
+                            .await
+                            .map_err(AppError::internal)?;
+                    }
+                }
+                continuation_token = response.next_continuation_token().map(str::to_string);
+                if continuation_token.is_none() {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        AssetStoreKind::Disabled => Ok(()),
+    }
+}
+
 async fn user_role_exists(db: &SqlitePool, role: &str) -> Result<bool, AppError> {
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE role = ?")
         .bind(role)
@@ -1811,6 +2043,8 @@ async fn invoke_openai_image(
             "action": if payload.request.reference_assets.is_empty() { "generate" } else { "edit" },
             "size": format!("{}x{}", payload.request.width, payload.request.height),
             "output_format": payload.config.output_format.clone().unwrap_or_else(|| "png".into()),
+            "moderation": payload.config.moderation.clone().unwrap_or_else(|| "auto".into()),
+            "partial_images": 1,
         });
         if !payload.config.prompt_guard_enabled {
             if let Some(quality) = &payload.request.quality {
@@ -1838,6 +2072,7 @@ async fn invoke_openai_image(
             },
             "tools": [tool],
             "tool_choice": "required",
+            "stream": true,
         });
         request.json(&body).send().await.map_err(|error| {
             warn!("openai image responses request failed: {}", error);
@@ -1859,6 +2094,26 @@ async fn invoke_openai_image(
             AppError::bad_gateway("Images API 请求失败")
         })?
     };
+
+    if payload.config.endpoint_mode == ProviderEndpointMode::ResponsesApi {
+        let status = response.status();
+        let is_event_stream = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.contains("text/event-stream"))
+            .unwrap_or(false);
+        let body = response.text().await.map_err(AppError::internal)?;
+        if !status.is_success() {
+            return Err(AppError::bad_gateway(format!(
+                "Responses API 上游请求失败：HTTP {status}，{body}"
+            )));
+        }
+        if is_event_stream || body.trim_start().starts_with("data:") {
+            return parse_openai_responses_event_stream(&body).map_err(AppError::bad_gateway);
+        }
+        return serde_json::from_str(&body).map_err(AppError::internal);
+    }
 
     response.json().await.map_err(AppError::internal)
 }
@@ -2185,6 +2440,7 @@ fn extract_generation_result(
         return result;
     }
     if request.endpoint_mode == ProviderEndpointMode::ResponsesApi {
+        let upstream_response = response_json.clone();
         let mut result = extract_openai_responses_result(request, response_json, output_format)
             .unwrap_or_else(|error| GenerationResult {
                 images: Vec::new(),
@@ -2198,7 +2454,10 @@ fn extract_generation_result(
                     revised_prompt: None,
                     duration_ms: Some(duration_ms),
                 },
-                raw_response_json: Some(serde_json::json!({ "error": error })),
+                raw_response_json: Some(serde_json::json!({
+                    "parse_error": error,
+                    "upstream_response": upstream_response,
+                })),
             });
         result.parameter_snapshot.duration_ms = Some(duration_ms);
         return result;

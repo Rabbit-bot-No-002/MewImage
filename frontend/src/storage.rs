@@ -177,3 +177,21 @@ pub async fn load_asset_payloads(asset_ids: &[String]) -> Result<HashMap<String,
         .map_err(|error| error.to_string())?;
     Ok(loaded)
 }
+
+pub async fn clear_asset_payloads() -> Result<(), String> {
+    let db = open_db().await?;
+    let transaction = db
+        .transaction(&[ASSET_STORE_NAME], TransactionMode::ReadWrite)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .store(ASSET_STORE_NAME)
+        .map_err(|error| error.to_string())?
+        .clear()
+        .await
+        .map_err(|error| error.to_string())?;
+    transaction
+        .done()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}

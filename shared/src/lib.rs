@@ -474,10 +474,9 @@ pub fn extract_openai_responses_result(
     let mut revised_prompt = None::<String>;
     let fallback_mime = image_mime_from_output_format(output_format);
 
-    if let Some(output_items) = response_json
-        .get("output")
-        .and_then(|value| value.as_array())
-    {
+    let mut output_groups = Vec::new();
+    collect_responses_output_groups(&response_json, &mut output_groups);
+    for output_items in output_groups {
         for item in output_items {
             if item.get("type").and_then(|value| value.as_str()) != Some("image_generation_call") {
                 continue;
@@ -520,6 +519,120 @@ pub fn extract_openai_responses_result(
         },
         raw_response_json: Some(response_json),
     })
+}
+
+fn collect_responses_output_groups<'a>(
+    value: &'a serde_json::Value,
+    output_groups: &mut Vec<&'a Vec<serde_json::Value>>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(output) = map.get("output").and_then(|value| value.as_array()) {
+                output_groups.push(output);
+            }
+            for child in map.values() {
+                collect_responses_output_groups(child, output_groups);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_responses_output_groups(item, output_groups);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn parse_openai_responses_event_stream(body: &str) -> Result<serde_json::Value, String> {
+    let mut completed_response = None;
+    let mut completed_items = Vec::new();
+    let mut partial_images = BTreeMap::<u64, String>::new();
+
+    for line in body.lines() {
+        let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(data)
+            .map_err(|error| format!("Responses SSE 事件解析失败：{error}"))?;
+        match event.get("type").and_then(|value| value.as_str()) {
+            Some("response.completed") => {
+                if let Some(response) = event.get("response").filter(|value| value.is_object()) {
+                    completed_response = Some(response.clone());
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item").filter(|value| {
+                    value.get("type").and_then(|value| value.as_str())
+                        == Some("image_generation_call")
+                }) {
+                    completed_items.push(item.clone());
+                }
+            }
+            Some("response.image_generation_call.partial_image") => {
+                if let Some(image) = event
+                    .get("partial_image_b64")
+                    .and_then(|value| value.as_str())
+                {
+                    let index = event
+                        .get("partial_image_index")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    partial_images.insert(index, image.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(response) = completed_response {
+        if responses_payload_has_image_result(&response) {
+            return Ok(response);
+        }
+    }
+    let usable_completed_items = completed_items
+        .into_iter()
+        .filter(responses_payload_has_image_result)
+        .collect::<Vec<_>>();
+    if !usable_completed_items.is_empty() {
+        return Ok(serde_json::json!({ "output": usable_completed_items }));
+    }
+    if let Some((_, image)) = partial_images.last_key_value() {
+        return Ok(serde_json::json!({
+            "output": [{
+                "type": "image_generation_call",
+                "status": "completed",
+                "result": image,
+            }]
+        }));
+    }
+    Err("Responses SSE 没有返回可用的最终响应。".into())
+}
+
+fn responses_payload_has_image_result(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_image_call =
+                map.get("type").and_then(|value| value.as_str()) == Some("image_generation_call");
+            if is_image_call
+                && map
+                    .get("result")
+                    .map(|result| match result {
+                        serde_json::Value::String(value) => !value.trim().is_empty(),
+                        serde_json::Value::Null => false,
+                        _ => true,
+                    })
+                    .unwrap_or(false)
+            {
+                return true;
+            }
+            map.values().any(responses_payload_has_image_result)
+        }
+        serde_json::Value::Array(items) => items.iter().any(responses_payload_has_image_result),
+        _ => false,
+    }
 }
 
 pub fn extract_nano_banana_result(
@@ -674,7 +787,9 @@ fn normalize_openai_response_image(
         });
     }
 
-    if looks_like_base64_payload(trimmed) || (has_image_hint && looks_like_base64_fragment(trimmed))
+    if (is_root_payload && looks_like_base64_fragment(trimmed))
+        || looks_like_base64_payload(trimmed)
+        || (has_image_hint && looks_like_base64_fragment(trimmed))
     {
         if !is_root_payload && !has_image_hint {
             return None;
@@ -919,6 +1034,28 @@ pub struct MergePreviewResponse {
     pub task_count: usize,
     pub thread_count: usize,
     pub asset_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudDataClearScope {
+    SyncData,
+    ProviderTemplates,
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudDataClearRequest {
+    pub scope: CloudDataClearScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CloudDataStatsResponse {
+    pub image_count: usize,
+    pub image_bytes: u64,
+    pub provider_template_count: usize,
+    pub pending_upload_count: usize,
+    pub has_sync_snapshot: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1263,6 +1400,71 @@ mod tests {
             result.parameter_snapshot.actual_quality.as_deref(),
             Some("medium")
         );
+    }
+
+    #[test]
+    fn responses_result_reads_gateway_wrapped_output() {
+        let request = GenerationRequest {
+            prompt: "test".into(),
+            model: "gpt-5.5".into(),
+            width: 1024,
+            height: 1024,
+            quality: Some("high".into()),
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            reference_assets: Vec::new(),
+        };
+        let response_json = serde_json::json!({
+            "data": {
+                "response": {
+                    "output": [{
+                        "type": "image_generation_call",
+                        "result": "aGVsbG8=",
+                    }]
+                }
+            }
+        });
+
+        let result = extract_openai_responses_result(&request, response_json, Some("png")).unwrap();
+        assert_eq!(result.images.len(), 1);
+    }
+
+    #[test]
+    fn responses_sse_prefers_completed_response() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"ZG9uZQ==\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}]}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let payload = parse_openai_responses_event_stream(stream).unwrap();
+        assert_eq!(payload["output"][0]["result"], "ZmluYWw=");
+    }
+
+    #[test]
+    fn responses_sse_uses_done_item_without_completed_snapshot() {
+        let stream = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}}\n\n";
+        let payload = parse_openai_responses_event_stream(stream).unwrap();
+        assert_eq!(payload["output"][0]["result"], "ZmluYWw=");
+    }
+
+    #[test]
+    fn responses_sse_falls_back_when_completed_result_is_empty() {
+        let stream = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"\"}]}}\n\n",
+        );
+        let payload = parse_openai_responses_event_stream(stream).unwrap();
+        assert_eq!(payload["output"][0]["result"], "ZmluYWw=");
+    }
+
+    #[test]
+    fn responses_sse_uses_latest_partial_as_last_resort() {
+        let stream = concat!(
+            "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_index\":0,\"partial_image_b64\":\"Zmlyc3Q=\"}\n\n",
+            "data: {\"type\":\"response.image_generation_call.partial_image\",\"partial_image_index\":1,\"partial_image_b64\":\"bGFzdA==\"}\n\n",
+        );
+        let payload = parse_openai_responses_event_stream(stream).unwrap();
+        assert_eq!(payload["output"][0]["result"], "bGFzdA==");
     }
 
     #[test]

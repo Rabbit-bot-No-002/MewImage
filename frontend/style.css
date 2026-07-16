@@ -1175,6 +1175,127 @@ body[data-theme="night"] .admin-user-row {
   border-radius: 13px;
 }
 
+.data-management-panel {
+  min-height: 520px;
+}
+
+.data-management-header,
+.cloud-stat-toolbar {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.data-scope-tabs {
+  max-width: 360px;
+}
+
+.data-scope-content {
+  gap: 12px;
+}
+
+.data-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.cloud-stat-grid {
+  flex: 1;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.data-stat-card {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: linear-gradient(145deg, rgba(255, 125, 176, 0.1), rgba(140, 202, 255, 0.08));
+}
+
+.data-stat-card span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.data-stat-card strong {
+  overflow: hidden;
+  font-size: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.data-action-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--panel-strong);
+}
+
+.data-action-card > div:first-child {
+  min-width: 0;
+}
+
+.data-action-card h3 {
+  margin-bottom: 6px;
+  font-size: 15px;
+}
+
+.data-action-buttons {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+
+.data-action-buttons .button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 9px 13px;
+  border-radius: 14px;
+}
+
+.danger-zone {
+  border-color: color-mix(in srgb, var(--danger) 28%, var(--line));
+  background: linear-gradient(145deg, color-mix(in srgb, var(--danger) 7%, var(--panel-strong)), var(--panel-strong));
+}
+
+.data-management-message {
+  margin: 0;
+  padding: 10px 13px;
+  border-radius: 14px;
+  color: var(--text);
+  background: linear-gradient(135deg, rgba(255, 125, 176, 0.11), rgba(140, 202, 255, 0.11));
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.data-cloud-locked {
+  min-height: 240px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+}
+
+.data-cloud-locked .app-icon {
+  font-size: 34px;
+}
+
+.visually-hidden-file-input {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .resolution-sheet {
   width: min(720px, 100%);
   min-height: 360px;
@@ -2515,6 +2636,19 @@ body[data-theme="night"] .config-switcher-menu {
 
   .settings-content {
     max-height: min(620px, calc(100vh - 220px));
+  }
+
+  .data-action-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .data-action-buttons {
+    justify-content: flex-start;
+  }
+
+  .cloud-stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .topbar {

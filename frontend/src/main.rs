@@ -1,5 +1,6 @@
 mod api;
 mod crypto;
+mod data_management;
 mod providers;
 mod storage;
 
@@ -17,12 +18,12 @@ use leptos::{html, prelude::*, task::spawn_local};
 use mew_image_shared::{
     AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUserSummary,
     AdminUsersResponse, AppPreferences, AuthRequest, AuthResponse,
-    BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, ConversationThread,
-    DEFAULT_FAVORITE_FOLDER_ID, EncryptedApiConfig, FavoriteFolder, ImageAssetRef, LocalAppState,
-    LocalTaskRecord, MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
-    ProviderTemplate, RegisterRequest, SyncCheckpoint, SyncPullResponse, TaskStatus,
-    ThemePreference, UserSummary, UsernameAvailabilityResponse, clamp_size, new_id,
-    normalize_api_config, now_rfc3339,
+    BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, CloudDataClearRequest,
+    CloudDataClearScope, CloudDataStatsResponse, ConversationThread, DEFAULT_FAVORITE_FOLDER_ID,
+    EncryptedApiConfig, FavoriteFolder, ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse,
+    ProviderAccessMode, ProviderEndpointMode, ProviderKind, ProviderTemplate, RegisterRequest,
+    SyncCheckpoint, SyncPullResponse, TaskStatus, ThemePreference, UserSummary,
+    UsernameAvailabilityResponse, clamp_size, new_id, normalize_api_config, now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -31,8 +32,8 @@ use providers::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use storage::{
-    apply_asset_payload_changes, load_asset_payloads, load_snapshot, save_ui_state,
-    save_workspace_snapshot,
+    apply_asset_payload_changes, clear_asset_payloads, load_asset_payloads, load_snapshot,
+    save_ui_state, save_workspace_snapshot,
 };
 use wasm_bindgen::{JsCast, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
@@ -136,6 +137,17 @@ enum ConfirmPopoverKind {
     DeleteThread(String),
     DeleteFavoriteFolder(String),
     DeleteTask(String),
+    DeleteUser(String),
+    ClearLocalData(LocalDataClearScope),
+    ClearCloudData(CloudDataClearScope),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalDataClearScope {
+    Workspace,
+    Configs,
+    Preferences,
+    All,
 }
 
 #[derive(Clone, PartialEq)]
@@ -191,7 +203,8 @@ fn App() -> impl IntoView {
     let register_password_confirm = RwSignal::new(String::new());
     let admin_setup_token = RwSignal::new(String::new());
     let show_admin_setup_token = RwSignal::new(false);
-    let admin_setup_allowed = RwSignal::new(false);
+    // 状态接口不可用时仍保留初始化入口，避免部署漏配被静默隐藏。
+    let admin_setup_allowed = RwSignal::new(true);
     let auth_form_message = RwSignal::new(None::<String>);
     let username_check_message = RwSignal::new(None::<String>);
     let change_old_password = RwSignal::new(String::new());
@@ -236,6 +249,11 @@ fn App() -> impl IntoView {
     let show_settings = RwSignal::new(false);
     let show_settings_menu = RwSignal::new(false);
     let settings_tab = RwSignal::new("providers".to_string());
+    let data_management_tab = RwSignal::new("local".to_string());
+    let data_management_busy = RwSignal::new(false);
+    let data_management_message = RwSignal::new(None::<String>);
+    let cloud_data_stats = RwSignal::new(None::<CloudDataStatsResponse>);
+    let backup_file_input = NodeRef::<html::Input>::new();
     let show_resolution_menu = RwSignal::new(false);
     let show_config_switcher = RwSignal::new(false);
     let preview_state = RwSignal::new(None::<PreviewState>);
@@ -626,7 +644,7 @@ fn App() -> impl IntoView {
                 .await
             {
                 if let Ok(status) = response.json::<AdminSetupStatusResponse>().await {
-                    admin_setup_allowed.set(status.setup_allowed);
+                    admin_setup_allowed.set(!status.admin_exists);
                 }
             }
 
@@ -1326,7 +1344,7 @@ fn App() -> impl IntoView {
             .map(|user| user.role == "admin")
             .unwrap_or(false)
         {
-            status_text.set("只有管理员可以查看用户审批列表。".into());
+            status_text.set("只有管理员可以查看用户管理列表。".into());
             return;
         }
         loading_admin_users.set(true);
@@ -1406,6 +1424,318 @@ fn App() -> impl IntoView {
                 Err(error) => status_text.set(format!("管理员操作失败：{error}")),
             }
         });
+    };
+
+    let delete_managed_user = move |user_id: String, x: f64, y: f64| {
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::DeleteUser(user_id),
+            title: "删除用户与云端数据".into(),
+            message: "此操作会永久删除该用户的账号、服务器图片、同步快照和服务商模板；用户浏览器里的本地数据不会被远程删除。是否继续？".into(),
+            x,
+            y,
+        }));
+    };
+
+    let refresh_cloud_data_stats = move || {
+        let approved = auth_user
+            .get_untracked()
+            .map(|user| user.status == "approved")
+            .unwrap_or(false);
+        if !approved {
+            data_management_message.set(Some("账号审批通过后才能查看云端数据。".into()));
+            return;
+        }
+        data_management_busy.set(true);
+        data_management_message.set(Some("正在读取云端数据统计……".into()));
+        spawn_local(async move {
+            match Request::get(&api_url("/api/data/stats"))
+                .credentials(web_sys::RequestCredentials::Include)
+                .send()
+                .await
+            {
+                Ok(response) if response.ok() => {
+                    match response.json::<CloudDataStatsResponse>().await {
+                        Ok(stats) => {
+                            cloud_data_stats.set(Some(stats));
+                            data_management_message.set(Some("云端数据统计已刷新。".into()));
+                        }
+                        Err(error) => {
+                            data_management_message.set(Some(format!("云端统计解析失败：{error}")))
+                        }
+                    }
+                }
+                Ok(response) => data_management_message.set(Some(
+                    response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "读取云端统计失败。".into()),
+                )),
+                Err(error) => {
+                    data_management_message.set(Some(format!("读取云端统计失败：{error}")))
+                }
+            }
+            data_management_busy.set(false);
+        });
+    };
+
+    let export_local_backup = move |_| {
+        if generating.get_untracked() {
+            data_management_message.set(Some("图片正在生成，请完成后再导出。".into()));
+            return;
+        }
+        data_management_busy.set(true);
+        data_management_message.set(Some("正在读取本地图片并生成备份……".into()));
+        let state = snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
+        spawn_local(async move {
+            let asset_ids = state
+                .assets
+                .iter()
+                .map(|asset| asset.id.clone())
+                .collect::<Vec<_>>();
+            let result: Result<Vec<u8>, String> = async {
+                let mut payloads = load_asset_payloads(&asset_ids)
+                    .await
+                    .map_err(|error| format!("读取本地图片失败：{error}"))?;
+                for asset in &state.assets {
+                    if payloads.contains_key(&asset.id) || asset.data_url.is_some() {
+                        continue;
+                    }
+                    let Some(remote_url) = asset.remote_url.as_deref() else {
+                        continue;
+                    };
+                    let source = if remote_url.starts_with('/') {
+                        api_url(remote_url)
+                    } else {
+                        remote_url.to_string()
+                    };
+                    let (bytes, mime_type) = if remote_url.starts_with("/api/assets/") {
+                        fetch_authenticated_image_bytes(&source).await?
+                    } else {
+                        fetch_image_bytes(&source).await?
+                    };
+                    payloads.insert(asset.id.clone(), bytes_to_data_url(&bytes, &mime_type));
+                }
+                data_management::build_backup(state, &payloads)
+            }
+            .await;
+            match result.and_then(|bytes| download_backup_bytes(&bytes)) {
+                Ok(()) => data_management_message
+                    .set(Some("备份已生成，请在浏览器下载记录中确认保存。".into())),
+                Err(error) => data_management_message.set(Some(format!("导出失败：{error}"))),
+            }
+            data_management_busy.set(false);
+        });
+    };
+
+    let import_local_backup = move |event: Event| {
+        if generating.get_untracked() {
+            data_management_message.set(Some("图片正在生成，请完成后再导入。".into()));
+            return;
+        }
+        let Some(input) = event
+            .target()
+            .and_then(|target| target.dyn_into::<HtmlInputElement>().ok())
+        else {
+            return;
+        };
+        let Some(file) = input.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        input.set_value("");
+        data_management_busy.set(true);
+        data_management_message.set(Some("正在校验并合并本地备份……".into()));
+        let local = snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
+        spawn_local(async move {
+            let file = File::from(file);
+            let result = read_as_bytes(&file)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| data_management::import_backup(&bytes, &local));
+            match result {
+                Ok(mut imported) => {
+                    reconcile_task_integrity(
+                        &mut imported.state.tasks,
+                        &imported.state.assets,
+                        true,
+                    );
+                    let first_thread = imported
+                        .state
+                        .threads
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(default_thread);
+                    current_thread_id.set(first_thread.id.clone());
+                    current_config_id.set(
+                        imported
+                            .state
+                            .configs
+                            .first()
+                            .map(|config| config.id.clone())
+                            .unwrap_or_default(),
+                    );
+                    draft_prompt.set(first_thread.draft_prompt);
+                    selected_reference_ids.set(Vec::new());
+                    continuation_asset_id.set(None);
+                    reference_menu_asset_id.set(None);
+                    apply_local_state(
+                        imported.state,
+                        configs,
+                        tasks,
+                        threads,
+                        assets,
+                        preferences,
+                        checkpoint,
+                    );
+                    enqueue_payload_writes(imported.payloads);
+                    persist_state();
+                    persist_ui_state();
+                    data_management_message.set(Some(format!(
+                        "导入完成：读取 {} 条任务、{} 个图片引用，复用 {} 张重复图片。",
+                        imported.imported_task_count,
+                        imported.imported_asset_count,
+                        imported.deduplicated_asset_count,
+                    )));
+                }
+                Err(error) => data_management_message.set(Some(format!("导入失败：{error}"))),
+            }
+            data_management_busy.set(false);
+        });
+    };
+
+    let perform_clear_local_data = move |scope: LocalDataClearScope| {
+        if generating.get_untracked() {
+            data_management_message.set(Some("图片正在生成，请完成后再清除数据。".into()));
+            return;
+        }
+        data_management_busy.set(true);
+        let clear_workspace = matches!(
+            scope,
+            LocalDataClearScope::Workspace | LocalDataClearScope::All
+        );
+        let clear_configs = matches!(
+            scope,
+            LocalDataClearScope::Configs | LocalDataClearScope::All
+        );
+        let clear_preferences = matches!(
+            scope,
+            LocalDataClearScope::Preferences | LocalDataClearScope::All
+        );
+        if clear_workspace {
+            payload_write_queue.set(HashMap::new());
+            payload_delete_queue.set(HashSet::new());
+            tasks.set(Vec::new());
+            assets.set(Vec::new());
+            let thread = default_thread();
+            current_thread_id.set(thread.id.clone());
+            threads.set(vec![thread]);
+            checkpoint.set(SyncCheckpoint::default());
+            draft_prompt.set(String::new());
+            selected_reference_ids.set(Vec::new());
+            continuation_asset_id.set(None);
+            reference_menu_asset_id.set(None);
+            preview_state.set(None);
+            preview_panel_state.set(None);
+            gallery_page.set(1);
+        }
+        if clear_configs {
+            let config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+            current_config_id.set(config.id.clone());
+            configs.set(vec![config]);
+        }
+        if clear_preferences {
+            preferences.set(AppPreferences::default());
+            tasks.update(|items| {
+                for task in items.iter_mut().filter(|task| task.favorite) {
+                    task.favorite_folder_id = Some(DEFAULT_FAVORITE_FOLDER_ID.into());
+                    task.updated_at = now_rfc3339();
+                }
+            });
+        }
+        // 若此前有写盘仍在执行，保留 pending 可保证旧快照完成后再落一次当前空状态。
+        if clear_workspace || clear_preferences {
+            persist_state();
+        }
+        if clear_configs || clear_preferences {
+            persist_ui_state();
+        }
+        spawn_local(async move {
+            let mut errors = Vec::new();
+            if clear_workspace {
+                if let Err(error) = clear_asset_payloads().await {
+                    errors.push(format!("清除图片失败：{error}"));
+                }
+            }
+            data_management_message.set(Some(if errors.is_empty() {
+                "所选本地数据已清除，云端数据未受影响。".into()
+            } else {
+                errors.join("；")
+            }));
+            data_management_busy.set(false);
+        });
+    };
+
+    let perform_clear_cloud_data = move |scope: CloudDataClearScope| {
+        data_management_busy.set(true);
+        data_management_message.set(Some("正在清除所选云端数据……".into()));
+        spawn_local(async move {
+            let request = Request::post(&api_url("/api/data/clear"))
+                .credentials(web_sys::RequestCredentials::Include)
+                .json(&CloudDataClearRequest { scope });
+            let result = match request {
+                Ok(builder) => builder.send().await,
+                Err(error) => {
+                    data_management_message.set(Some(format!("清除请求序列化失败：{error}")));
+                    data_management_busy.set(false);
+                    return;
+                }
+            };
+            match result {
+                Ok(response) if response.ok() => {
+                    match response.json::<CloudDataStatsResponse>().await {
+                        Ok(stats) => {
+                            cloud_data_stats.set(Some(stats));
+                            data_management_message
+                                .set(Some("所选云端数据已清除，本地工作区未受影响。".into()));
+                        }
+                        Err(error) => {
+                            data_management_message.set(Some(format!("清除结果解析失败：{error}")))
+                        }
+                    }
+                }
+                Ok(response) => data_management_message.set(Some(
+                    response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "清除云端数据失败。".into()),
+                )),
+                Err(error) => {
+                    data_management_message.set(Some(format!("清除云端数据失败：{error}")))
+                }
+            }
+            data_management_busy.set(false);
+        });
+    };
+
+    let confirm_local_clear = move |scope: LocalDataClearScope, event: MouseEvent| {
+        let (title, message) = local_clear_confirmation(scope);
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::ClearLocalData(scope),
+            title: title.into(),
+            message: message.into(),
+            x: event.client_x() as f64,
+            y: event.client_y() as f64,
+        }));
+    };
+
+    let confirm_cloud_clear = move |scope: CloudDataClearScope, event: MouseEvent| {
+        let (title, message) = cloud_clear_confirmation(&scope);
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::ClearCloudData(scope),
+            title: title.into(),
+            message: message.into(),
+            x: event.client_x() as f64,
+            y: event.client_y() as f64,
+        }));
     };
 
     let add_config = move |_| {
@@ -1966,6 +2296,11 @@ fn App() -> impl IntoView {
                 perform_delete_favorite_folder(folder_id)
             }
             ConfirmPopoverKind::DeleteTask(task_id) => perform_delete_task(task_id),
+            ConfirmPopoverKind::DeleteUser(user_id) => {
+                admin_user_action("/api/admin/users/delete", user_id)
+            }
+            ConfirmPopoverKind::ClearLocalData(scope) => perform_clear_local_data(scope),
+            ConfirmPopoverKind::ClearCloudData(scope) => perform_clear_cloud_data(scope),
         }
     };
 
@@ -2439,7 +2774,7 @@ fn App() -> impl IntoView {
                     >
                         <MaterialSymbolIcon name="star" filled=true />
                     </button>
-                    <img class="brand-logo" src="/favicon/MewImage01.png" alt="MewImage" />
+                    <img class="brand-logo" src="/favicon/MewImage04.svg" alt="MewImage" />
                     <h1>"MewImage"</h1>
                     <span class="muted">"默认本地模式、登录手动同步~"</span>
                 </div>
@@ -2511,12 +2846,20 @@ fn App() -> impl IntoView {
                                                     on:click=move |_| settings_tab.set("admin".into())
                                                 >
                                                     <MaterialSymbolIcon name="admin_panel_settings" filled=false />
-                                                    <span>"用户审批"</span>
+                                                    <span>"用户管理"</span>
                                                 </button>
                                             }.into_any()
                                         } else {
                                             ().into_any()
                                         }}
+                                        <button
+                                            class="settings-nav-button"
+                                            class:is-active=move || settings_tab.get() == "data"
+                                            on:click=move |_| settings_tab.set("data".into())
+                                        >
+                                            <MaterialSymbolIcon name="database" filled=false />
+                                            <span>"数据管理"</span>
+                                        </button>
                                     </div>
                                     <button
                                         class="settings-nav-button settings-about-button"
@@ -2759,7 +3102,7 @@ fn App() -> impl IntoView {
                                         "admin" => view! {
                                             <section class="stack admin-panel">
                                                 <div class="row admin-panel-header">
-                                                    <h2>"用户审批"</h2>
+                                                    <h2>"用户管理"</h2>
                                                     <button class="button ghost" on:click=refresh_admin_users disabled=move || loading_admin_users.get()>
                                                         {move || if loading_admin_users.get() { "刷新中…" } else { "刷新列表" }}
                                                     </button>
@@ -2778,6 +3121,8 @@ fn App() -> impl IntoView {
                                                             let approve_id = user.id.clone();
                                                             let disable_id = user.id.clone();
                                                             let restore_id = user.id.clone();
+                                                            let delete_id = user.id.clone();
+                                                            let can_delete = user.role != "admin";
                                                             view! {
                                                                 <article class="admin-user-row">
                                                                     <div class="admin-user-main">
@@ -2806,6 +3151,22 @@ fn App() -> impl IntoView {
                                                                                 </button>
                                                                             }.into_any()
                                                                         }}
+                                                                        {if can_delete {
+                                                                            view! {
+                                                                                <button
+                                                                                    class="button ghost danger"
+                                                                                    on:click=move |event: MouseEvent| delete_managed_user(
+                                                                                        delete_id.clone(),
+                                                                                        event.client_x() as f64,
+                                                                                        event.client_y() as f64,
+                                                                                    )
+                                                                                >
+                                                                                    "删除"
+                                                                                </button>
+                                                                            }.into_any()
+                                                                        } else {
+                                                                            ().into_any()
+                                                                        }}
                                                                     </div>
                                                                 </article>
                                                             }.into_any()
@@ -2814,10 +3175,135 @@ fn App() -> impl IntoView {
                                                 </div>
                                             </section>
                                         }.into_any(),
+                                        "data" => view! {
+                                            <section class="stack data-management-panel">
+                                                <div class="row data-management-header">
+                                                    <div>
+                                                        <h2>"数据管理"</h2>
+                                                        <p class="status compact-help">"本地与云端完全分开管理，任何一侧的清除都不会自动影响另一侧。"</p>
+                                                    </div>
+                                                    <span class="tag">"版本化 ZIP 备份"</span>
+                                                </div>
+                                                <div class="auth-mode-tabs data-scope-tabs">
+                                                    <button
+                                                        class="auth-mode-button"
+                                                        class:is-active=move || data_management_tab.get() == "local"
+                                                        on:click=move |_| data_management_tab.set("local".into())
+                                                    >
+                                                        "本地数据"
+                                                    </button>
+                                                    <button
+                                                        class="auth-mode-button"
+                                                        class:is-active=move || data_management_tab.get() == "cloud"
+                                                        on:click=move |_| {
+                                                            data_management_tab.set("cloud".into());
+                                                            refresh_cloud_data_stats();
+                                                        }
+                                                    >
+                                                        "云端数据"
+                                                    </button>
+                                                </div>
+                                                {move || if data_management_tab.get() == "local" {
+                                                    let task_count = tasks.with(|items| items.len());
+                                                    let thread_count = threads.with(|items| items.len());
+                                                    let asset_count = assets.with(|items| items.len());
+                                                    view! {
+                                                        <div class="stack data-scope-content">
+                                                            <div class="data-stat-grid">
+                                                                <div class="data-stat-card"><span>"会话"</span><strong>{thread_count}</strong></div>
+                                                                <div class="data-stat-card"><span>"生成任务"</span><strong>{task_count}</strong></div>
+                                                                <div class="data-stat-card"><span>"本地图片"</span><strong>{asset_count}</strong></div>
+                                                            </div>
+                                                            <article class="data-action-card">
+                                                                <div>
+                                                                    <h3>"备份与恢复"</h3>
+                                                                    <p class="status compact-help">"导出会包含工作区和图片原文件，但不会导出明文 API Key。导入默认按 ID、更新时间和 SHA-256 合并。"</p>
+                                                                </div>
+                                                                <div class="row data-action-buttons">
+                                                                    <button class="button secondary" on:click=export_local_backup disabled=move || data_management_busy.get() || generating.get()>
+                                                                        <MaterialSymbolIcon name="download" filled=false />
+                                                                        "导出 ZIP"
+                                                                    </button>
+                                                                    <button class="button ghost" on:click=move |_| {
+                                                                        if let Some(input) = backup_file_input.get() {
+                                                                            input.click();
+                                                                        }
+                                                                    } disabled=move || data_management_busy.get() || generating.get()>
+                                                                        <MaterialSymbolIcon name="upload" filled=false />
+                                                                        "合并导入"
+                                                                    </button>
+                                                                    <input
+                                                                        node_ref=backup_file_input
+                                                                        class="visually-hidden-file-input"
+                                                                        type="file"
+                                                                        accept=".zip,application/zip"
+                                                                        on:change=import_local_backup
+                                                                    />
+                                                                </div>
+                                                            </article>
+                                                            <article class="data-action-card danger-zone">
+                                                                <div>
+                                                                    <h3>"清除本地数据"</h3>
+                                                                    <p class="status compact-help">"仅清除当前浏览器中的数据；服务器备份和账号不会受影响。"</p>
+                                                                </div>
+                                                                <div class="row data-action-buttons">
+                                                                    <button class="button ghost danger" on:click=move |event| confirm_local_clear(LocalDataClearScope::Workspace, event)>"历史与图片"</button>
+                                                                    <button class="button ghost danger" on:click=move |event| confirm_local_clear(LocalDataClearScope::Configs, event)>"服务商配置"</button>
+                                                                    <button class="button ghost danger" on:click=move |event| confirm_local_clear(LocalDataClearScope::Preferences, event)>"界面偏好"</button>
+                                                                    <button class="button danger" on:click=move |event| confirm_local_clear(LocalDataClearScope::All, event)>"全部本地数据"</button>
+                                                                </div>
+                                                            </article>
+                                                        </div>
+                                                    }.into_any()
+                                                } else {
+                                                    let approved = auth_user.get().map(|user| user.status == "approved").unwrap_or(false);
+                                                    if !approved {
+                                                        view! {
+                                                            <div class="admin-empty data-cloud-locked">
+                                                                <MaterialSymbolIcon name="cloud_off" filled=false />
+                                                                <strong>"云端数据暂不可用"</strong>
+                                                                <span>"登录且账号审批通过后，可查看和清除自己的云端同步数据。游客本地数据不会上传。"</span>
+                                                            </div>
+                                                        }.into_any()
+                                                    } else {
+                                                        let stats = cloud_data_stats.get().unwrap_or_default();
+                                                        view! {
+                                                            <div class="stack data-scope-content">
+                                                                <div class="row cloud-stat-toolbar">
+                                                                    <div class="data-stat-grid cloud-stat-grid">
+                                                                        <div class="data-stat-card"><span>"云端图片"</span><strong>{stats.image_count}</strong></div>
+                                                                        <div class="data-stat-card"><span>"占用空间"</span><strong>{format_byte_size(stats.image_bytes)}</strong></div>
+                                                                        <div class="data-stat-card"><span>"服务商模板"</span><strong>{stats.provider_template_count}</strong></div>
+                                                                        <div class="data-stat-card"><span>"同步快照"</span><strong>{if stats.has_sync_snapshot { "有" } else { "无" }}</strong></div>
+                                                                    </div>
+                                                                    <button class="button ghost icon-button" title="刷新云端统计" on:click=move |_| refresh_cloud_data_stats() disabled=move || data_management_busy.get()>
+                                                                        <MaterialSymbolIcon name="refresh" filled=false />
+                                                                    </button>
+                                                                </div>
+                                                                <article class="data-action-card danger-zone">
+                                                                    <div>
+                                                                        <h3>"清除云端数据"</h3>
+                                                                        <p class="status compact-help">"只删除当前账号的服务器数据；当前浏览器工作区和账号本身都会保留。"</p>
+                                                                    </div>
+                                                                    <div class="row data-action-buttons">
+                                                                        <button class="button ghost danger" on:click=move |event| confirm_cloud_clear(CloudDataClearScope::SyncData, event)>"同步数据与图片"</button>
+                                                                        <button class="button ghost danger" on:click=move |event| confirm_cloud_clear(CloudDataClearScope::ProviderTemplates, event)>"服务商模板"</button>
+                                                                        <button class="button danger" on:click=move |event| confirm_cloud_clear(CloudDataClearScope::All, event)>"全部云端数据"</button>
+                                                                    </div>
+                                                                </article>
+                                                            </div>
+                                                        }.into_any()
+                                                    }
+                                                }}
+                                                {move || data_management_message.get().map(|message| view! {
+                                                    <p class="data-management-message">{message}</p>
+                                                })}
+                                            </section>
+                                        }.into_any(),
                                         "about" => view! {
                                             <section class="stack">
                                                 <div class="settings-about-card">
-                                                    <img class="settings-about-logo" src="/favicon/MewImage01.png" alt="MewImage" />
+                                                    <img class="settings-about-logo" src="/favicon/MewImage04.svg" alt="MewImage" />
                                                     <div class="stack">
                                                         <h2>"关于 MewImage"</h2>
                                                         <p class="status">"一个本地优先、登录后手动同步的可爱图片生成工作台。游客数据默认留在浏览器，服务器只承担代理、账号和可选同步职责。"</p>
@@ -5911,6 +6397,26 @@ async fn fetch_image_bytes_direct(src: &str) -> Result<(Vec<u8>, String), String
     Ok((bytes, mime_type))
 }
 
+async fn fetch_authenticated_image_bytes(src: &str) -> Result<(Vec<u8>, String), String> {
+    let response = Request::get(src)
+        .credentials(web_sys::RequestCredentials::Include)
+        .send()
+        .await
+        .map_err(|error| format!("下载云端图片失败：{error}"))?;
+    if !response.ok() {
+        return Err(format!("下载云端图片失败：HTTP {}", response.status()));
+    }
+    let mime_type = response
+        .headers()
+        .get("content-type")
+        .unwrap_or_else(|| "image/png".into());
+    let bytes = response
+        .binary()
+        .await
+        .map_err(|error| format!("读取云端图片失败：{error}"))?;
+    Ok((bytes, mime_type))
+}
+
 pub(crate) fn blob_from_bytes(bytes: &[u8], mime_type: &str) -> Result<Blob, String> {
     let array = Uint8Array::from(bytes);
     let parts = Array::new();
@@ -5979,6 +6485,71 @@ fn download_image_from_src(src: &str, file_name: &str) -> Result<(), String> {
     anchor.click();
     let _ = body.remove_child(&anchor);
     Ok(())
+}
+
+fn download_backup_bytes(bytes: &[u8]) -> Result<(), String> {
+    let blob = blob_from_bytes(bytes, "application/zip")?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|error| format!("创建备份下载地址失败：{error:?}"))?;
+    let result =
+        download_image_from_src(&url, &format!("mew-image-backup-{}.zip", today_compact()));
+    web_sys::Url::revoke_object_url(&url)
+        .map_err(|error| format!("释放备份下载地址失败：{error:?}"))?;
+    result
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
+fn local_clear_confirmation(scope: LocalDataClearScope) -> (&'static str, &'static str) {
+    match scope {
+        LocalDataClearScope::Workspace => (
+            "清除本地历史与图片",
+            "将永久删除当前浏览器中的会话、任务、收藏和图片原文件；服务商配置与云端数据保留。是否继续？",
+        ),
+        LocalDataClearScope::Configs => (
+            "清除本地服务商配置",
+            "将永久删除当前浏览器保存的服务商配置和明文 API Key，并恢复默认空配置。是否继续？",
+        ),
+        LocalDataClearScope::Preferences => (
+            "重置本地界面偏好",
+            "将重置主题、收藏文件夹和界面偏好；历史图片和服务商配置保留。是否继续？",
+        ),
+        LocalDataClearScope::All => (
+            "清除全部本地数据",
+            "将永久删除当前浏览器中的工作区、图片、配置、API Key 和界面偏好；云端数据与账号保留。是否继续？",
+        ),
+    }
+}
+
+fn cloud_clear_confirmation(scope: &CloudDataClearScope) -> (&'static str, &'static str) {
+    match scope {
+        CloudDataClearScope::SyncData => (
+            "清除云端同步数据",
+            "将永久删除当前账号的云端同步快照、服务器图片和未完成上传；当前浏览器数据保留。是否继续？",
+        ),
+        CloudDataClearScope::ProviderTemplates => (
+            "清除云端服务商模板",
+            "将永久删除当前账号保存到服务器的自定义服务商模板；本地配置保留。是否继续？",
+        ),
+        CloudDataClearScope::All => (
+            "清除全部云端数据",
+            "将永久删除当前账号的所有云端同步数据、服务器图片和自定义模板；账号与当前浏览器数据保留。是否继续？",
+        ),
+    }
 }
 
 async fn import_file_list(files: FileList) -> Result<Vec<ImageAssetRef>, String> {
