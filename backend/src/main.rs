@@ -31,12 +31,12 @@ use mew_image_shared::{
     CloudDataClearScope, CloudDataStatsResponse, GenerateViaProxyRequest, GeneratedImageResult,
     GenerationResult, ImageAssetRef, MeResponse, MergePreviewResponse, ParameterSnapshot,
     ProviderEndpointMode, ProviderKind, ProviderTemplate, ProviderTemplateImportRequest,
-    RegisterRequest, SyncEnvelope, SyncPullResponse, SyncPushRequest, UploadCompleteRequest,
-    UploadCompleteResponse, UploadInitRequest, UploadInitResponse, UserSummary,
-    UsernameAvailabilityResponse, aspect_ratio_from_dimensions, extract_gemini_generation_result,
-    extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes,
-    nano_banana_image_size_from_dimensions, new_id, now_rfc3339,
-    parse_openai_responses_event_stream,
+    RegisterRequest, SyncEntityKind, SyncEnvelope, SyncPullResponse, SyncPushRequest,
+    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
+    UserSummary, UsernameAvailabilityResponse, aspect_ratio_from_dimensions,
+    extract_gemini_generation_result, extract_openai_compatible_result,
+    extract_openai_responses_result, merge_envelopes, nano_banana_image_size_from_dimensions,
+    new_id, now_rfc3339, parse_openai_responses_event_stream,
 };
 use rand::distr::{Alphanumeric, SampleString};
 use reqwest::Url;
@@ -739,6 +739,8 @@ async fn sync_push(
     .await
     .map_err(AppError::internal)?;
 
+    cleanup_tombstoned_assets(&state, &user.id, &merged).await?;
+
     Ok(Json(SyncPullResponse {
         envelope: merged,
         checkpoint: mew_image_shared::SyncCheckpoint {
@@ -748,6 +750,66 @@ async fn sync_push(
             server_cursor: Some(updated_at),
         },
     }))
+}
+
+async fn cleanup_tombstoned_assets(
+    state: &AppState,
+    user_id: &str,
+    envelope: &SyncEnvelope,
+) -> Result<(), AppError> {
+    let active_asset_ids = envelope
+        .assets
+        .iter()
+        .map(|asset| asset.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let deleted_asset_ids = envelope
+        .tombstones
+        .iter()
+        .filter(|item| item.entity_kind == SyncEntityKind::Asset)
+        .map(|item| item.entity_id.as_str())
+        .filter(|asset_id| !active_asset_ids.contains(asset_id))
+        .collect::<BTreeSet<_>>();
+
+    for asset_id in deleted_asset_ids {
+        let row = sqlx::query("SELECT object_key FROM assets WHERE id = ? AND user_id = ?")
+            .bind(asset_id)
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+        let Some(row) = row else {
+            continue;
+        };
+        let object_key = row.get::<String, _>("object_key");
+        let other_references = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM assets WHERE user_id = ? AND object_key = ? AND id != ?",
+        )
+        .bind(user_id)
+        .bind(&object_key)
+        .bind(asset_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+        if other_references == 0 {
+            // 对象删除是幂等的，先删文件可确保失败后仍能通过资产行重试。
+            delete_object(state, &object_key).await?;
+        }
+        let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
+        sqlx::query("DELETE FROM upload_tokens WHERE asset_id = ? AND user_id = ?")
+            .bind(asset_id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?;
+        sqlx::query("DELETE FROM assets WHERE id = ? AND user_id = ?")
+            .bind(asset_id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?;
+        transaction.commit().await.map_err(AppError::internal)?;
+    }
+    Ok(())
 }
 
 async fn sync_pull(
@@ -2721,7 +2783,7 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mew_image_shared::{GenerationRequest, ProviderEndpointMode};
+    use mew_image_shared::{GenerationRequest, ProviderEndpointMode, SyncTombstone};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -2806,5 +2868,113 @@ mod tests {
             result.parameter_snapshot.revised_prompt.as_deref(),
             Some("better prompt")
         );
+    }
+
+    #[tokio::test]
+    async fn tombstone_cleanup_keeps_shared_object_until_last_reference_is_deleted() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_db(&db).await.unwrap();
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let config = AppConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            database_url: "sqlite::memory:".into(),
+            frontend_dist: String::new(),
+            session_secure: false,
+            allowed_web_origins: Vec::new(),
+            trusted_provider_hosts: Vec::new(),
+            enforce_provider_host_whitelist: false,
+            enable_guest_proxy: true,
+            require_login_for_custom_provider: true,
+            admin_setup_token: None,
+            allow_first_admin_setup: false,
+            asset_store: AssetStoreKind::Local,
+            local_asset_dir: asset_dir.to_string_lossy().into_owned(),
+            s3_bucket: String::new(),
+            s3_region: "auto".into(),
+            s3_endpoint: None,
+            s3_access_key: None,
+            s3_secret_key: None,
+        };
+        let state = AppState {
+            config,
+            db,
+            s3: None,
+            http: reqwest::Client::new(),
+            provider_builtins: Vec::new(),
+        };
+        let object_key = "users/user-1/assets/shared.bin";
+        put_object(&state, object_key, "image/png", b"image".to_vec())
+            .await
+            .unwrap();
+        for asset_id in ["asset-1", "asset-2"] {
+            sqlx::query(
+                "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(asset_id)
+            .bind("user-1")
+            .bind(object_key)
+            .bind("image/png")
+            .bind("shared")
+            .bind(5_i64)
+            .bind(now_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let asset_2 = ImageAssetRef {
+            id: "asset-2".into(),
+            sha256: "shared".into(),
+            mime_type: "image/png".into(),
+            byte_len: 5,
+            width: None,
+            height: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            data_url: None,
+            remote_object_key: Some(object_key.into()),
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        };
+        let first_delete = SyncEnvelope {
+            assets: vec![asset_2],
+            tombstones: vec![SyncTombstone {
+                entity_kind: SyncEntityKind::Asset,
+                entity_id: "asset-1".into(),
+                deleted_at: now_rfc3339(),
+            }],
+            ..SyncEnvelope::default()
+        };
+        cleanup_tombstoned_assets(&state, "user-1", &first_delete)
+            .await
+            .unwrap();
+        assert!(
+            local_object_path(&state.config.local_asset_dir, object_key)
+                .unwrap()
+                .exists()
+        );
+
+        let final_delete = SyncEnvelope {
+            tombstones: vec![SyncTombstone {
+                entity_kind: SyncEntityKind::Asset,
+                entity_id: "asset-2".into(),
+                deleted_at: now_rfc3339(),
+            }],
+            ..SyncEnvelope::default()
+        };
+        cleanup_tombstoned_assets(&state, "user-1", &final_delete)
+            .await
+            .unwrap();
+        assert!(
+            !local_object_path(&state.config.local_asset_dir, object_key)
+                .unwrap()
+                .exists()
+        );
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
     }
 }

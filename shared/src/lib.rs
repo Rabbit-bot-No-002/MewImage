@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SYNC_SCHEMA_VERSION: u32 = 1;
+pub const SYNC_SCHEMA_VERSION: u32 = 2;
 
 pub fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
@@ -999,6 +999,8 @@ pub struct SyncEnvelope {
     pub threads: Vec<ConversationThread>,
     pub assets: Vec<ImageAssetRef>,
     pub preferences: AppPreferences,
+    #[serde(default)]
+    pub tombstones: Vec<SyncTombstone>,
 }
 
 impl Default for SyncEnvelope {
@@ -1011,8 +1013,25 @@ impl Default for SyncEnvelope {
             threads: Vec::new(),
             assets: Vec::new(),
             preferences: AppPreferences::default(),
+            tombstones: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncEntityKind {
+    Config,
+    Task,
+    Thread,
+    Asset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncTombstone {
+    pub entity_kind: SyncEntityKind,
+    pub entity_id: String,
+    pub deleted_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1178,6 +1197,8 @@ pub struct LocalAppState {
     pub assets: Vec<ImageAssetRef>,
     pub preferences: AppPreferences,
     pub checkpoint: SyncCheckpoint,
+    #[serde(default)]
+    pub tombstones: Vec<SyncTombstone>,
 }
 
 impl Default for LocalAppState {
@@ -1196,6 +1217,7 @@ impl Default for LocalAppState {
             assets: Vec::new(),
             preferences: AppPreferences::default(),
             checkpoint: SyncCheckpoint::default(),
+            tombstones: Vec::new(),
         }
     }
 }
@@ -1260,19 +1282,78 @@ pub fn merge_records<T: SyncEntity>(left: &[T], right: &[T]) -> Vec<T> {
     values
 }
 
+pub fn merge_tombstones(left: &[SyncTombstone], right: &[SyncTombstone]) -> Vec<SyncTombstone> {
+    let mut merged = HashMap::<(SyncEntityKind, String), SyncTombstone>::new();
+    for item in left.iter().chain(right.iter()) {
+        let key = (item.entity_kind, item.entity_id.clone());
+        match merged.get(&key) {
+            Some(existing) if existing.deleted_at >= item.deleted_at => {}
+            _ => {
+                merged.insert(key, item.clone());
+            }
+        }
+    }
+    let mut values = merged.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        left.deleted_at
+            .cmp(&right.deleted_at)
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
+    });
+    values
+}
+
+pub fn apply_tombstones<T: SyncEntity>(
+    records: Vec<T>,
+    tombstones: &[SyncTombstone],
+    entity_kind: SyncEntityKind,
+) -> Vec<T> {
+    let deleted_at_by_id = tombstones
+        .iter()
+        .filter(|item| item.entity_kind == entity_kind)
+        .map(|item| (item.entity_id.as_str(), item.deleted_at.as_str()))
+        .collect::<HashMap<_, _>>();
+    records
+        .into_iter()
+        .filter(|record| {
+            deleted_at_by_id
+                .get(record.sync_id())
+                .map(|deleted_at| record.sync_updated_at() > *deleted_at)
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
 pub fn merge_envelopes(left: &SyncEnvelope, right: &SyncEnvelope) -> SyncEnvelope {
+    let tombstones = merge_tombstones(&left.tombstones, &right.tombstones);
     SyncEnvelope {
         schema_version: left.schema_version.max(right.schema_version),
         updated_at: left.updated_at.clone().max(right.updated_at.clone()),
-        configs: merge_records(&left.configs, &right.configs),
-        tasks: merge_records(&left.tasks, &right.tasks),
-        threads: merge_records(&left.threads, &right.threads),
-        assets: merge_records(&left.assets, &right.assets),
+        configs: apply_tombstones(
+            merge_records(&left.configs, &right.configs),
+            &tombstones,
+            SyncEntityKind::Config,
+        ),
+        tasks: apply_tombstones(
+            merge_records(&left.tasks, &right.tasks),
+            &tombstones,
+            SyncEntityKind::Task,
+        ),
+        threads: apply_tombstones(
+            merge_records(&left.threads, &right.threads),
+            &tombstones,
+            SyncEntityKind::Thread,
+        ),
+        assets: apply_tombstones(
+            merge_records(&left.assets, &right.assets),
+            &tombstones,
+            SyncEntityKind::Asset,
+        ),
         preferences: if left.updated_at >= right.updated_at {
             left.preferences.clone()
         } else {
             right.preferences.clone()
         },
+        tombstones,
     }
 }
 
@@ -1360,6 +1441,107 @@ mod tests {
         };
         let merged = merge_envelopes(&left, &right);
         assert_eq!(merged.preferences.theme, ThemePreference::Night);
+    }
+
+    #[test]
+    fn newer_tombstone_removes_record_and_blocks_old_device_restore() {
+        let task = LocalTaskRecord {
+            id: "task-1".into(),
+            thread_id: "thread-1".into(),
+            config_id: "config-1".into(),
+            prompt: "test".into(),
+            requested_model: "test".into(),
+            reference_asset_ids: Vec::new(),
+            result: None,
+            favorite: false,
+            favorite_folder_id: None,
+            status: TaskStatus::Failed,
+            error_message: None,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-02T00:00:00+00:00".into(),
+        };
+        let server = SyncEnvelope {
+            tasks: vec![task.clone()],
+            ..SyncEnvelope::default()
+        };
+        let deleting_device = SyncEnvelope {
+            tombstones: vec![SyncTombstone {
+                entity_kind: SyncEntityKind::Task,
+                entity_id: task.id.clone(),
+                deleted_at: "2026-01-03T00:00:00+00:00".into(),
+            }],
+            ..SyncEnvelope::default()
+        };
+        let deleted = merge_envelopes(&server, &deleting_device);
+        assert!(deleted.tasks.is_empty());
+
+        let stale_device = SyncEnvelope {
+            tasks: vec![task],
+            ..SyncEnvelope::default()
+        };
+        assert!(merge_envelopes(&deleted, &stale_device).tasks.is_empty());
+    }
+
+    #[test]
+    fn version_one_snapshot_without_tombstones_remains_readable() {
+        let mut value = serde_json::to_value(SyncEnvelope::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("schema_version".into(), serde_json::json!(1));
+        object.remove("tombstones");
+        let decoded: SyncEnvelope = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.schema_version, 1);
+        assert!(decoded.tombstones.is_empty());
+    }
+
+    #[test]
+    fn record_newer_than_tombstone_can_be_explicitly_restored() {
+        let mut task = LocalTaskRecord {
+            id: "task-1".into(),
+            thread_id: "thread-1".into(),
+            config_id: "config-1".into(),
+            prompt: "restored".into(),
+            requested_model: "test".into(),
+            reference_asset_ids: Vec::new(),
+            result: None,
+            favorite: false,
+            favorite_folder_id: None,
+            status: TaskStatus::Failed,
+            error_message: None,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-04T00:00:00+00:00".into(),
+        };
+        let tombstone = SyncTombstone {
+            entity_kind: SyncEntityKind::Task,
+            entity_id: task.id.clone(),
+            deleted_at: "2026-01-03T00:00:00+00:00".into(),
+        };
+        let merged = merge_envelopes(
+            &SyncEnvelope {
+                tombstones: vec![tombstone],
+                ..SyncEnvelope::default()
+            },
+            &SyncEnvelope {
+                tasks: vec![task.clone()],
+                ..SyncEnvelope::default()
+            },
+        );
+        assert_eq!(merged.tasks, vec![task.clone()]);
+        task.updated_at = "2026-01-03T00:00:00+00:00".into();
+        let equal_timestamp = merge_envelopes(
+            &SyncEnvelope {
+                tombstones: vec![SyncTombstone {
+                    entity_kind: SyncEntityKind::Task,
+                    entity_id: task.id.clone(),
+                    deleted_at: "2026-01-03T00:00:00+00:00".into(),
+                }],
+                ..SyncEnvelope::default()
+            },
+            &SyncEnvelope {
+                tasks: vec![task],
+                ..SyncEnvelope::default()
+            },
+        );
+        assert!(equal_timestamp.tasks.is_empty());
     }
 
     #[test]

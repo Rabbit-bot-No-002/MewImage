@@ -1261,6 +1261,10 @@ body[data-theme="night"] .admin-user-row {
   border-radius: 14px;
 }
 
+.data-action-buttons .button.danger:not(.ghost) {
+  color: #fff;
+}
+
 .danger-zone {
   border-color: color-mix(in srgb, var(--danger) 28%, var(--line));
   background: linear-gradient(145deg, color-mix(in srgb, var(--danger) 7%, var(--panel-strong)), var(--panel-strong));

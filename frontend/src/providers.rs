@@ -6,8 +6,8 @@ use mew_image_shared::{
     ProviderEndpointMode, ProviderKind, ProviderTemplate, SyncCheckpoint, SyncEnvelope,
     aspect_ratio_from_dimensions, extract_gemini_generation_result,
     extract_openai_compatible_result, extract_openai_responses_result, merge_envelopes,
-    merge_records, nano_banana_image_size_from_dimensions, new_id, normalize_api_config,
-    now_rfc3339, parse_openai_responses_event_stream,
+    nano_banana_image_size_from_dimensions, new_id, normalize_api_config, now_rfc3339,
+    parse_openai_responses_event_stream,
 };
 use serde_json::json;
 
@@ -121,6 +121,7 @@ pub fn prepare_sync_envelope(
             .cloned()
             .collect(),
         preferences: state.preferences.clone(),
+        tombstones: state.tombstones.clone(),
     })
 }
 
@@ -138,9 +139,10 @@ pub fn hydrate_local_state(
         threads: local.threads.clone(),
         assets: local.assets.clone(),
         preferences: local.preferences.clone(),
+        tombstones: local.tombstones.clone(),
     };
     let merged = merge_envelopes(&local_envelope, &remote);
-    let mut configs = merge_records(&local.configs, &merged.configs);
+    let mut configs = merged.configs.clone();
     for config in &mut configs {
         normalize_api_config(config);
         if config.api_key_plaintext.is_some() {
@@ -163,7 +165,7 @@ pub fn hydrate_local_state(
         }
     }
 
-    let mut assets = merge_records(&local.assets, &merged.assets);
+    let mut assets = merged.assets.clone();
     for asset in &mut assets {
         if asset.data_url.is_some() {
             continue;
@@ -183,6 +185,7 @@ pub fn hydrate_local_state(
         assets,
         preferences: merged.preferences,
         checkpoint,
+        tombstones: merged.tombstones,
     }
 }
 
@@ -963,4 +966,44 @@ fn mask_key(value: &str) -> String {
         return "******".into();
     }
     format!("{}***{}", &value[..3], &value[value.len() - 3..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mew_image_shared::{SyncEntityKind, SyncTombstone};
+
+    #[test]
+    fn hydrate_does_not_restore_local_asset_removed_by_remote_tombstone() {
+        let mut local = LocalAppState::default();
+        local.assets.push(ImageAssetRef {
+            id: "asset-1".into(),
+            sha256: "hash".into(),
+            mime_type: "image/png".into(),
+            byte_len: 1,
+            width: None,
+            height: None,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+            data_url: Some("data:image/png;base64,AA==".into()),
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        });
+        let hydrated = hydrate_local_state(
+            &local,
+            SyncEnvelope {
+                tombstones: vec![SyncTombstone {
+                    entity_kind: SyncEntityKind::Asset,
+                    entity_id: "asset-1".into(),
+                    deleted_at: "2026-01-02T00:00:00+00:00".into(),
+                }],
+                ..SyncEnvelope::default()
+            },
+            SyncCheckpoint::default(),
+            None,
+        );
+        assert!(hydrated.assets.is_empty());
+    }
 }

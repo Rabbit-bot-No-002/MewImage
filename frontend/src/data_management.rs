@@ -5,7 +5,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use mew_image_shared::{
-    EncryptedApiConfig, LocalAppState, merge_records, new_id, normalize_api_config, now_rfc3339,
+    EncryptedApiConfig, LocalAppState, SyncEntityKind, apply_tombstones, merge_records,
+    merge_tombstones, new_id, normalize_api_config, now_rfc3339,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -251,7 +252,12 @@ fn merge_backup(
     }
     remap_asset_references(&mut imported, &id_remap);
 
-    let mut configs = merge_records(&local.configs, &imported.configs);
+    let tombstones = merge_tombstones(&local.tombstones, &imported.tombstones);
+    let mut configs = apply_tombstones(
+        merge_records(&local.configs, &imported.configs),
+        &tombstones,
+        SyncEntityKind::Config,
+    );
     preserve_local_plaintext_keys(&mut configs, &local.configs);
     for config in &mut configs {
         normalize_api_config(config);
@@ -261,12 +267,22 @@ fn merge_backup(
         .into_iter()
         .filter(|asset| !deduplicated_asset_ids.contains(&asset.id))
         .collect::<Vec<_>>();
-    let assets = merge_records(&local.assets, &imported_assets);
+    let assets = apply_tombstones(
+        merge_records(&local.assets, &imported_assets),
+        &tombstones,
+        SyncEntityKind::Asset,
+    );
+    let active_asset_ids = assets
+        .iter()
+        .map(|asset| asset.id.as_str())
+        .collect::<HashSet<_>>();
     let payloads = imported_payloads
         .into_iter()
         .filter_map(|(id, payload)| {
             let mapped = id_remap.get(&id).cloned().unwrap_or(id);
-            (!local.assets.iter().any(|asset| asset.id == mapped)).then_some((mapped, payload))
+            (active_asset_ids.contains(mapped.as_str())
+                && !local.assets.iter().any(|asset| asset.id == mapped))
+            .then_some((mapped, payload))
         })
         .collect();
     let imported_is_newer = imported
@@ -283,8 +299,16 @@ fn merge_backup(
     (
         LocalAppState {
             configs,
-            tasks: merge_records(&local.tasks, &imported.tasks),
-            threads: merge_records(&local.threads, &imported.threads),
+            tasks: apply_tombstones(
+                merge_records(&local.tasks, &imported.tasks),
+                &tombstones,
+                SyncEntityKind::Task,
+            ),
+            threads: apply_tombstones(
+                merge_records(&local.threads, &imported.threads),
+                &tombstones,
+                SyncEntityKind::Thread,
+            ),
             assets,
             preferences: if imported_is_newer {
                 imported.preferences
@@ -292,6 +316,7 @@ fn merge_backup(
                 local.preferences.clone()
             },
             checkpoint: local.checkpoint.clone(),
+            tombstones,
         },
         payloads,
         deduplicated,

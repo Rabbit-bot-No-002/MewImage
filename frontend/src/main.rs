@@ -22,8 +22,9 @@ use mew_image_shared::{
     CloudDataClearScope, CloudDataStatsResponse, ConversationThread, DEFAULT_FAVORITE_FOLDER_ID,
     EncryptedApiConfig, FavoriteFolder, ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse,
     ProviderAccessMode, ProviderEndpointMode, ProviderKind, ProviderTemplate, RegisterRequest,
-    SyncCheckpoint, SyncPullResponse, TaskStatus, ThemePreference, UserSummary,
-    UsernameAvailabilityResponse, clamp_size, new_id, normalize_api_config, now_rfc3339,
+    SyncCheckpoint, SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus, ThemePreference,
+    UserSummary, UsernameAvailabilityResponse, clamp_size, new_id, normalize_api_config,
+    now_rfc3339,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -191,6 +192,7 @@ fn App() -> impl IntoView {
     let assets = RwSignal::new(Vec::<ImageAssetRef>::new());
     let preferences = RwSignal::new(AppPreferences::default());
     let checkpoint = RwSignal::new(SyncCheckpoint::default());
+    let tombstones = RwSignal::new(Vec::<SyncTombstone>::new());
     let templates = RwSignal::new(vec![
         ProviderTemplate::builtin_openai(),
         ProviderTemplate::builtin_nano_banana(),
@@ -287,12 +289,14 @@ fn App() -> impl IntoView {
         let threads = threads;
         let assets = assets;
         let checkpoint = checkpoint;
+        let tombstones = tombstones;
         move || {
             request_workspace_persist(
                 tasks,
                 threads,
                 assets,
                 checkpoint,
+                tombstones,
                 workspace_persist_scheduled,
                 workspace_persist_inflight,
                 workspace_persist_pending,
@@ -464,6 +468,7 @@ fn App() -> impl IntoView {
         let assets = assets;
         let preferences = preferences;
         let checkpoint = checkpoint;
+        let tombstones = tombstones;
         let templates = templates;
         let auth_user = auth_user;
         let admin_setup_allowed = admin_setup_allowed;
@@ -534,6 +539,7 @@ fn App() -> impl IntoView {
                 assets_signal,
                 preferences,
                 checkpoint,
+                tombstones,
             );
             status_text.set("本地工作台已恢复，缩略图正在后台补全……".into());
 
@@ -558,6 +564,7 @@ fn App() -> impl IntoView {
                     threads,
                     assets_signal,
                     checkpoint,
+                    tombstones,
                     workspace_persist_scheduled,
                     workspace_persist_inflight,
                     workspace_persist_pending,
@@ -615,6 +622,7 @@ fn App() -> impl IntoView {
                         threads,
                         assets_signal_for_thumbs,
                         checkpoint,
+                        tombstones,
                         workspace_persist_scheduled,
                         workspace_persist_inflight,
                         workspace_persist_pending,
@@ -1027,7 +1035,15 @@ fn App() -> impl IntoView {
         }
         syncing.set(true);
         status_text.set("正在同步本地记录到云端……".into());
-        let state = snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
+        let state = snapshot_local_state(
+            configs,
+            tasks,
+            threads,
+            assets,
+            preferences,
+            checkpoint,
+            tombstones,
+        );
         let secret = sync_secret.get_untracked();
         let status_signal = status_text;
         let syncing_signal = syncing;
@@ -1039,6 +1055,15 @@ fn App() -> impl IntoView {
         let preferences_signal = preferences;
         let checkpoint_signal = checkpoint;
         let auth_user_signal = auth_user;
+        let enqueue_deleted_payloads = enqueue_payload_deletes;
+        let selected_reference_ids_signal = selected_reference_ids;
+        let continuation_asset_id_signal = continuation_asset_id;
+        let reference_menu_asset_id_signal = reference_menu_asset_id;
+        let preview_state_signal = preview_state;
+        let preview_panel_state_signal = preview_panel_state;
+        let current_config_id_signal = current_config_id;
+        let current_thread_id_signal = current_thread_id;
+        let draft_prompt_signal = draft_prompt;
         spawn_local(async move {
             let envelope = match prepare_sync_envelope(
                 &state,
@@ -1082,6 +1107,76 @@ fn App() -> impl IntoView {
                         );
                         let mut hydrated = hydrated;
                         reconcile_task_integrity(&mut hydrated.tasks, &hydrated.assets, true);
+                        if hydrated.threads.is_empty() {
+                            hydrated.threads.push(default_thread());
+                        }
+                        let retained_asset_ids = hydrated
+                            .assets
+                            .iter()
+                            .map(|asset| asset.id.as_str())
+                            .collect::<HashSet<_>>();
+                        let removed_asset_ids = state
+                            .assets
+                            .iter()
+                            .filter(|asset| !retained_asset_ids.contains(asset.id.as_str()))
+                            .map(|asset| asset.id.clone())
+                            .collect::<Vec<_>>();
+                        if !removed_asset_ids.is_empty() {
+                            enqueue_deleted_payloads(removed_asset_ids.clone());
+                            selected_reference_ids_signal
+                                .update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
+                            if continuation_asset_id_signal
+                                .get_untracked()
+                                .as_ref()
+                                .map(|id| removed_asset_ids.contains(id))
+                                .unwrap_or(false)
+                            {
+                                continuation_asset_id_signal.set(None);
+                            }
+                            if reference_menu_asset_id_signal
+                                .get_untracked()
+                                .as_ref()
+                                .map(|id| removed_asset_ids.contains(id))
+                                .unwrap_or(false)
+                            {
+                                reference_menu_asset_id_signal.set(None);
+                            }
+                            if preview_state_signal
+                                .get_untracked()
+                                .as_ref()
+                                .map(|preview| removed_asset_ids.contains(&preview.asset_id))
+                                .unwrap_or(false)
+                            {
+                                preview_state_signal.set(None);
+                                preview_panel_state_signal.set(None);
+                            }
+                        }
+                        let current_config_id_value = current_config_id_signal.get_untracked();
+                        if !hydrated
+                            .configs
+                            .iter()
+                            .any(|config| config.id == current_config_id_value)
+                        {
+                            current_config_id_signal.set(
+                                hydrated
+                                    .configs
+                                    .first()
+                                    .map(|config| config.id.clone())
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        let current_thread_id_value = current_thread_id_signal.get_untracked();
+                        if !hydrated
+                            .threads
+                            .iter()
+                            .any(|thread| thread.id == current_thread_id_value)
+                            && let Some(thread) = hydrated.threads.first()
+                        {
+                            current_thread_id_signal.set(thread.id.clone());
+                            draft_prompt_signal.set(thread.draft_prompt.clone());
+                            selected_reference_ids_signal.set(Vec::new());
+                            continuation_asset_id_signal.set(None);
+                        }
                         apply_local_state(
                             hydrated,
                             configs_signal,
@@ -1090,6 +1185,7 @@ fn App() -> impl IntoView {
                             assets_signal,
                             preferences_signal,
                             checkpoint_signal,
+                            tombstones,
                         );
                         persist();
                         persist_ui_state();
@@ -1485,7 +1581,15 @@ fn App() -> impl IntoView {
         }
         data_management_busy.set(true);
         data_management_message.set(Some("正在读取本地图片并生成备份……".into()));
-        let state = snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
+        let state = snapshot_local_state(
+            configs,
+            tasks,
+            threads,
+            assets,
+            preferences,
+            checkpoint,
+            tombstones,
+        );
         spawn_local(async move {
             let asset_ids = state
                 .assets
@@ -1544,7 +1648,15 @@ fn App() -> impl IntoView {
         input.set_value("");
         data_management_busy.set(true);
         data_management_message.set(Some("正在校验并合并本地备份……".into()));
-        let local = snapshot_local_state(configs, tasks, threads, assets, preferences, checkpoint);
+        let local = snapshot_local_state(
+            configs,
+            tasks,
+            threads,
+            assets,
+            preferences,
+            checkpoint,
+            tombstones,
+        );
         spawn_local(async move {
             let file = File::from(file);
             let result = read_as_bytes(&file)
@@ -1585,6 +1697,7 @@ fn App() -> impl IntoView {
                         assets,
                         preferences,
                         checkpoint,
+                        tombstones,
                     );
                     enqueue_payload_writes(imported.payloads);
                     persist_state();
@@ -1629,6 +1742,7 @@ fn App() -> impl IntoView {
             current_thread_id.set(thread.id.clone());
             threads.set(vec![thread]);
             checkpoint.set(SyncCheckpoint::default());
+            tombstones.set(Vec::new());
             draft_prompt.set(String::new());
             selected_reference_ids.set(Vec::new());
             continuation_asset_id.set(None);
@@ -1777,12 +1891,14 @@ fn App() -> impl IntoView {
         configs.update(|items| {
             items.retain(|config| config.id != current.id);
         });
+        record_sync_tombstones(tombstones, [(SyncEntityKind::Config, current.id.clone())]);
         let next_id = configs
             .get_untracked()
             .first()
             .map(|config| config.id.clone())
             .unwrap_or_default();
         current_config_id.set(next_id);
+        persist_state();
         persist_ui_state();
     };
 
@@ -1850,6 +1966,22 @@ fn App() -> impl IntoView {
             })
             .map(|asset| asset.id.clone())
             .collect();
+        let mut deleted_entities =
+            Vec::with_capacity(1 + removed_task_ids.len() + removed_asset_ids.len());
+        deleted_entities.push((SyncEntityKind::Thread, thread_id.clone()));
+        deleted_entities.extend(
+            removed_task_ids
+                .iter()
+                .cloned()
+                .map(|id| (SyncEntityKind::Task, id)),
+        );
+        deleted_entities.extend(
+            removed_asset_ids
+                .iter()
+                .cloned()
+                .map(|id| (SyncEntityKind::Asset, id)),
+        );
+        record_sync_tombstones(tombstones, deleted_entities);
         tasks.update(|items| items.retain(|task| task.thread_id != thread_id));
         assets.update(|items| {
             items.retain(|asset| {
@@ -2051,6 +2183,7 @@ fn App() -> impl IntoView {
             continuation_asset_id.set(None);
         }
         let removed_asset_ids = vec![asset_id.clone()];
+        record_sync_tombstones(tombstones, [(SyncEntityKind::Asset, asset_id.clone())]);
         enqueue_payload_deletes(removed_asset_ids);
         persist_state();
         status_text.set("参考图已删除。".into());
@@ -2109,13 +2242,26 @@ fn App() -> impl IntoView {
             .filter(|asset| asset.source_task_id.as_deref() == Some(task_id.as_str()))
             .map(|asset| asset.id.clone())
             .collect();
+        let mut deleted_entities = Vec::with_capacity(1 + removed_asset_ids.len());
+        deleted_entities.push((SyncEntityKind::Task, task_id.clone()));
+        deleted_entities.extend(
+            removed_asset_ids
+                .iter()
+                .cloned()
+                .map(|id| (SyncEntityKind::Asset, id)),
+        );
+        record_sync_tombstones(tombstones, deleted_entities);
         assets.update(|items| {
             items.retain(|asset| asset.source_task_id.as_deref() != Some(task_id.as_str()));
         });
         tasks.update(|items| items.retain(|task| task.id != task_id));
         threads.update(|items| {
             for thread in items {
+                let previous_len = thread.task_ids.len();
                 thread.task_ids.retain(|id| id != &task_id);
+                if thread.task_ids.len() != previous_len {
+                    thread.updated_at = now_rfc3339();
+                }
             }
         });
         selected_reference_ids.update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
@@ -5273,6 +5419,31 @@ fn normalized_favorite_folders(mut folders: Vec<FavoriteFolder>) -> Vec<Favorite
     folders
 }
 
+fn record_sync_tombstones(
+    tombstones: RwSignal<Vec<SyncTombstone>>,
+    entities: impl IntoIterator<Item = (SyncEntityKind, String)>,
+) {
+    let deleted_at = now_rfc3339();
+    tombstones.update(|items| {
+        for (entity_kind, entity_id) in entities {
+            if let Some(existing) = items
+                .iter_mut()
+                .find(|item| item.entity_kind == entity_kind && item.entity_id == entity_id)
+            {
+                if existing.deleted_at < deleted_at {
+                    existing.deleted_at = deleted_at.clone();
+                }
+            } else {
+                items.push(SyncTombstone {
+                    entity_kind,
+                    entity_id,
+                    deleted_at: deleted_at.clone(),
+                });
+            }
+        }
+    });
+}
+
 fn visible_thread_items(
     threads: &[ConversationThread],
     current_thread_id: &str,
@@ -5567,6 +5738,7 @@ fn request_workspace_persist(
     threads: RwSignal<Vec<ConversationThread>>,
     assets: RwSignal<Vec<ImageAssetRef>>,
     checkpoint: RwSignal<SyncCheckpoint>,
+    tombstones: RwSignal<Vec<SyncTombstone>>,
     scheduled: RwSignal<bool>,
     inflight: RwSignal<bool>,
     pending: RwSignal<bool>,
@@ -5587,13 +5759,13 @@ fn request_workspace_persist(
         }
         pending.set(false);
         inflight.set(true);
-        let snapshot = snapshot_workspace_state(tasks, threads, assets, checkpoint);
+        let snapshot = snapshot_workspace_state(tasks, threads, assets, checkpoint, tombstones);
         spawn_local(async move {
             let _ = save_workspace_snapshot(&snapshot).await;
             inflight.set(false);
             if pending.get_untracked() {
                 request_workspace_persist(
-                    tasks, threads, assets, checkpoint, scheduled, inflight, pending,
+                    tasks, threads, assets, checkpoint, tombstones, scheduled, inflight, pending,
                 );
             }
         });
@@ -5708,6 +5880,7 @@ fn snapshot_local_state(
     assets: RwSignal<Vec<ImageAssetRef>>,
     preferences: RwSignal<AppPreferences>,
     checkpoint: RwSignal<SyncCheckpoint>,
+    tombstones: RwSignal<Vec<SyncTombstone>>,
 ) -> LocalAppState {
     LocalAppState {
         configs: configs.with_untracked(|items| items.clone()),
@@ -5716,6 +5889,7 @@ fn snapshot_local_state(
         assets: assets.with_untracked(|items| items.clone()),
         preferences: preferences.get_untracked(),
         checkpoint: checkpoint.get_untracked(),
+        tombstones: tombstones.get_untracked(),
     }
 }
 
@@ -5724,6 +5898,7 @@ fn snapshot_workspace_state(
     threads: RwSignal<Vec<ConversationThread>>,
     assets: RwSignal<Vec<ImageAssetRef>>,
     checkpoint: RwSignal<SyncCheckpoint>,
+    tombstones: RwSignal<Vec<SyncTombstone>>,
 ) -> LocalAppState {
     LocalAppState {
         configs: Vec::new(),
@@ -5732,6 +5907,7 @@ fn snapshot_workspace_state(
         assets: assets.with_untracked(|items| strip_asset_payloads_for_snapshot(items)),
         preferences: AppPreferences::default(),
         checkpoint: checkpoint.get_untracked(),
+        tombstones: tombstones.get_untracked(),
     }
 }
 
@@ -5743,6 +5919,7 @@ fn apply_local_state(
     assets: RwSignal<Vec<ImageAssetRef>>,
     preferences: RwSignal<AppPreferences>,
     checkpoint: RwSignal<SyncCheckpoint>,
+    tombstones: RwSignal<Vec<SyncTombstone>>,
 ) {
     for config in &mut state.configs {
         normalize_api_config(config);
@@ -5753,6 +5930,7 @@ fn apply_local_state(
     assets.set(state.assets);
     preferences.set(state.preferences);
     checkpoint.set(state.checkpoint);
+    tombstones.set(state.tombstones);
 }
 
 fn resolve_dimensions(
