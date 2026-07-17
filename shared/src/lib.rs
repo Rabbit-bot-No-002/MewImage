@@ -1179,6 +1179,8 @@ pub struct LocalTaskRecord {
     pub favorite: bool,
     #[serde(default)]
     pub favorite_folder_id: Option<String>,
+    #[serde(default)]
+    pub detached_from_thread: bool,
     pub status: TaskStatus,
     pub error_message: Option<String>,
     pub created_at: String,
@@ -1852,6 +1854,7 @@ mod tests {
             result: None,
             favorite: false,
             favorite_folder_id: None,
+            detached_from_thread: false,
             status: TaskStatus::Failed,
             error_message: None,
             created_at: "2026-01-01T00:00:00+00:00".into(),
@@ -1891,6 +1894,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_task_without_detached_flag_remains_readable() {
+        let task = LocalTaskRecord {
+            id: "task-1".into(),
+            thread_id: "thread-1".into(),
+            config_id: "config-1".into(),
+            prompt: "test".into(),
+            requested_model: "test".into(),
+            reference_asset_ids: Vec::new(),
+            generation_settings: None,
+            result: None,
+            favorite: true,
+            favorite_folder_id: Some(DEFAULT_FAVORITE_FOLDER_ID.into()),
+            detached_from_thread: true,
+            status: TaskStatus::Succeeded,
+            error_message: None,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+        };
+        let mut value = serde_json::to_value(task).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("detached_from_thread");
+
+        let decoded: LocalTaskRecord = serde_json::from_value(value).unwrap();
+
+        assert!(!decoded.detached_from_thread);
+    }
+
+    #[test]
     fn record_newer_than_tombstone_can_be_explicitly_restored() {
         let mut task = LocalTaskRecord {
             id: "task-1".into(),
@@ -1903,6 +1936,7 @@ mod tests {
             result: None,
             favorite: false,
             favorite_folder_id: None,
+            detached_from_thread: false,
             status: TaskStatus::Failed,
             error_message: None,
             created_at: "2026-01-01T00:00:00+00:00".into(),
@@ -2126,6 +2160,7 @@ mod tests {
             }),
             favorite: false,
             favorite_folder_id: None,
+            detached_from_thread: false,
             status: TaskStatus::Succeeded,
             error_message: None,
             created_at: now_rfc3339(),

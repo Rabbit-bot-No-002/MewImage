@@ -430,6 +430,7 @@ mod tests {
             result: None,
             favorite: false,
             favorite_folder_id: None,
+            detached_from_thread: true,
             status: mew_image_shared::TaskStatus::Failed,
             error_message: None,
             created_at: now_rfc3339(),
@@ -439,6 +440,7 @@ mod tests {
         let imported = import_backup(&zip, &local).unwrap();
         assert_eq!(imported.state.assets.len(), 1);
         assert_eq!(imported.state.tasks[0].reference_asset_ids, ["local-asset"]);
+        assert!(imported.state.tasks[0].detached_from_thread);
         assert_eq!(imported.deduplicated_asset_count, 1);
     }
 

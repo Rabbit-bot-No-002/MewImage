@@ -183,6 +183,7 @@ fn MaterialSymbolIcon(name: &'static str, filled: bool) -> impl IntoView {
 }
 
 const THUMBNAIL_DATA_URL_KEY: &str = "thumbnail_data_url";
+const FAVORITE_ARCHIVE_ASSET_KEY: &str = "favorite_archive";
 const THUMBNAIL_MAX_EDGE: u32 = 320;
 const GALLERY_PAGE_SIZE: usize = 10;
 const VISIBLE_THREAD_LIMIT: usize = 5;
@@ -750,11 +751,8 @@ fn App() -> impl IntoView {
     });
 
     let reference_assets = Memo::new(move |_| {
-        let thread_id = current_thread_id.get();
         let selected_ids = selected_reference_ids.get();
-        assets.with(|asset_list| {
-            selected_thread_reference_assets(asset_list, &thread_id, &selected_ids)
-        })
+        assets.with(|asset_list| selected_reference_assets(asset_list, &selected_ids))
     });
 
     let continuation_asset = Memo::new(move |_| {
@@ -2242,60 +2240,34 @@ fn App() -> impl IntoView {
     };
 
     let perform_delete_thread = move |thread_id: String| {
-        let removed_task_ids: Vec<String> = tasks
-            .get_untracked()
-            .iter()
-            .filter(|task| task.thread_id == thread_id)
-            .map(|task| task.id.clone())
-            .collect();
-        let removed_asset_ids: Vec<String> = assets
-            .get_untracked()
-            .iter()
-            .filter(|asset| {
-                asset
-                    .metadata
-                    .get("thread_id")
-                    .map(|id| id == &thread_id)
-                    .unwrap_or(false)
-                    || asset
-                        .source_task_id
-                        .as_ref()
-                        .map(|task_id| removed_task_ids.contains(task_id))
-                        .unwrap_or(false)
-            })
-            .map(|asset| asset.id.clone())
-            .collect();
+        let result = delete_thread_preserving_favorites(
+            tasks.get_untracked(),
+            assets.get_untracked(),
+            &thread_id,
+            &now_rfc3339(),
+        );
         let mut deleted_entities =
-            Vec::with_capacity(1 + removed_task_ids.len() + removed_asset_ids.len());
+            Vec::with_capacity(1 + result.removed_task_ids.len() + result.removed_asset_ids.len());
         deleted_entities.push((SyncEntityKind::Thread, thread_id.clone()));
         deleted_entities.extend(
-            removed_task_ids
+            result
+                .removed_task_ids
                 .iter()
                 .cloned()
                 .map(|id| (SyncEntityKind::Task, id)),
         );
         deleted_entities.extend(
-            removed_asset_ids
+            result
+                .removed_asset_ids
                 .iter()
                 .cloned()
                 .map(|id| (SyncEntityKind::Asset, id)),
         );
         record_sync_tombstones(tombstones, deleted_entities);
-        tasks.update(|items| items.retain(|task| task.thread_id != thread_id));
-        assets.update(|items| {
-            items.retain(|asset| {
-                !(asset
-                    .metadata
-                    .get("thread_id")
-                    .map(|id| id == &thread_id)
-                    .unwrap_or(false)
-                    || asset
-                        .source_task_id
-                        .as_ref()
-                        .map(|task_id| removed_task_ids.contains(task_id))
-                        .unwrap_or(false))
-            });
-        });
+        let removed_asset_ids = result.removed_asset_ids.clone();
+        let retained_favorite_count = result.retained_favorite_count;
+        tasks.set(result.tasks);
+        assets.set(result.assets);
         if !removed_asset_ids.is_empty() {
             enqueue_payload_deletes(removed_asset_ids.clone());
         }
@@ -2327,14 +2299,18 @@ fn App() -> impl IntoView {
             continuation_asset_id.set(None);
         }
         persist_state();
-        status_text.set("会话已删除。".into());
+        status_text.set(if retained_favorite_count == 0 {
+            "会话已删除。".into()
+        } else {
+            format!("会话已删除，已在全局收藏夹独立保留 {retained_favorite_count} 条收藏。")
+        });
     };
 
     let delete_thread = move |thread_id: String, x: f64, y: f64| {
         confirm_popover.set(Some(ConfirmPopoverState {
             kind: ConfirmPopoverKind::DeleteThread(thread_id),
             title: "删除会话".into(),
-            message: "删除会话后，会连同该会话的记录与参考图一起移除，是否继续？".into(),
+            message: "删除会话后，未收藏记录会被移除；收藏夹中的提示词、结果图和参考图会独立保留。是否继续？".into(),
             x,
             y,
         }));
@@ -2493,13 +2469,19 @@ fn App() -> impl IntoView {
         let Some(task) = task_list.iter().find(|task| task.id == task_id).cloned() else {
             return;
         };
+        let thread_list = threads.get_untracked();
+        let target_thread_id =
+            task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
         selected_reference_ids.set(task.reference_asset_ids.clone());
         reference_menu_asset_id.set(None);
-        current_thread_id.set(task.thread_id.clone());
+        current_thread_id.set(target_thread_id.clone());
         draft_prompt.set(task.prompt.clone());
         continuation_asset_id.set(None);
         threads.update(|items| {
-            if let Some(thread) = items.iter_mut().find(|thread| thread.id == task.thread_id) {
+            if let Some(thread) = items
+                .iter_mut()
+                .find(|thread| thread.id == target_thread_id)
+            {
                 thread.draft_prompt = task.prompt.clone();
                 thread.updated_at = now_rfc3339();
             }
@@ -2513,13 +2495,19 @@ fn App() -> impl IntoView {
         let Some(task) = task_list.iter().find(|task| task.id == task_id).cloned() else {
             return;
         };
-        current_thread_id.set(task.thread_id.clone());
+        let thread_list = threads.get_untracked();
+        let target_thread_id =
+            task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
+        current_thread_id.set(target_thread_id.clone());
         draft_prompt.set(task.prompt.clone());
         selected_reference_ids.set(task.reference_asset_ids.clone());
         continuation_asset_id.set(Some(asset_id.clone()));
         reference_menu_asset_id.set(None);
         threads.update(|items| {
-            if let Some(thread) = items.iter_mut().find(|thread| thread.id == task.thread_id) {
+            if let Some(thread) = items
+                .iter_mut()
+                .find(|thread| thread.id == target_thread_id)
+            {
                 thread.draft_prompt = task.prompt.clone();
                 thread.updated_at = now_rfc3339();
             }
@@ -2535,12 +2523,45 @@ fn App() -> impl IntoView {
     };
 
     let perform_delete_task = move |task_id: String| {
-        let removed_asset_ids: Vec<String> = assets
-            .get_untracked()
+        let mut next_tasks = tasks.get_untracked();
+        let deleted_reference_ids = next_tasks
             .iter()
-            .filter(|asset| asset.source_task_id.as_deref() == Some(task_id.as_str()))
-            .map(|asset| asset.id.clone())
-            .collect();
+            .find(|task| task.id == task_id)
+            .map(|task| {
+                task.reference_asset_ids
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        next_tasks.retain(|task| task.id != task_id);
+        let remaining_reference_ids = next_tasks
+            .iter()
+            .flat_map(|task| task.reference_asset_ids.iter().cloned())
+            .collect::<HashSet<_>>();
+        let mut next_assets = assets.get_untracked();
+        let mut removed_asset_ids = Vec::new();
+        let updated_at = now_rfc3339();
+        next_assets.retain_mut(|asset| {
+            let generated_by_deleted_task =
+                asset.source_task_id.as_deref() == Some(task_id.as_str());
+            if generated_by_deleted_task && remaining_reference_ids.contains(&asset.id) {
+                asset.source_task_id = None;
+                asset
+                    .metadata
+                    .insert(FAVORITE_ARCHIVE_ASSET_KEY.into(), "true".into());
+                asset.updated_at = updated_at.clone();
+                return true;
+            }
+            let unused_archived_reference = deleted_reference_ids.contains(&asset.id)
+                && !remaining_reference_ids.contains(&asset.id)
+                && asset.metadata.contains_key(FAVORITE_ARCHIVE_ASSET_KEY);
+            if generated_by_deleted_task || unused_archived_reference {
+                removed_asset_ids.push(asset.id.clone());
+                return false;
+            }
+            true
+        });
         let mut deleted_entities = Vec::with_capacity(1 + removed_asset_ids.len());
         deleted_entities.push((SyncEntityKind::Task, task_id.clone()));
         deleted_entities.extend(
@@ -2550,10 +2571,8 @@ fn App() -> impl IntoView {
                 .map(|id| (SyncEntityKind::Asset, id)),
         );
         record_sync_tombstones(tombstones, deleted_entities);
-        assets.update(|items| {
-            items.retain(|asset| asset.source_task_id.as_deref() != Some(task_id.as_str()));
-        });
-        tasks.update(|items| items.retain(|task| task.id != task_id));
+        assets.set(next_assets);
+        tasks.set(next_tasks);
         threads.update(|items| {
             for thread in items {
                 let previous_len = thread.task_ids.len();
@@ -2776,13 +2795,52 @@ fn App() -> impl IntoView {
     };
 
     let cancel_favorite_for_task = move |task_id: String| {
+        let thread_list = threads.get_untracked();
+        let current_id = current_thread_id.get_untracked();
+        let target_thread_id = thread_list
+            .iter()
+            .find(|thread| thread.id == current_id)
+            .or_else(|| thread_list.first())
+            .map(|thread| thread.id.clone())
+            .unwrap_or_default();
+        let mut reattached_reference_ids = None;
         tasks.update(|items| {
             if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
+                if task.detached_from_thread && !target_thread_id.is_empty() {
+                    task.thread_id = target_thread_id.clone();
+                    task.detached_from_thread = false;
+                    reattached_reference_ids = Some(task.reference_asset_ids.clone());
+                }
                 task.favorite = false;
                 task.favorite_folder_id = None;
                 task.updated_at = now_rfc3339();
             }
         });
+        if let Some(reference_ids) = reattached_reference_ids.as_ref() {
+            let reference_ids = reference_ids.iter().collect::<HashSet<_>>();
+            let updated_at = now_rfc3339();
+            assets.update(|items| {
+                for asset in items {
+                    if reference_ids.contains(&asset.id) {
+                        asset
+                            .metadata
+                            .insert("thread_id".into(), target_thread_id.clone());
+                        asset.updated_at = updated_at.clone();
+                    }
+                }
+            });
+            threads.update(|items| {
+                if let Some(thread) = items
+                    .iter_mut()
+                    .find(|thread| thread.id == target_thread_id)
+                {
+                    if !thread.task_ids.contains(&task_id) {
+                        thread.task_ids.push(task_id.clone());
+                    }
+                    thread.updated_at = now_rfc3339();
+                }
+            });
+        }
         preview_panel_state.update(|state| {
             if let Some(state) = state.as_mut() {
                 if state.task_id == task_id {
@@ -2792,6 +2850,9 @@ fn App() -> impl IntoView {
         });
         favorite_folder_picker.set(None);
         persist_state();
+        if reattached_reference_ids.is_some() {
+            status_text.set("已取消收藏，并将归档记录移回当前会话。".into());
+        }
     };
 
     let toggle_favorite_for_task = move |task_id: String, x: f64, y: f64| {
@@ -2906,8 +2967,7 @@ fn App() -> impl IntoView {
             .unwrap_or_else(ProviderTemplate::builtin_openai);
         commit_current_thread_draft();
         let selected_ids = selected_reference_ids.get_untracked();
-        let mut references =
-            selected_thread_reference_assets(&assets.get_untracked(), &thread_id, &selected_ids);
+        let mut references = selected_reference_assets(&assets.get_untracked(), &selected_ids);
         references.truncate(16);
         if let Some(asset_id) = continuation_asset_id.get_untracked() {
             if let Some(asset) = assets
@@ -2981,6 +3041,7 @@ fn App() -> impl IntoView {
                 result: None,
                 favorite: false,
                 favorite_folder_id: None,
+                detached_from_thread: false,
                 status: TaskStatus::Running,
                 error_message: None,
                 created_at: now_rfc3339(),
@@ -3049,8 +3110,7 @@ fn App() -> impl IntoView {
                 return;
             }
             let references = assets_signal.with_untracked(|items| {
-                let mut references =
-                    selected_thread_reference_assets(items, &thread_id, &selected_ids_for_request);
+                let mut references = selected_reference_assets(items, &selected_ids_for_request);
                 references.truncate(16);
                 if let Some(asset_id) = continuation_asset_id_for_request.clone() {
                     if let Some(asset) = items
@@ -3297,8 +3357,11 @@ fn App() -> impl IntoView {
             return;
         };
         let settings = generation_settings_for_rerun(&task, &config);
+        let thread_list = threads.get_untracked();
+        let target_thread_id =
+            task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
 
-        current_thread_id.set(task.thread_id.clone());
+        current_thread_id.set(target_thread_id.clone());
         draft_prompt.set(task.prompt.clone());
         if let Some(textarea) = draft_prompt_ref.get() {
             textarea.set_value(&task.prompt);
@@ -3312,7 +3375,10 @@ fn App() -> impl IntoView {
         custom_width.set(settings.width);
         custom_height.set(settings.height);
         threads.update(|items| {
-            if let Some(thread) = items.iter_mut().find(|thread| thread.id == task.thread_id) {
+            if let Some(thread) = items
+                .iter_mut()
+                .find(|thread| thread.id == target_thread_id)
+            {
                 thread.draft_prompt = task.prompt.clone();
                 thread.updated_at = now_rfc3339();
             }
@@ -6151,22 +6217,129 @@ fn reconcile_task_integrity(
     changed
 }
 
-fn selected_thread_reference_assets(
-    assets: &[ImageAssetRef],
+struct ThreadDeletionResult {
+    tasks: Vec<LocalTaskRecord>,
+    assets: Vec<ImageAssetRef>,
+    removed_task_ids: Vec<String>,
+    removed_asset_ids: Vec<String>,
+    retained_favorite_count: usize,
+}
+
+fn delete_thread_preserving_favorites(
+    mut tasks: Vec<LocalTaskRecord>,
+    mut assets: Vec<ImageAssetRef>,
     thread_id: &str,
+    updated_at: &str,
+) -> ThreadDeletionResult {
+    let thread_tasks = tasks
+        .iter()
+        .filter(|task| task.thread_id == thread_id && !task.detached_from_thread)
+        .collect::<Vec<_>>();
+    let favorite_task_ids = thread_tasks
+        .iter()
+        .filter(|task| task.favorite)
+        .map(|task| task.id.clone())
+        .collect::<HashSet<_>>();
+    let removed_task_ids = thread_tasks
+        .iter()
+        .filter(|task| !task.favorite)
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let removed_task_id_set = removed_task_ids.iter().cloned().collect::<HashSet<_>>();
+    let protected_reference_ids = tasks
+        .iter()
+        .filter(|task| task.favorite)
+        .flat_map(|task| task.reference_asset_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    let removed_reference_ids = thread_tasks
+        .iter()
+        .filter(|task| !task.favorite)
+        .flat_map(|task| task.reference_asset_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+
+    for task in &mut tasks {
+        if favorite_task_ids.contains(&task.id) {
+            task.detached_from_thread = true;
+            task.updated_at = updated_at.to_string();
+        }
+    }
+    tasks.retain(|task| !removed_task_id_set.contains(&task.id));
+
+    let mut removed_asset_ids = Vec::new();
+    assets.retain_mut(|asset| {
+        let belongs_to_thread = asset
+            .metadata
+            .get("thread_id")
+            .map(|value| value == thread_id)
+            .unwrap_or(false);
+        let source_task_id = asset.source_task_id.as_deref();
+        let source_is_favorite = source_task_id
+            .map(|id| favorite_task_ids.contains(id))
+            .unwrap_or(false);
+        let source_is_removed = source_task_id
+            .map(|id| removed_task_id_set.contains(id))
+            .unwrap_or(false);
+        let protected = source_is_favorite || protected_reference_ids.contains(&asset.id);
+        let archived_removed_reference = asset.metadata.contains_key(FAVORITE_ARCHIVE_ASSET_KEY)
+            && removed_reference_ids.contains(&asset.id);
+        let should_remove =
+            (belongs_to_thread || source_is_removed || archived_removed_reference) && !protected;
+        if should_remove {
+            removed_asset_ids.push(asset.id.clone());
+            return false;
+        }
+
+        if protected && belongs_to_thread {
+            asset.metadata.remove("thread_id");
+            asset
+                .metadata
+                .insert(FAVORITE_ARCHIVE_ASSET_KEY.into(), "true".into());
+            asset.updated_at = updated_at.to_string();
+        }
+        if protected && source_is_removed {
+            asset.source_task_id = None;
+            asset
+                .metadata
+                .insert(FAVORITE_ARCHIVE_ASSET_KEY.into(), "true".into());
+            asset.updated_at = updated_at.to_string();
+        }
+        true
+    });
+
+    ThreadDeletionResult {
+        tasks,
+        assets,
+        removed_task_ids,
+        removed_asset_ids,
+        retained_favorite_count: favorite_task_ids.len(),
+    }
+}
+
+fn task_target_thread_id(
+    task: &LocalTaskRecord,
+    threads: &[ConversationThread],
+    current_thread_id: &str,
+) -> String {
+    if !task.detached_from_thread && threads.iter().any(|thread| thread.id == task.thread_id) {
+        return task.thread_id.clone();
+    }
+    if threads.iter().any(|thread| thread.id == current_thread_id) {
+        return current_thread_id.to_string();
+    }
+    threads
+        .first()
+        .map(|thread| thread.id.clone())
+        .unwrap_or_default()
+}
+
+fn selected_reference_assets(
+    assets: &[ImageAssetRef],
     selected_reference_ids: &[String],
 ) -> Vec<ImageAssetRef> {
     let mut selected_assets = Vec::new();
     for selected_id in selected_reference_ids {
         if let Some(asset) = assets.iter().find(|asset| {
-            asset.id == *selected_id
-                && asset.source_task_id.is_none()
-                && !asset.metadata.contains_key("mask_base_asset_id")
-                && asset
-                    .metadata
-                    .get("thread_id")
-                    .map(|value| value == thread_id)
-                    .unwrap_or(false)
+            asset.id == *selected_id && !asset.metadata.contains_key("mask_base_asset_id")
         }) {
             selected_assets.push(asset.clone());
         }
@@ -7480,6 +7653,60 @@ fn mask_key(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_task(
+        id: &str,
+        thread_id: &str,
+        favorite: bool,
+        reference_asset_ids: &[&str],
+    ) -> LocalTaskRecord {
+        LocalTaskRecord {
+            id: id.into(),
+            thread_id: thread_id.into(),
+            config_id: "config-1".into(),
+            prompt: format!("prompt-{id}"),
+            requested_model: "gpt-image-2".into(),
+            reference_asset_ids: reference_asset_ids
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect(),
+            generation_settings: None,
+            result: None,
+            favorite,
+            favorite_folder_id: favorite.then(|| DEFAULT_FAVORITE_FOLDER_ID.into()),
+            detached_from_thread: false,
+            status: TaskStatus::Succeeded,
+            error_message: None,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+        }
+    }
+
+    fn test_asset(
+        id: &str,
+        source_task_id: Option<&str>,
+        thread_id: Option<&str>,
+    ) -> ImageAssetRef {
+        let mut metadata = BTreeMap::new();
+        if let Some(thread_id) = thread_id {
+            metadata.insert("thread_id".into(), thread_id.into());
+        }
+        ImageAssetRef {
+            id: id.into(),
+            sha256: format!("sha-{id}"),
+            mime_type: "image/png".into(),
+            byte_len: 4,
+            width: Some(1),
+            height: Some(1),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+            data_url: None,
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: source_task_id.map(str::to_string),
+            metadata,
+        }
+    }
+
     #[test]
     fn rerun_prefers_historical_generation_settings() {
         let config = providers::default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
@@ -7505,6 +7732,7 @@ mod tests {
             result: None,
             favorite: false,
             favorite_folder_id: None,
+            detached_from_thread: false,
             status: TaskStatus::Succeeded,
             error_message: None,
             created_at: now_rfc3339(),
@@ -7535,5 +7763,97 @@ mod tests {
         assert_eq!(preset_dimensions("2k", "1:1"), (2048, 2048));
         assert_eq!(preset_dimensions("4k", "16:9"), (3840, 2160));
         assert_eq!(preset_dimensions("4k", "1:1"), (2880, 2880));
+    }
+
+    #[test]
+    fn deleting_thread_preserves_favorite_task_and_its_assets() {
+        let tasks = vec![
+            test_task("favorite", "thread-1", true, &["reference"]),
+            test_task("ordinary", "thread-1", false, &[]),
+        ];
+        let assets = vec![
+            test_asset("reference", None, Some("thread-1")),
+            test_asset("favorite-output", Some("favorite"), None),
+            test_asset("ordinary-output", Some("ordinary"), None),
+        ];
+
+        let result = delete_thread_preserving_favorites(
+            tasks,
+            assets,
+            "thread-1",
+            "2026-01-02T00:00:00+00:00",
+        );
+
+        assert_eq!(result.retained_favorite_count, 1);
+        assert_eq!(result.removed_task_ids, ["ordinary"]);
+        assert_eq!(result.removed_asset_ids, ["ordinary-output"]);
+        assert_eq!(result.tasks.len(), 1);
+        assert!(result.tasks[0].detached_from_thread);
+        assert!(
+            result
+                .assets
+                .iter()
+                .any(|asset| asset.id == "favorite-output")
+        );
+        let reference = result
+            .assets
+            .iter()
+            .find(|asset| asset.id == "reference")
+            .unwrap();
+        assert!(!reference.metadata.contains_key("thread_id"));
+        assert_eq!(
+            reference.metadata.get(FAVORITE_ARCHIVE_ASSET_KEY),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn deleting_source_task_preserves_result_referenced_by_favorite() {
+        let tasks = vec![
+            test_task("favorite", "thread-1", true, &["source-output"]),
+            test_task("source", "thread-1", false, &[]),
+        ];
+        let assets = vec![
+            test_asset("favorite-output", Some("favorite"), None),
+            test_asset("source-output", Some("source"), None),
+        ];
+
+        let result = delete_thread_preserving_favorites(
+            tasks,
+            assets,
+            "thread-1",
+            "2026-01-02T00:00:00+00:00",
+        );
+        let source_output = result
+            .assets
+            .iter()
+            .find(|asset| asset.id == "source-output")
+            .unwrap();
+
+        assert_eq!(source_output.source_task_id, None);
+        assert_eq!(
+            source_output.metadata.get(FAVORITE_ARCHIVE_ASSET_KEY),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn selected_archived_references_keep_explicit_order() {
+        let mut archived = test_asset("archived", Some("deleted-source"), None);
+        archived
+            .metadata
+            .insert(FAVORITE_ARCHIVE_ASSET_KEY.into(), "true".into());
+        let current = test_asset("current", None, Some("thread-2"));
+
+        let selected =
+            selected_reference_assets(&[current, archived], &["archived".into(), "current".into()]);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|asset| asset.id.as_str())
+                .collect::<Vec<_>>(),
+            ["archived", "current"]
+        );
     }
 }
