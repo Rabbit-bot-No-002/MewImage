@@ -9,7 +9,7 @@ use mew_image_shared::{
     extract_openai_responses_result, gemini_auth_header, gemini_generate_content_url,
     is_google_official_gemini_base_url, merge_envelopes, nano_banana_image_size_from_dimensions,
     new_id, normalize_api_config, now_rfc3339, parse_openai_responses_event_stream,
-    resolve_responses_main_model,
+    resolve_responses_main_model, strip_successful_task_payloads,
 };
 use serde_json::json;
 
@@ -100,22 +100,41 @@ pub async fn load_templates() -> Result<Vec<ProviderTemplate>, String> {
 pub fn prepare_sync_envelope(
     state: &LocalAppState,
     sync_secret: Option<&str>,
+    sync_api_keys: bool,
 ) -> Result<SyncEnvelope, String> {
+    let encrypted_at = now_rfc3339();
     let mut configs = Vec::with_capacity(state.configs.len());
     for config in &state.configs {
         let mut config = config.clone();
-        if let (Some(secret), Some(plaintext)) = (sync_secret, config.api_key_plaintext.clone()) {
-            config.api_key_encrypted = Some(encrypt_secret(secret, &plaintext)?);
-            config.api_key_hint = Some(mask_key(&plaintext));
+        if sync_api_keys {
+            if let (Some(secret), Some(plaintext)) = (sync_secret, config.api_key_plaintext.clone())
+            {
+                let encrypted_matches = config
+                    .api_key_encrypted
+                    .as_ref()
+                    .and_then(|encrypted| decrypt_secret(secret, encrypted).ok())
+                    .map(|decrypted| decrypted == plaintext)
+                    .unwrap_or(false);
+                if !encrypted_matches {
+                    config.api_key_encrypted = Some(encrypt_secret(secret, &plaintext)?);
+                    config.updated_at = encrypted_at.clone();
+                }
+                config.api_key_hint = Some(mask_key(&plaintext));
+            }
+        } else if config.api_key_encrypted.take().is_some() {
+            config.api_key_hint = None;
+            config.updated_at = encrypted_at.clone();
         }
         config.api_key_plaintext = None;
         configs.push(config);
     }
+    let mut tasks = state.tasks.clone();
+    strip_successful_task_payloads(&mut tasks);
     Ok(SyncEnvelope {
         schema_version: mew_image_shared::SYNC_SCHEMA_VERSION,
         updated_at: now_rfc3339(),
         configs,
-        tasks: state.tasks.clone(),
+        tasks,
         threads: state.threads.clone(),
         assets: state
             .assets
@@ -133,6 +152,7 @@ pub fn hydrate_local_state(
     remote: SyncEnvelope,
     checkpoint: SyncCheckpoint,
     sync_secret: Option<&str>,
+    legacy_sync_secret: Option<&str>,
 ) -> LocalAppState {
     let local_envelope = SyncEnvelope {
         schema_version: mew_image_shared::SYNC_SCHEMA_VERSION,
@@ -151,10 +171,23 @@ pub fn hydrate_local_state(
         if config.api_key_plaintext.is_some() {
             continue;
         }
-        if let (Some(secret), Some(encrypted)) = (sync_secret, config.api_key_encrypted.clone()) {
-            if let Ok(plaintext) = decrypt_secret(secret, &encrypted) {
+        if let Some(encrypted) = config.api_key_encrypted.clone() {
+            let primary_plaintext = sync_secret
+                .and_then(|secret| decrypt_secret(secret, &encrypted).ok())
+                .map(|plaintext| (plaintext, false));
+            let recovered = primary_plaintext.or_else(|| {
+                legacy_sync_secret
+                    .and_then(|secret| decrypt_secret(secret, &encrypted).ok())
+                    .map(|plaintext| (plaintext, true))
+            });
+            if let Some((plaintext, used_legacy_secret)) = recovered {
                 config.api_key_plaintext = Some(plaintext.clone());
                 config.api_key_hint = Some(mask_key(&plaintext));
+                if used_legacy_secret {
+                    // 旧版本直接使用登录密码加密，下次同步时升级为可信设备密钥。
+                    config.api_key_encrypted = None;
+                    config.updated_at = now_rfc3339();
+                }
             }
         }
         if let Some(local_plaintext) = local
@@ -996,7 +1029,60 @@ mod tests {
             },
             SyncCheckpoint::default(),
             None,
+            None,
         );
         assert!(hydrated.assets.is_empty());
+    }
+
+    #[test]
+    fn sync_envelope_encrypts_api_key_without_exposing_plaintext() {
+        let mut state = LocalAppState::default();
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.api_key_plaintext = Some("sk-example".into());
+        state.configs.push(config);
+
+        let envelope = prepare_sync_envelope(&state, Some("trusted-secret"), true).unwrap();
+        let synced = &envelope.configs[0];
+        assert!(synced.api_key_plaintext.is_none());
+        assert!(synced.api_key_encrypted.is_some());
+        assert_eq!(
+            decrypt_secret("trusted-secret", synced.api_key_encrypted.as_ref().unwrap()).unwrap(),
+            "sk-example"
+        );
+    }
+
+    #[test]
+    fn disabling_api_key_sync_removes_ciphertext() {
+        let mut state = LocalAppState::default();
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.api_key_plaintext = Some("sk-example".into());
+        config.api_key_encrypted = Some(encrypt_secret("trusted-secret", "sk-example").unwrap());
+        state.configs.push(config);
+
+        let envelope = prepare_sync_envelope(&state, None, false).unwrap();
+        assert!(envelope.configs[0].api_key_plaintext.is_none());
+        assert!(envelope.configs[0].api_key_encrypted.is_none());
+    }
+
+    #[test]
+    fn legacy_password_ciphertext_is_recovered_for_migration() {
+        let local = LocalAppState::default();
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.api_key_encrypted = Some(encrypt_secret("old-password", "sk-example").unwrap());
+        let remote = SyncEnvelope {
+            configs: vec![config],
+            ..SyncEnvelope::default()
+        };
+
+        let hydrated = hydrate_local_state(
+            &local,
+            remote,
+            SyncCheckpoint::default(),
+            Some("trusted-secret"),
+            Some("old-password"),
+        );
+        let recovered = &hydrated.configs[0];
+        assert_eq!(recovered.api_key_plaintext.as_deref(), Some("sk-example"));
+        assert!(recovered.api_key_encrypted.is_none());
     }
 }

@@ -43,6 +43,7 @@ use mew_image_shared::{
     gemini_generate_content_url, is_google_official_gemini_base_url, merge_envelopes,
     nano_banana_image_size_from_dimensions, new_id, now_rfc3339,
     parse_openai_responses_event_stream, resolve_responses_main_model,
+    strip_successful_task_payloads,
 };
 use rand::distr::{Alphanumeric, SampleString};
 use reqwest::Url;
@@ -292,6 +293,9 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(db)
     .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS assets_user_sha256 ON assets(user_id, sha256)")
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -1405,12 +1409,14 @@ async fn load_sync_envelope(db: &SqlitePool, user_id: &str) -> Result<SyncEnvelo
         .await
         .map_err(AppError::internal)?;
 
-    match row {
+    let mut envelope = match row {
         Some(row) => {
-            serde_json::from_str(&row.get::<String, _>("payload")).map_err(AppError::internal)
+            serde_json::from_str(&row.get::<String, _>("payload")).map_err(AppError::internal)?
         }
-        None => Ok(SyncEnvelope::default()),
-    }
+        None => SyncEnvelope::default(),
+    };
+    strip_successful_task_payloads(&mut envelope.tasks);
+    Ok(envelope)
 }
 
 async fn normalize_envelope_assets(
@@ -1421,39 +1427,108 @@ async fn normalize_envelope_assets(
     for config in &mut envelope.configs {
         config.api_key_plaintext = None;
     }
+    strip_successful_task_payloads(&mut envelope.tasks);
     for asset in &mut envelope.assets {
-        if asset.remote_object_key.is_some() {
+        if let Some(object_key) = asset.remote_object_key.take() {
+            if is_user_asset_object_key(&object_key, user_id, &asset.sha256) {
+                asset.remote_object_key = Some(object_key.clone());
+                asset.remote_url = Some(format!("/api/assets/{}", asset.id));
+                asset.data_url = None;
+                let mime_type = asset.mime_type.clone();
+                upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
+                continue;
+            }
+            warn!(
+                "ignored invalid synced object key for user {}: {}",
+                user_id, object_key
+            );
+        }
+
+        if let Some((object_key, mime_type, byte_len)) =
+            find_existing_asset_object(&state.db, user_id, &asset.sha256).await?
+        {
+            asset.remote_object_key = Some(object_key.clone());
             asset.remote_url = Some(format!("/api/assets/{}", asset.id));
             asset.data_url = None;
+            asset.mime_type = mime_type.clone();
+            asset.byte_len = byte_len.max(0) as u64;
+            upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
             continue;
         }
-        let Some(data_url) = asset.data_url.clone() else {
+
+        let Some(data_url) = asset.data_url.take() else {
             continue;
         };
         let (mime_type, bytes) = decode_data_url(&data_url)?;
         let object_key = format!("users/{user_id}/assets/{}.bin", asset.sha256);
         put_object(state, &object_key, &mime_type, bytes).await?;
-        asset.remote_object_key = Some(object_key);
+        asset.remote_object_key = Some(object_key.clone());
         asset.remote_url = Some(format!("/api/assets/{}", asset.id));
-        asset.data_url = None;
-
-        sqlx::query(
-            "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET object_key = excluded.object_key, mime_type = excluded.mime_type, sha256 = excluded.sha256, byte_len = excluded.byte_len",
-        )
-        .bind(&asset.id)
-        .bind(user_id)
-        .bind(asset.remote_object_key.as_deref().unwrap_or_default())
-        .bind(&mime_type)
-        .bind(&asset.sha256)
-        .bind(asset.byte_len as i64)
-        .bind(&asset.created_at)
-        .execute(&state.db)
-        .await
-        .map_err(AppError::internal)?;
+        upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
     }
     envelope.updated_at = now_rfc3339();
     Ok(envelope)
+}
+
+fn is_user_asset_object_key(object_key: &str, user_id: &str, sha256: &str) -> bool {
+    let expected_prefix = format!("users/{user_id}/assets/{sha256}");
+    object_key
+        .strip_prefix(&expected_prefix)
+        .map(|suffix| {
+            matches!(suffix.as_bytes().first(), Some(b'.' | b'-'))
+                && !suffix.contains('/')
+                && !suffix.contains("..")
+        })
+        .unwrap_or(false)
+}
+
+async fn find_existing_asset_object(
+    db: &SqlitePool,
+    user_id: &str,
+    sha256: &str,
+) -> Result<Option<(String, String, i64)>, AppError> {
+    sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT object_key, mime_type, byte_len FROM assets
+         WHERE user_id = ? AND sha256 = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(sha256)
+    .fetch_optional(db)
+    .await
+    .map_err(AppError::internal)
+}
+
+async fn upsert_asset_index(
+    state: &AppState,
+    user_id: &str,
+    asset: &ImageAssetRef,
+    object_key: &str,
+    mime_type: &str,
+) -> Result<(), AppError> {
+    let result = sqlx::query(
+        "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             object_key = excluded.object_key,
+             mime_type = excluded.mime_type,
+             sha256 = excluded.sha256,
+             byte_len = excluded.byte_len
+         WHERE assets.user_id = excluded.user_id",
+    )
+    .bind(&asset.id)
+    .bind(user_id)
+    .bind(object_key)
+    .bind(mime_type)
+    .bind(&asset.sha256)
+    .bind(asset.byte_len as i64)
+    .bind(&asset.created_at)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::bad_request("图片资源 ID 与其他用户冲突。"));
+    }
+    Ok(())
 }
 
 async fn put_object(
@@ -2855,6 +2930,30 @@ mod tests {
         let (mime, bytes) = decode_data_url("data:text/plain;base64,aGVsbG8=").unwrap();
         assert_eq!(mime, "text/plain");
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn synced_object_key_must_stay_in_current_user_asset_namespace() {
+        assert!(is_user_asset_object_key(
+            "users/user-1/assets/hash.bin",
+            "user-1",
+            "hash"
+        ));
+        assert!(is_user_asset_object_key(
+            "users/user-1/assets/hash-image.png",
+            "user-1",
+            "hash"
+        ));
+        assert!(!is_user_asset_object_key(
+            "users/user-2/assets/hash.bin",
+            "user-1",
+            "hash"
+        ));
+        assert!(!is_user_asset_object_key(
+            "users/user-1/assets/hash/other.bin",
+            "user-1",
+            "hash"
+        ));
     }
 
     #[test]

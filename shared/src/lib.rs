@@ -1185,6 +1185,27 @@ pub struct LocalTaskRecord {
     pub updated_at: String,
 }
 
+/// 成功任务的图片本体由 ImageAssetRef 管理，任务中只保留结果数量和参数快照。
+pub fn strip_successful_task_payloads(tasks: &mut [LocalTaskRecord]) -> bool {
+    let mut changed = false;
+    for task in tasks {
+        if task.status != TaskStatus::Succeeded {
+            continue;
+        }
+        let Some(result) = task.result.as_mut() else {
+            continue;
+        };
+        for image in &mut result.images {
+            changed |= image.url.is_some() || image.data_url.is_some();
+            image.url = None;
+            image.data_url = None;
+        }
+        changed |= result.raw_response_json.is_some();
+        result.raw_response_json = None;
+    }
+    changed
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConversationThread {
     pub id: String,
@@ -2083,6 +2104,50 @@ mod tests {
         let mut accumulator = OpenAiResponsesStreamAccumulator::new();
         let error = accumulator.push_chunk(stream.as_bytes()).unwrap_err();
         assert!(error.contains("quota exceeded"));
+    }
+
+    #[test]
+    fn successful_task_payloads_are_removed_without_losing_image_count() {
+        let mut tasks = vec![LocalTaskRecord {
+            id: "task-1".into(),
+            thread_id: "thread-1".into(),
+            config_id: "config-1".into(),
+            prompt: "test".into(),
+            requested_model: "model".into(),
+            reference_asset_ids: Vec::new(),
+            generation_settings: None,
+            result: Some(GenerationResult {
+                images: vec![GeneratedImageResult {
+                    url: Some("https://example.com/image.png".into()),
+                    data_url: Some("data:image/png;base64,aGVsbG8=".into()),
+                }],
+                parameter_snapshot: ParameterSnapshot::default(),
+                raw_response_json: Some(serde_json::json!({ "result": "aGVsbG8=" })),
+            }),
+            favorite: false,
+            favorite_folder_id: None,
+            status: TaskStatus::Succeeded,
+            error_message: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        }];
+
+        let mut failed_tasks = tasks.clone();
+        failed_tasks[0].status = TaskStatus::Failed;
+        assert!(!strip_successful_task_payloads(&mut failed_tasks));
+        assert!(
+            failed_tasks[0].result.as_ref().unwrap().images[0]
+                .data_url
+                .is_some()
+        );
+
+        assert!(strip_successful_task_payloads(&mut tasks));
+
+        let result = tasks[0].result.as_ref().unwrap();
+        assert_eq!(result.images.len(), 1);
+        assert!(result.images[0].url.is_none());
+        assert!(result.images[0].data_url.is_none());
+        assert!(result.raw_response_json.is_none());
     }
 
     #[test]

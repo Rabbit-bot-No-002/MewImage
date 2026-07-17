@@ -10,6 +10,61 @@ const ASSET_STORE_NAME: &str = "asset_payloads";
 const SNAPSHOT_KEY: &str = "app_state";
 const CONFIGS_KEY: &str = "configs_state";
 const PREFERENCES_KEY: &str = "preferences_state";
+const TRUSTED_SYNC_KEY_PREFIX: &str = "mew-image-trusted-sync-key:";
+const API_KEY_SYNC_ENABLED_PREFIX: &str = "mew-image-api-key-sync-enabled:";
+
+pub fn load_trusted_sync_secret(user_id: &str) -> Option<String> {
+    local_storage_value(&format!("{TRUSTED_SYNC_KEY_PREFIX}{user_id}"))
+}
+
+pub fn save_trusted_sync_secret(user_id: &str, secret: &str) -> Result<(), String> {
+    set_local_storage_value(&format!("{TRUSTED_SYNC_KEY_PREFIX}{user_id}"), secret)
+}
+
+pub fn clear_trusted_sync_secret(user_id: &str) -> Result<(), String> {
+    let Some(storage) = web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+    else {
+        return Err("浏览器本地存储不可用".into());
+    };
+    storage
+        .remove_item(&format!("{TRUSTED_SYNC_KEY_PREFIX}{user_id}"))
+        .map_err(|error| format!("{error:?}"))
+}
+
+pub fn load_api_key_sync_enabled(user_id: &str) -> bool {
+    local_storage_value(&format!("{API_KEY_SYNC_ENABLED_PREFIX}{user_id}"))
+        .map(|value| value != "false")
+        .unwrap_or(true)
+}
+
+pub fn save_api_key_sync_enabled(user_id: &str, enabled: bool) -> Result<(), String> {
+    set_local_storage_value(
+        &format!("{API_KEY_SYNC_ENABLED_PREFIX}{user_id}"),
+        if enabled { "true" } else { "false" },
+    )
+}
+
+fn local_storage_value(key: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+        .and_then(|storage| storage.get_item(key).ok())
+        .flatten()
+}
+
+fn set_local_storage_value(key: &str, value: &str) -> Result<(), String> {
+    let Some(storage) = web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+    else {
+        return Err("浏览器本地存储不可用".into());
+    };
+    storage
+        .set_item(key, value)
+        .map_err(|error| format!("{error:?}"))
+}
 
 async fn open_db() -> Result<Rexie, String> {
     Rexie::builder(DB_NAME)

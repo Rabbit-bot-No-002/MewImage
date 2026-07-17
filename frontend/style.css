@@ -1086,6 +1086,64 @@ body[data-theme="night"] .settings-nav-button.is-active {
   font-weight: 700;
 }
 
+.auth-action-row {
+  align-items: flex-start;
+}
+
+.sync-action-control {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 260px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.sync-status-message {
+  margin: 0;
+  max-width: 100%;
+}
+
+.sync-key-settings {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.28);
+}
+
+body[data-theme="night"] .sync-key-settings {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sync-key-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+}
+
+.sync-key-toggle-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--primary);
+}
+
+.sync-key-state {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.sync-key-unlock-row {
+  flex-wrap: nowrap;
+}
+
+.sync-key-unlock-row .text-input {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
 .admin-bootstrap-block {
   gap: 8px;
 }
@@ -1136,6 +1194,25 @@ body[data-theme="night"] .settings-nav-button.is-active {
 .settings-config-actions .select-input {
   flex: 1 1 0;
   min-width: 0;
+}
+
+.api-key-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px 38px;
+  gap: 8px;
+  align-items: center;
+}
+
+.api-key-tool-button {
+  width: 38px;
+  height: 38px;
+  min-height: 38px;
+  padding: 0;
+  border-radius: 13px;
+}
+
+.api-key-copy-feedback {
+  margin-top: -4px;
 }
 
 .compact-help {
@@ -2107,6 +2184,14 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 }
 
 @media (max-width: 640px) {
+  .sync-key-unlock-row {
+    flex-wrap: wrap;
+  }
+
+  .sync-key-unlock-row .button {
+    width: 100%;
+  }
+
   .favorite-gallery-grid {
     grid-template-columns: 1fr;
   }

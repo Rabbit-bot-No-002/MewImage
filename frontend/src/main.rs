@@ -11,6 +11,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use crypto::derive_trusted_sync_secret;
 use gloo_file::{File, futures::read_as_bytes, futures::read_as_data_url};
 use gloo_net::http::Request;
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
@@ -24,7 +25,7 @@ use mew_image_shared::{
     LocalTaskRecord, MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
     ProviderTemplate, RegisterRequest, SyncCheckpoint, SyncEntityKind, SyncPullResponse,
     SyncTombstone, TaskStatus, ThemePreference, UserSummary, UsernameAvailabilityResponse,
-    clamp_size, new_id, normalize_api_config, now_rfc3339,
+    clamp_size, new_id, normalize_api_config, now_rfc3339, strip_successful_task_payloads,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -33,8 +34,9 @@ use providers::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use storage::{
-    apply_asset_payload_changes, clear_asset_payloads, load_asset_payloads, load_snapshot,
-    save_ui_state, save_workspace_snapshot,
+    apply_asset_payload_changes, clear_asset_payloads, clear_trusted_sync_secret,
+    load_api_key_sync_enabled, load_asset_payloads, load_snapshot, load_trusted_sync_secret,
+    save_api_key_sync_enabled, save_trusted_sync_secret, save_ui_state, save_workspace_snapshot,
 };
 use wasm_bindgen::{JsCast, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
@@ -217,6 +219,10 @@ fn App() -> impl IntoView {
     let admin_users = RwSignal::new(Vec::<AdminUserSummary>::new());
     let loading_admin_users = RwSignal::new(false);
     let sync_secret = RwSignal::new(String::new());
+    let legacy_sync_secret = RwSignal::new(String::new());
+    let sync_api_keys_enabled = RwSignal::new(true);
+    let sync_unlock_password = RwSignal::new(String::new());
+    let sync_unlocking = RwSignal::new(false);
     let current_thread_id = RwSignal::new(String::new());
     let current_config_id = RwSignal::new(String::new());
     let selected_reference_ids = RwSignal::new(Vec::<String>::new());
@@ -237,6 +243,7 @@ fn App() -> impl IntoView {
         "准备就绪，当前默认是游客本地 + 受限代理模式：数据留在浏览器，本服务仅对受信任图像上游做临时中转。"
             .to_string(),
     );
+    let sync_status_text = RwSignal::new(None::<String>);
     let generating = RwSignal::new(false);
     let generation_cancel_requested = RwSignal::new(false);
     let generation_abort_controller = RwSignal::new(None::<web_sys::AbortController>);
@@ -474,6 +481,9 @@ fn App() -> impl IntoView {
         let tombstones = tombstones;
         let templates = templates;
         let auth_user = auth_user;
+        let sync_secret = sync_secret;
+        let sync_api_keys_enabled = sync_api_keys_enabled;
+        let sync_status_text = sync_status_text;
         let admin_setup_allowed = admin_setup_allowed;
         let current_thread_id = current_thread_id;
         let current_config_id = current_config_id;
@@ -509,6 +519,7 @@ fn App() -> impl IntoView {
             for config in &mut state.configs {
                 normalize_api_config(config);
             }
+            let stripped_task_payloads = strip_successful_task_payloads(&mut state.tasks);
             state
                 .assets
                 .retain(|asset| !asset.metadata.contains_key("mask_base_asset_id"));
@@ -562,6 +573,8 @@ fn App() -> impl IntoView {
                     payload_flush_inflight,
                     payload_flush_pending,
                 );
+            }
+            if had_embedded_payloads || stripped_task_payloads {
                 request_workspace_persist(
                     tasks_signal,
                     threads,
@@ -646,6 +659,22 @@ fn App() -> impl IntoView {
                 .await
             {
                 if let Ok(me) = response.json::<MeResponse>().await {
+                    if let Some(user) = me.user.as_ref() {
+                        let enabled = load_api_key_sync_enabled(&user.id);
+                        sync_api_keys_enabled.set(enabled);
+                        if enabled {
+                            if let Some(secret) = load_trusted_sync_secret(&user.id) {
+                                sync_secret.set(secret);
+                                sync_status_text
+                                    .set(Some("可信设备已解锁，可同步 API Key。".into()));
+                            } else {
+                                sync_status_text.set(Some(
+                                    "当前登录会话尚未解锁 API Key 同步，请输入账号密码解锁。"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     auth_user.set(me.user);
                 }
             }
@@ -1036,15 +1065,15 @@ fn App() -> impl IntoView {
 
     let sync_action = move || {
         let Some(user) = auth_user.get_untracked() else {
-            status_text.set("登录后才会启用跨设备同步。".into());
+            sync_status_text.set(Some("登录后才会启用跨设备同步。".into()));
             return;
         };
         if user.status != "approved" {
-            status_text.set("账号仍在等待管理员审批，暂不能使用云端同步。".into());
+            sync_status_text.set(Some("账号仍在等待管理员审批，暂不能使用云端同步。".into()));
             return;
         }
         syncing.set(true);
-        status_text.set("正在同步本地记录到云端……".into());
+        sync_status_text.set(Some("正在整理本地同步数据……".into()));
         let state = snapshot_local_state(
             configs,
             tasks,
@@ -1054,8 +1083,38 @@ fn App() -> impl IntoView {
             checkpoint,
             tombstones,
         );
+        let sync_api_keys = sync_api_keys_enabled.get_untracked();
+        let has_api_key_material = state
+            .configs
+            .iter()
+            .any(|config| config.api_key_plaintext.is_some() || config.api_key_encrypted.is_some());
+        if sync_api_keys && sync_secret.get_untracked().is_empty() && has_api_key_material {
+            syncing.set(false);
+            sync_status_text.set(Some(
+                "API Key 同步尚未解锁，请先在下方输入账号密码完成可信设备解锁。".into(),
+            ));
+            return;
+        }
+        let pending_asset_count = state
+            .assets
+            .iter()
+            .filter(|asset| asset.remote_object_key.is_none())
+            .count();
+        let pending_asset_bytes = state
+            .assets
+            .iter()
+            .filter(|asset| asset.remote_object_key.is_none())
+            .map(|asset| asset.byte_len)
+            .sum::<u64>();
+        let resident_payload_ids = state
+            .assets
+            .iter()
+            .filter(|asset| asset.data_url.is_some())
+            .map(|asset| asset.id.clone())
+            .collect::<HashSet<_>>();
         let secret = sync_secret.get_untracked();
-        let status_signal = status_text;
+        let legacy_secret = legacy_sync_secret.get_untracked();
+        let status_signal = sync_status_text;
         let syncing_signal = syncing;
         let persist = persist_state;
         let configs_signal = configs;
@@ -1075,21 +1134,59 @@ fn App() -> impl IntoView {
         let current_thread_id_signal = current_thread_id;
         let draft_prompt_signal = draft_prompt;
         spawn_local(async move {
+            let started_at = js_sys::Date::now();
+            let mut state = state;
+            let missing_payload_ids = state
+                .assets
+                .iter()
+                .filter(|asset| asset.remote_object_key.is_none() && asset.data_url.is_none())
+                .map(|asset| asset.id.clone())
+                .collect::<Vec<_>>();
+            if !missing_payload_ids.is_empty() {
+                status_signal.set(Some(format!(
+                    "正在读取 {} 张本地图片……",
+                    missing_payload_ids.len()
+                )));
+                match load_asset_payloads(&missing_payload_ids).await {
+                    Ok(payloads) => {
+                        let _ = merge_asset_payloads(&mut state.assets, &payloads);
+                    }
+                    Err(error) => {
+                        syncing_signal.set(false);
+                        status_signal.set(Some(format!("读取本地图片失败：{error}")));
+                        return;
+                    }
+                }
+            }
+            status_signal.set(Some(if pending_asset_count == 0 {
+                "正在同步配置、会话和图片索引……".into()
+            } else {
+                format!(
+                    "正在同步 {pending_asset_count} 张新图片，约 {}……",
+                    format_byte_size(pending_asset_bytes)
+                )
+            }));
             let envelope = match prepare_sync_envelope(
                 &state,
-                if secret.is_empty() {
+                if !sync_api_keys || secret.is_empty() {
                     None
                 } else {
                     Some(secret.as_str())
                 },
+                sync_api_keys,
             ) {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     syncing_signal.set(false);
-                    status_signal.set(format!("同步前加密失败：{error}"));
+                    status_signal.set(Some(format!("同步前加密失败：{error}")));
                     return;
                 }
             };
+            for asset in &mut state.assets {
+                if !resident_payload_ids.contains(&asset.id) {
+                    asset.data_url = None;
+                }
+            }
             let request = mew_image_shared::SyncPushRequest {
                 client_updated_at: now_rfc3339(),
                 envelope,
@@ -1099,9 +1196,10 @@ fn App() -> impl IntoView {
                 .json(&request);
             let Ok(builder) = response else {
                 syncing_signal.set(false);
-                status_signal.set("同步请求序列化失败。".into());
+                status_signal.set(Some("同步请求序列化失败。".into()));
                 return;
             };
+            let request_started_at = js_sys::Date::now();
             match builder.send().await {
                 Ok(response) if response.ok() => match response.json::<SyncPullResponse>().await {
                     Ok(pulled) => {
@@ -1109,14 +1207,53 @@ fn App() -> impl IntoView {
                             &state,
                             pulled.envelope,
                             pulled.checkpoint,
-                            if secret.is_empty() {
+                            if !sync_api_keys || secret.is_empty() {
                                 None
                             } else {
                                 Some(secret.as_str())
                             },
+                            if !sync_api_keys || legacy_secret.is_empty() {
+                                None
+                            } else {
+                                Some(legacy_secret.as_str())
+                            },
                         );
                         let mut hydrated = hydrated;
                         reconcile_task_integrity(&mut hydrated.tasks, &hydrated.assets, true);
+                        let needs_legacy_key_migration = sync_api_keys
+                            && hydrated.configs.iter().any(|config| {
+                                config.api_key_plaintext.is_some()
+                                    && config.api_key_encrypted.is_none()
+                            });
+                        if needs_legacy_key_migration && !secret.is_empty() {
+                            let mut migration_state = hydrated.clone();
+                            for asset in &mut migration_state.assets {
+                                asset.data_url = None;
+                            }
+                            if let Ok(envelope) =
+                                prepare_sync_envelope(&migration_state, Some(secret.as_str()), true)
+                            {
+                                let migration_request = mew_image_shared::SyncPushRequest {
+                                    client_updated_at: now_rfc3339(),
+                                    envelope,
+                                };
+                                if let Ok(builder) = Request::post(&api_url("/api/sync/push"))
+                                    .credentials(web_sys::RequestCredentials::Include)
+                                    .json(&migration_request)
+                                    && let Ok(response) = builder.send().await
+                                    && response.ok()
+                                    && let Ok(migrated) = response.json::<SyncPullResponse>().await
+                                {
+                                    hydrated = hydrate_local_state(
+                                        &hydrated,
+                                        migrated.envelope,
+                                        migrated.checkpoint,
+                                        Some(secret.as_str()),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
                         if hydrated.threads.is_empty() {
                             hydrated.threads.push(default_thread());
                         }
@@ -1199,7 +1336,12 @@ fn App() -> impl IntoView {
                         );
                         persist();
                         persist_ui_state();
-                        status_signal.set(format!("已完成与 {} 的云端同步。", user.username));
+                        let elapsed_seconds = (js_sys::Date::now() - started_at) / 1_000.0;
+                        let remote_seconds = (js_sys::Date::now() - request_started_at) / 1_000.0;
+                        status_signal.set(Some(format!(
+                            "已完成与 {} 的云端同步，总用时 {:.1} 秒（网络与服务器 {:.1} 秒）。",
+                            user.username, elapsed_seconds, remote_seconds
+                        )));
                         if let Ok(response) = Request::get(&api_url("/api/auth/me"))
                             .credentials(web_sys::RequestCredentials::Include)
                             .send()
@@ -1210,14 +1352,114 @@ fn App() -> impl IntoView {
                             }
                         }
                     }
-                    Err(error) => status_signal.set(format!("同步响应解析失败：{error}")),
+                    Err(error) => status_signal.set(Some(format!("同步响应解析失败：{error}"))),
                 },
                 Ok(response) => {
-                    status_signal.set(response.text().await.unwrap_or_else(|_| "同步失败".into()));
+                    status_signal.set(Some(
+                        response.text().await.unwrap_or_else(|_| "同步失败".into()),
+                    ));
                 }
-                Err(error) => status_signal.set(format!("同步失败：{error}")),
+                Err(error) => status_signal.set(Some(format!("同步失败：{error}"))),
             }
             syncing_signal.set(false);
+        });
+    };
+
+    let toggle_api_key_sync = move |event: Event| {
+        let enabled = event
+            .target()
+            .and_then(|target| target.dyn_into::<HtmlInputElement>().ok())
+            .map(|input| input.checked())
+            .unwrap_or(false);
+        let Some(user) = auth_user.get_untracked() else {
+            return;
+        };
+        sync_api_keys_enabled.set(enabled);
+        let _ = save_api_key_sync_enabled(&user.id, enabled);
+        if enabled {
+            if let Some(secret) = load_trusted_sync_secret(&user.id) {
+                sync_secret.set(secret);
+                configs.update(|items| mark_api_keys_for_reencryption(items));
+                persist_ui_state();
+                sync_status_text.set(Some("可信设备已解锁，可同步 API Key。".into()));
+            } else {
+                sync_status_text.set(Some(
+                    "API Key 同步已启用，请输入账号密码解锁当前设备。".into(),
+                ));
+            }
+            return;
+        }
+
+        let _ = clear_trusted_sync_secret(&user.id);
+        sync_secret.set(String::new());
+        legacy_sync_secret.set(String::new());
+        configs.update(|items| {
+            let updated_at = now_rfc3339();
+            for config in items {
+                if config.api_key_encrypted.take().is_some() {
+                    config.updated_at = updated_at.clone();
+                }
+            }
+        });
+        persist_ui_state();
+        sync_status_text.set(Some(
+            "API Key 同步已关闭；下次手动同步会移除云端密文，本地 Key 保留。".into(),
+        ));
+    };
+
+    let unlock_api_key_sync = move |_| {
+        let Some(user) = auth_user.get_untracked() else {
+            sync_status_text.set(Some("请先登录账号。".into()));
+            return;
+        };
+        let password = sync_unlock_password.get_untracked();
+        if password.is_empty() {
+            sync_status_text.set(Some("请输入当前账号密码。".into()));
+            return;
+        }
+        sync_unlocking.set(true);
+        sync_status_text.set(Some("正在验证账号并解锁可信设备……".into()));
+        spawn_local(async move {
+            let request = Request::post(&api_url("/api/auth/login"))
+                .credentials(web_sys::RequestCredentials::Include)
+                .json(&AuthRequest {
+                    username: user.username.clone(),
+                    password: password.clone(),
+                });
+            let result = match request {
+                Ok(builder) => builder.send().await,
+                Err(error) => {
+                    sync_status_text.set(Some(format!("解锁请求序列化失败：{error}")));
+                    sync_unlocking.set(false);
+                    return;
+                }
+            };
+            match result {
+                Ok(response) if response.ok() => {
+                    let trusted_secret = derive_trusted_sync_secret(&user.id, &password);
+                    match save_trusted_sync_secret(&user.id, &trusted_secret) {
+                        Ok(()) => {
+                            sync_secret.set(trusted_secret);
+                            legacy_sync_secret.set(password);
+                            configs.update(|items| mark_api_keys_for_reencryption(items));
+                            persist_ui_state();
+                            sync_unlock_password.set(String::new());
+                            sync_status_text.set(Some("可信设备已解锁，可同步 API Key。".into()));
+                        }
+                        Err(error) => {
+                            sync_status_text.set(Some(format!("可信设备密钥保存失败：{error}")))
+                        }
+                    }
+                }
+                Ok(response) => sync_status_text.set(Some(
+                    response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "账号密码验证失败。".into()),
+                )),
+                Err(error) => sync_status_text.set(Some(format!("解锁失败：{error}"))),
+            }
+            sync_unlocking.set(false);
         });
     };
 
@@ -1284,9 +1526,14 @@ fn App() -> impl IntoView {
         status_text.set("正在处理账号状态……".into());
         let auth_user = auth_user;
         let sync_secret = sync_secret;
+        let legacy_sync_secret = legacy_sync_secret;
+        let sync_api_keys_enabled = sync_api_keys_enabled;
+        let sync_status_text = sync_status_text;
         let status_text = status_text;
         let auth_form_message = auth_form_message;
         let admin_setup_allowed = admin_setup_allowed;
+        let login_password_signal = login_password;
+        let register_password_confirm_signal = register_password_confirm;
         let password_confirm = register_password_confirm.get_untracked();
         let setup_token = admin_setup_token.get_untracked();
         spawn_local(async move {
@@ -1314,8 +1561,27 @@ fn App() -> impl IntoView {
             match builder.send().await {
                 Ok(response) if response.ok() => match response.json::<AuthResponse>().await {
                     Ok(auth) => {
-                        sync_secret.set(password);
+                        let enabled = load_api_key_sync_enabled(&auth.user.id);
+                        sync_api_keys_enabled.set(enabled);
+                        if enabled {
+                            let trusted_secret =
+                                derive_trusted_sync_secret(&auth.user.id, &password);
+                            if save_trusted_sync_secret(&auth.user.id, &trusted_secret).is_ok() {
+                                sync_secret.set(trusted_secret);
+                                legacy_sync_secret.set(password);
+                                sync_status_text
+                                    .set(Some("可信设备已解锁，可同步 API Key。".into()));
+                            } else {
+                                sync_status_text
+                                    .set(Some("登录成功，但浏览器无法保存可信设备密钥。".into()));
+                            }
+                        } else {
+                            sync_secret.set(String::new());
+                            legacy_sync_secret.set(String::new());
+                        }
                         auth_user.set(Some(auth.user.clone()));
+                        login_password_signal.set(String::new());
+                        register_password_confirm_signal.set(String::new());
                         if auth.user.role == "admin" {
                             admin_setup_allowed.set(false);
                             show_admin_setup_token.set(false);
@@ -1390,10 +1656,10 @@ fn App() -> impl IntoView {
         let new_password = change_new_password.get_untracked();
         let new_password_confirm = change_new_password_confirm.get_untracked();
         password_form_message.set(None);
-        if auth_user.get_untracked().is_none() {
+        let Some(current_user) = auth_user.get_untracked() else {
             password_form_message.set(Some("请先登录后再修改密码。".into()));
             return;
-        }
+        };
         if let Err(message) =
             validate_frontend_password_strength(&new_password, &new_password_confirm)
         {
@@ -1408,9 +1674,13 @@ fn App() -> impl IntoView {
         let status_text = status_text;
         let password_form_message = password_form_message;
         let sync_secret = sync_secret;
+        let legacy_sync_secret = legacy_sync_secret;
+        let sync_api_keys_enabled = sync_api_keys_enabled;
+        let sync_status_text = sync_status_text;
         let change_old_password = change_old_password;
         let change_new_password = change_new_password;
         let change_new_password_confirm = change_new_password_confirm;
+        let previous_sync_secret = sync_secret.get_untracked();
         spawn_local(async move {
             let request = Request::post(&api_url("/api/auth/change-password"))
                 .credentials(web_sys::RequestCredentials::Include)
@@ -1425,7 +1695,18 @@ fn App() -> impl IntoView {
             };
             match builder.send().await {
                 Ok(response) if response.ok() => {
-                    sync_secret.set(new_password);
+                    if sync_api_keys_enabled.get_untracked() {
+                        let trusted_secret =
+                            derive_trusted_sync_secret(&current_user.id, &new_password);
+                        if save_trusted_sync_secret(&current_user.id, &trusted_secret).is_ok() {
+                            legacy_sync_secret.set(previous_sync_secret);
+                            sync_secret.set(trusted_secret);
+                            sync_status_text.set(Some(
+                                "密码已更新；下次同步会使用新的可信设备密钥重新加密 API Key。"
+                                    .into(),
+                            ));
+                        }
+                    }
                     change_old_password.set(String::new());
                     change_new_password.set(String::new());
                     change_new_password_confirm.set(String::new());
@@ -1765,6 +2046,14 @@ fn App() -> impl IntoView {
             let config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
             current_config_id.set(config.id.clone());
             configs.set(vec![config]);
+            if let Some(user) = auth_user.get_untracked() {
+                let _ = clear_trusted_sync_secret(&user.id);
+                sync_secret.set(String::new());
+                legacy_sync_secret.set(String::new());
+                sync_status_text.set(Some(
+                    "本地服务商配置和可信设备密钥已清除，云端密文未受影响。".into(),
+                ));
+            }
         }
         if clear_preferences {
             preferences.set(AppPreferences::default());
@@ -2803,17 +3092,23 @@ fn App() -> impl IntoView {
                             break;
                         }
                         let asset_payload = match (image.data_url.clone(), image.url.clone()) {
-                            (Some(data_url), _) => {
-                                let byte_len = data_url.len() as u64;
-                                let sha256 = sha256_hex(data_url.as_bytes());
-                                Some((
+                            (Some(data_url), _) => match decode_browser_data_url(&data_url) {
+                                Ok((mime_type, bytes)) => Some((
                                     Some(data_url),
                                     None,
-                                    byte_len,
-                                    sha256,
-                                    "image/png".to_string(),
-                                ))
-                            }
+                                    bytes.len() as u64,
+                                    sha256_hex(&bytes),
+                                    mime_type,
+                                )),
+                                Err(error) => {
+                                    asset_build_errors.push(format!(
+                                        "第 {} 张结果数据解析失败：{}",
+                                        index + 1,
+                                        error
+                                    ));
+                                    None
+                                }
+                            },
                             (None, Some(url)) => match fetch_image_bytes(&url).await {
                                 Ok((bytes, mime_type)) => {
                                     let data_url = bytes_to_data_url(&bytes, &mime_type);
@@ -2948,6 +3243,7 @@ fn App() -> impl IntoView {
                             task.status = TaskStatus::Succeeded;
                             task.updated_at = now_rfc3339();
                             task.result = Some(result);
+                            strip_successful_task_payloads(std::slice::from_mut(task));
                         }
                     });
                     continuation_signal.set(first_generated_id);
@@ -3293,7 +3589,58 @@ fn App() -> impl IntoView {
                                                     } else {
                                                         ().into_any()
                                                     }}
-                                                    <div class="row">
+                                                    {move || if auth_user.get().is_some() {
+                                                        view! {
+                                                            <div class="sync-key-settings">
+                                                                <label class="sync-key-toggle-row">
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        prop:checked=move || sync_api_keys_enabled.get()
+                                                                        on:change=toggle_api_key_sync
+                                                                    />
+                                                                    <span>"同步 API Key（客户端加密）"</span>
+                                                                    <span class="tag sync-key-state">
+                                                                        {move || if !sync_api_keys_enabled.get() {
+                                                                            "已关闭"
+                                                                        } else if sync_secret.get().is_empty() {
+                                                                            "未解锁"
+                                                                        } else {
+                                                                            "可信设备已解锁"
+                                                                        }}
+                                                                    </span>
+                                                                </label>
+                                                                <p class="status compact-help">
+                                                                    "服务器只保存密文；代理生成时 Key 仍会在后端内存中瞬时转发。"
+                                                                </p>
+                                                                {move || if sync_api_keys_enabled.get() && sync_secret.get().is_empty() {
+                                                                    view! {
+                                                                        <div class="row sync-key-unlock-row">
+                                                                            <input
+                                                                                class="text-input"
+                                                                                type="password"
+                                                                                autocomplete="current-password"
+                                                                                placeholder="输入账号密码解锁当前设备"
+                                                                                prop:value=move || sync_unlock_password.get()
+                                                                                on:input=move |event| sync_unlock_password.set(event_target_value(&event))
+                                                                            />
+                                                                            <button
+                                                                                class="button secondary"
+                                                                                on:click=unlock_api_key_sync
+                                                                                disabled=move || sync_unlocking.get()
+                                                                            >
+                                                                                {move || if sync_unlocking.get() { "解锁中…" } else { "解锁" }}
+                                                                            </button>
+                                                                        </div>
+                                                                    }.into_any()
+                                                                } else {
+                                                                    ().into_any()
+                                                                }}
+                                                            </div>
+                                                        }.into_any()
+                                                    } else {
+                                                        ().into_any()
+                                                    }}
+                                                    <div class="row auth-action-row">
                                                         <button
                                                             class="button"
                                                             on:click=move |_| {
@@ -3306,14 +3653,19 @@ fn App() -> impl IntoView {
                                                         >
                                                             {move || if auth_mode.get() == "register" { "创建账号" } else { "登录" }}
                                                         </button>
-                                                        <button
-                                                            class="button ghost"
-                                                            on:click=move |_| sync_action()
-                                                            disabled=move || syncing.get()
-                                                                || auth_user.get().map(|user| user.status != "approved").unwrap_or(true)
-                                                        >
-                                                            {move || if syncing.get() { "同步中…" } else { "立即同步" }}
-                                                        </button>
+                                                        <div class="sync-action-control">
+                                                            <button
+                                                                class="button ghost"
+                                                                on:click=move |_| sync_action()
+                                                                disabled=move || syncing.get()
+                                                                    || auth_user.get().map(|user| user.status != "approved").unwrap_or(true)
+                                                            >
+                                                                {move || if syncing.get() { "同步中…" } else { "立即同步" }}
+                                                            </button>
+                                                            {move || sync_status_text.get().map(|message| view! {
+                                                                <p class="form-hint sync-status-message">{message}</p>
+                                                            })}
+                                                        </div>
                                                     </div>
                                                 </div>
                                             </section>
@@ -3826,7 +4178,7 @@ fn App() -> impl IntoView {
             }).unwrap_or_else(|| ().into_any())}
 
             {move || confirm_popover.get().map(|state| {
-                let style = format!("left: {}px; top: {}px;", state.x + 8.0, state.y + 8.0);
+                let style = confirm_popover_style(state.x, state.y);
                 let confirm_label = if matches!(state.kind, ConfirmPopoverKind::CancelGeneration) {
                     "确认停止"
                 } else {
@@ -5206,6 +5558,8 @@ fn ConfigEditor(
     let model_draft = RwSignal::new(String::new());
     let responses_model_draft = RwSignal::new(String::new());
     let api_key_draft = RwSignal::new(String::new());
+    let api_key_visible = RwSignal::new(false);
+    let api_key_copy_feedback = RwSignal::new(None::<String>);
     let access_mode_draft = RwSignal::new(String::from("Smart"));
     let endpoint_mode_draft = RwSignal::new(String::from("ImagesApi"));
     let has_pending_changes = RwSignal::new(false);
@@ -5222,6 +5576,8 @@ fn ConfigEditor(
             model_draft.set(config.model);
             responses_model_draft.set(config.responses_model.unwrap_or_else(|| "gpt-5.5".into()));
             api_key_draft.set(config.api_key_plaintext.unwrap_or_default());
+            api_key_visible.set(false);
+            api_key_copy_feedback.set(None);
             access_mode_draft.set(format!("{:?}", config.access_mode));
             endpoint_mode_draft.set(format!("{:?}", config.endpoint_mode));
             has_pending_changes.set(false);
@@ -5280,6 +5636,11 @@ fn ConfigEditor(
                     _ => ProviderEndpointMode::ImagesApi,
                 };
                 let api_key = api_key_draft.get_untracked().trim().to_string();
+                let api_key_changed = config.api_key_plaintext.as_deref()
+                    != (!api_key.is_empty()).then_some(api_key.as_str());
+                if api_key_changed {
+                    config.api_key_encrypted = None;
+                }
                 if api_key.is_empty() {
                     config.api_key_plaintext = None;
                     config.api_key_hint = None;
@@ -5304,6 +5665,27 @@ fn ConfigEditor(
             );
             callback.forget();
         }
+    };
+
+    let copy_api_key = move |_| {
+        let value = api_key_draft.get_untracked();
+        if value.trim().is_empty() {
+            api_key_copy_feedback.set(Some("当前没有可复制的 API Key。".into()));
+            return;
+        }
+        spawn_local(async move {
+            let result = match web_sys::window() {
+                Some(window) => JsFuture::from(window.navigator().clipboard().write_text(&value))
+                    .await
+                    .map(|_| ()),
+                None => Err(wasm_bindgen::JsValue::from_str("浏览器窗口不可用")),
+            };
+            api_key_copy_feedback.set(Some(if result.is_ok() {
+                "API Key 已复制到剪贴板。".into()
+            } else {
+                "复制失败，请检查浏览器剪贴板权限。".into()
+            }));
+        });
     };
 
     view! {
@@ -5389,14 +5771,41 @@ fn ConfigEditor(
                     ().into_any()
                 }
             }}
-            <input
-                class="text-input"
-                type="password"
-                placeholder="API Key"
-                prop:value=move || api_key_draft.get()
-                on:input=move |ev| api_key_draft.set(event_target_value(&ev))
-                on:blur=move |_| commit_api_key()
-            />
+            <div class="api-key-input-row">
+                <input
+                    class="text-input"
+                    type=move || if api_key_visible.get() { "text" } else { "password" }
+                    autocomplete="off"
+                    placeholder="API Key"
+                    prop:value=move || api_key_draft.get()
+                    on:input=move |ev| {
+                        api_key_draft.set(event_target_value(&ev));
+                        api_key_copy_feedback.set(None);
+                    }
+                    on:blur=move |_| commit_api_key()
+                />
+                <button
+                    class="button ghost icon-button api-key-tool-button"
+                    title=move || if api_key_visible.get() { "隐藏 API Key" } else { "显示 API Key" }
+                    on:click=move |_| api_key_visible.update(|visible| *visible = !*visible)
+                >
+                    {move || if api_key_visible.get() {
+                        view! { <MaterialSymbolIcon name="visibility_off" filled=false /> }.into_any()
+                    } else {
+                        view! { <MaterialSymbolIcon name="visibility" filled=false /> }.into_any()
+                    }}
+                </button>
+                <button
+                    class="button ghost icon-button api-key-tool-button"
+                    title="复制 API Key"
+                    on:click=copy_api_key
+                >
+                    <MaterialSymbolIcon name="content_copy" filled=false />
+                </button>
+            </div>
+            {move || api_key_copy_feedback.get().map(|message| view! {
+                <p class="form-hint api-key-copy-feedback">{message}</p>
+            })}
             <div class="row settings-config-actions">
                 <select
                     class="select-input"
@@ -6068,9 +6477,11 @@ fn snapshot_local_state(
     checkpoint: RwSignal<SyncCheckpoint>,
     tombstones: RwSignal<Vec<SyncTombstone>>,
 ) -> LocalAppState {
+    let mut task_snapshot = tasks.with_untracked(|items| items.clone());
+    strip_successful_task_payloads(&mut task_snapshot);
     LocalAppState {
         configs: configs.with_untracked(|items| items.clone()),
-        tasks: tasks.with_untracked(|items| items.clone()),
+        tasks: task_snapshot,
         threads: threads.with_untracked(|items| items.clone()),
         assets: assets.with_untracked(|items| items.clone()),
         preferences: preferences.get_untracked(),
@@ -6086,9 +6497,11 @@ fn snapshot_workspace_state(
     checkpoint: RwSignal<SyncCheckpoint>,
     tombstones: RwSignal<Vec<SyncTombstone>>,
 ) -> LocalAppState {
+    let mut task_snapshot = tasks.with_untracked(|items| items.clone());
+    strip_successful_task_payloads(&mut task_snapshot);
     LocalAppState {
         configs: Vec::new(),
-        tasks: tasks.with_untracked(|items| items.clone()),
+        tasks: task_snapshot,
         threads: threads.with_untracked(|items| items.clone()),
         assets: assets.with_untracked(|items| strip_asset_payloads_for_snapshot(items)),
         preferences: AppPreferences::default(),
@@ -6258,6 +6671,17 @@ fn non_empty_string(value: String) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn mark_api_keys_for_reencryption(configs: &mut [EncryptedApiConfig]) {
+    let updated_at = now_rfc3339();
+    for config in configs {
+        if config.api_key_plaintext.is_none() {
+            continue;
+        }
+        config.api_key_encrypted = None;
+        config.updated_at = updated_at.clone();
     }
 }
 
@@ -6911,6 +7335,35 @@ fn format_byte_size(bytes: u64) -> String {
         format!("{:.1} KiB", bytes / KIB)
     } else {
         format!("{} B", bytes as u64)
+    }
+}
+
+fn confirm_popover_style(anchor_x: f64, anchor_y: f64) -> String {
+    let (viewport_width, viewport_height) = web_sys::window()
+        .map(|window| {
+            let width = window
+                .inner_width()
+                .ok()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(1280.0);
+            let height = window
+                .inner_height()
+                .ok()
+                .and_then(|value| value.as_f64())
+                .unwrap_or(720.0);
+            (width, height)
+        })
+        .unwrap_or((1280.0, 720.0));
+    let popover_width = 280.0_f64.min((viewport_width - 24.0).max(0.0));
+    let max_left = (viewport_width - popover_width - 12.0).max(12.0);
+    let left = (anchor_x + 8.0).clamp(12.0, max_left);
+
+    if anchor_y > viewport_height / 2.0 {
+        let bottom = (viewport_height - anchor_y + 8.0).max(12.0);
+        format!("left: {left}px; bottom: {bottom}px;")
+    } else {
+        let top = (anchor_y + 8.0).max(12.0);
+        format!("left: {left}px; top: {top}px;")
     }
 }
 
