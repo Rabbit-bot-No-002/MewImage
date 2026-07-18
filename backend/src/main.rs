@@ -21,7 +21,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::DefaultBodyLimit,
-    extract::{Multipart, Path, Query, State},
+    extract::{ConnectInfo, Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -55,6 +55,10 @@ use sqlx::{
 };
 use state::{AppConfig, AppState, AssetStoreKind};
 use tokio::net::TcpListener;
+use tower_cookies::{
+    Cookie, CookieManagerLayer, Cookies,
+    cookie::{SameSite, time::Duration as CookieDuration},
+};
 use tower_http::{
     cors::{AllowHeaders, AllowOrigin, CorsLayer},
     services::ServeDir,
@@ -66,6 +70,7 @@ use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
 use tracing::{error, info, warn};
 
 const MAX_CONCURRENT_PROXY_GENERATIONS: usize = 5;
+const REGISTRATION_DEVICE_COOKIE: &str = "mew_registration_device";
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 static MALLOC_TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -114,6 +119,8 @@ async fn main() -> anyhow::Result<()> {
     init_db(&db).await?;
 
     let s3 = build_s3_client(&config).await?;
+    let dummy_password_hash = hash_password("MewImage dummy password verification")
+        .map_err(|error| anyhow::anyhow!(error.message))?;
     let builtins = vec![
         ProviderTemplate::builtin_openai(),
         ProviderTemplate::builtin_nano_banana(),
@@ -129,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
         generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
             MAX_CONCURRENT_PROXY_GENERATIONS,
         )),
+        auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(config.auth_hash_concurrency)),
+        dummy_password_hash,
     });
 
     let session_pool = SessionSqlitePool::connect(&config.database_url).await?;
@@ -185,12 +194,17 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer)
         .layer(session_layer)
+        .layer(CookieManagerLayer::new())
         .with_state(state);
 
     let addr: SocketAddr = config.listen_addr.parse()?;
     let listener = TcpListener::bind(addr).await?;
     info!("backend listening on {}", addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -251,7 +265,21 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             approved_at TEXT,
             approved_by TEXT,
             last_login_at TEXT,
+            failed_login_count INTEGER NOT NULL DEFAULT 0,
+            locked_until TEXT,
             created_at TEXT NOT NULL
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS registration_devices (
+            device_hash TEXT PRIMARY KEY,
+            registration_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS auth_rate_limits (
+            scope TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            window_started_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL,
+            PRIMARY KEY (scope, key_hash)
         )"#,
         r#"CREATE TABLE IF NOT EXISTS sync_snapshots (
             user_id TEXT PRIMARY KEY,
@@ -296,6 +324,10 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS assets_user_sha256 ON assets(user_id, sha256)")
         .execute(db)
         .await?;
+    sqlx::query("DELETE FROM auth_rate_limits WHERE window_started_at < ?")
+        .bind(Utc::now().timestamp().saturating_sub(7 * 86_400))
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -314,6 +346,8 @@ async fn migrate_users_table(db: &SqlitePool) -> anyhow::Result<()> {
         ("approved_at", "TEXT"),
         ("approved_by", "TEXT"),
         ("last_login_at", "TEXT"),
+        ("failed_login_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("locked_until", "TEXT"),
     ] {
         if !columns.contains(name) {
             sqlx::query(&format!("ALTER TABLE users ADD COLUMN {name} {definition}"))
@@ -394,12 +428,36 @@ async fn admin_setup_status(
 
 async fn register(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    cookies: Cookies,
     session: Session,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
+    let client_ip = resolve_client_ip(&state.config, &headers, peer_addr);
+    enforce_auth_rate_limit(
+        &state.db,
+        "register_ip",
+        &hash_auth_identifier(&state.config.auth_secret, "ip", &client_ip.to_string()),
+        state.config.register_ip_limit,
+        state.config.register_window_seconds,
+        "当前网络注册请求过于频繁，请稍后再试。",
+    )
+    .await?;
+    let device_id = registration_device_id(&cookies, &state.config);
+    let device_hash = hash_auth_identifier(&state.config.auth_secret, "device", &device_id);
+    ensure_device_registration_available(
+        &state.db,
+        &device_hash,
+        state.config.register_device_limit,
+    )
+    .await?;
     validate_registration(&payload)?;
+    if username_exists(&state.db, &payload.username).await? {
+        return Err(AppError::bad_request("用户名已存在"));
+    }
 
-    let password_hash = hash_password(&payload.password)?;
+    let password_hash = hash_password_with_limit(&state, payload.password.clone()).await?;
     let has_admin = user_role_exists(&state.db, "admin").await?;
     let can_bootstrap_admin = state.config.allow_first_admin_setup
         && !has_admin
@@ -425,6 +483,7 @@ async fn register(
         created_at: now.clone(),
     };
 
+    let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
     let result = sqlx::query(
         "INSERT INTO users (id, username, password_hash, role, status, password_updated_at, approved_at, approved_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -437,7 +496,7 @@ async fn register(
     .bind(if can_bootstrap_admin { Some(now.clone()) } else { None })
     .bind(if can_bootstrap_admin { Some(user.id.clone()) } else { None })
     .bind(&now)
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await;
 
     if let Err(error) = result {
@@ -446,6 +505,14 @@ async fn register(
         }
         return Err(AppError::internal(error));
     }
+    reserve_device_registration(
+        &mut transaction,
+        &device_hash,
+        state.config.register_device_limit,
+        &now,
+    )
+    .await?;
+    transaction.commit().await.map_err(AppError::internal)?;
 
     session
         .insert("user_id", &user.id)
@@ -506,37 +573,83 @@ async fn bootstrap_admin(
 
 async fn login(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     session: Session,
     Json(payload): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
+    let client_ip = resolve_client_ip(&state.config, &headers, peer_addr);
+    enforce_auth_rate_limit(
+        &state.db,
+        "login_ip",
+        &hash_auth_identifier(&state.config.auth_secret, "ip", &client_ip.to_string()),
+        state.config.login_ip_limit,
+        state.config.login_window_seconds,
+        "登录尝试过于频繁，请稍后再试。",
+    )
+    .await?;
     validate_login_credentials(&payload)?;
 
     let row =
-        sqlx::query("SELECT id, username, password_hash, role, status, created_at FROM users WHERE username = ?")
+        sqlx::query("SELECT id, username, password_hash, role, status, created_at, locked_until FROM users WHERE username = ?")
             .bind(payload.username.trim())
             .fetch_optional(&state.db)
             .await
             .map_err(AppError::internal)?;
 
     let Some(row) = row else {
+        let _ =
+            verify_password_with_limit(&state, payload.password, state.dummy_password_hash.clone())
+                .await?;
         return Err(AppError::unauthorized("用户名或密码错误"));
     };
 
+    let user_id = row.get::<String, _>("id");
+    let username = row.get::<String, _>("username");
     let password_hash = row.get::<String, _>("password_hash");
-    verify_password(&payload.password, &password_hash)?;
-    if row.get::<String, _>("status") == "disabled" {
+    let role = row.get::<String, _>("role");
+    let status = row.get::<String, _>("status");
+    let created_at = row.get::<String, _>("created_at");
+    if status == "disabled" {
         return Err(AppError::unauthorized("账号已被禁用，请联系管理员。"));
     }
+    if let Some(retry_after) = active_lock_retry_seconds(row.get("locked_until")) {
+        return Err(AppError::rate_limited(
+            format!("账号已临时锁定，请在 {retry_after} 秒后重试。"),
+            "account_locked",
+            retry_after,
+        ));
+    }
+    if !verify_password_with_limit(&state, payload.password, password_hash).await? {
+        if let Some(retry_after) = record_failed_login(
+            &state.db,
+            &user_id,
+            state.config.login_failure_limit,
+            state.config.login_lock_seconds,
+        )
+        .await?
+        {
+            return Err(AppError::rate_limited(
+                format!("密码连续输错次数过多，账号已锁定 {retry_after} 秒。"),
+                "account_locked",
+                retry_after,
+            ));
+        }
+        return Err(AppError::unauthorized("用户名或密码错误"));
+    }
 
+    let image_count = user_image_count(&state.db, &user_id).await?;
     let user = UserSummary {
-        id: row.get("id"),
-        username: row.get("username"),
-        role: row.get("role"),
-        status: row.get("status"),
-        image_count: user_image_count(&state.db, row.get::<String, _>("id").as_str()).await?,
-        created_at: row.get("created_at"),
+        id: user_id,
+        username,
+        role,
+        status,
+        image_count,
+        created_at,
     };
-    sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
+    sqlx::query(
+        "UPDATE users SET last_login_at = ?, failed_login_count = 0, locked_until = NULL WHERE id = ?",
+    )
         .bind(now_rfc3339())
         .bind(&user.id)
         .execute(&state.db)
@@ -577,18 +690,22 @@ async fn change_password(
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::unauthorized("登录状态已失效，请重新登录。"))?;
 
-    verify_password(
-        &payload.old_password,
-        &row.get::<String, _>("password_hash"),
-    )?;
-    let password_hash = hash_password(&payload.new_password)?;
-    sqlx::query("UPDATE users SET password_hash = ?, password_updated_at = ? WHERE id = ?")
-        .bind(password_hash)
-        .bind(now_rfc3339())
-        .bind(&user.id)
-        .execute(&state.db)
-        .await
-        .map_err(AppError::internal)?;
+    let current_password_hash = row.get::<String, _>("password_hash");
+    if !verify_password_with_limit(&state, payload.old_password, current_password_hash).await? {
+        return Err(AppError::unauthorized("当前密码错误"));
+    }
+    let password_hash = hash_password_with_limit(&state, payload.new_password).await?;
+    sqlx::query(
+        "UPDATE users
+         SET password_hash = ?, password_updated_at = ?, failed_login_count = 0, locked_until = NULL
+         WHERE id = ?",
+    )
+    .bind(password_hash)
+    .bind(now_rfc3339())
+    .bind(&user.id)
+    .execute(&state.db)
+    .await
+    .map_err(AppError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1036,7 +1153,23 @@ async fn upload_init(
     let user = require_approved_user(&state, &session).await?;
     ensure_object_storage_ready(&state)?;
     cleanup_expired_upload_tokens(&state.db).await?;
-    let asset_id = new_id();
+    let asset_id = payload.asset_id.unwrap_or_else(new_id);
+    if uuid::Uuid::parse_str(&asset_id).is_err() {
+        return Err(AppError::bad_request("图片资源 ID 格式无效。"));
+    }
+    let existing_owner =
+        sqlx::query_scalar::<_, Option<String>>("SELECT user_id FROM assets WHERE id = ?")
+            .bind(&asset_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(AppError::internal)?
+            .flatten();
+    if existing_owner
+        .as_deref()
+        .is_some_and(|owner| owner != user.id)
+    {
+        return Err(AppError::bad_request("图片资源 ID 与其他用户冲突。"));
+    }
     let token = random_token();
     let object_key = format!(
         "users/{}/assets/{}-{}",
@@ -1142,9 +1275,14 @@ async fn upload_complete(
     ensure_upload_token_not_expired(&row)?;
 
     let created_at = now_rfc3339();
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET object_key = excluded.object_key, mime_type = excluded.mime_type, sha256 = excluded.sha256, byte_len = excluded.byte_len",
+         ON CONFLICT(id) DO UPDATE SET
+             object_key = excluded.object_key,
+             mime_type = excluded.mime_type,
+             sha256 = excluded.sha256,
+             byte_len = excluded.byte_len
+         WHERE assets.user_id = excluded.user_id",
     )
     .bind(row.get::<String, _>("asset_id"))
     .bind(row.get::<Option<String>, _>("user_id"))
@@ -1156,6 +1294,9 @@ async fn upload_complete(
     .execute(&state.db)
     .await
     .map_err(AppError::internal)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::bad_request("图片资源 ID 与其他用户冲突。"));
+    }
     sqlx::query("DELETE FROM upload_tokens WHERE token = ?")
         .bind(&payload.upload_token)
         .execute(&state.db)
@@ -1703,6 +1844,200 @@ async fn user_image_count(db: &SqlitePool, user_id: &str) -> Result<usize, AppEr
     Ok(count.max(0) as usize)
 }
 
+fn resolve_client_ip(config: &AppConfig, headers: &HeaderMap, peer_addr: SocketAddr) -> IpAddr {
+    if config.trust_proxy_headers {
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse().ok())
+        {
+            return ip;
+        }
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .and_then(|value| value.trim().parse().ok())
+        {
+            return ip;
+        }
+    }
+    peer_addr.ip()
+}
+
+fn registration_device_id(cookies: &Cookies, config: &AppConfig) -> String {
+    if let Some(cookie) = cookies.get(REGISTRATION_DEVICE_COOKIE)
+        && uuid::Uuid::parse_str(cookie.value()).is_ok()
+    {
+        return cookie.value().to_string();
+    }
+
+    let device_id = new_id();
+    let mut cookie = Cookie::new(REGISTRATION_DEVICE_COOKIE, device_id.clone());
+    cookie.set_path("/");
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_secure(config.session_secure);
+    cookie.set_max_age(CookieDuration::days(3650));
+    cookies.add(cookie);
+    device_id
+}
+
+fn hash_auth_identifier(secret: &str, namespace: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    hasher.update([0]);
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+async fn enforce_auth_rate_limit(
+    db: &SqlitePool,
+    scope: &str,
+    key_hash: &str,
+    limit: u32,
+    window_seconds: u64,
+    message: &str,
+) -> Result<(), AppError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let now = Utc::now().timestamp();
+    let window_seconds = window_seconds.max(1).min(i64::MAX as u64) as i64;
+    let reset_before = now.saturating_sub(window_seconds);
+    let row = sqlx::query(
+        "INSERT INTO auth_rate_limits (scope, key_hash, window_started_at, attempts)
+         VALUES (?, ?, ?, 1)
+         ON CONFLICT(scope, key_hash) DO UPDATE SET
+             attempts = CASE
+                 WHEN auth_rate_limits.window_started_at <= ? THEN 1
+                 ELSE auth_rate_limits.attempts + 1
+             END,
+             window_started_at = CASE
+                 WHEN auth_rate_limits.window_started_at <= ? THEN excluded.window_started_at
+                 ELSE auth_rate_limits.window_started_at
+             END
+         RETURNING attempts, window_started_at",
+    )
+    .bind(scope)
+    .bind(key_hash)
+    .bind(now)
+    .bind(reset_before)
+    .bind(reset_before)
+    .fetch_one(db)
+    .await
+    .map_err(AppError::internal)?;
+    let attempts = row.get::<i64, _>("attempts");
+    if attempts <= i64::from(limit) {
+        return Ok(());
+    }
+    let window_started_at = row.get::<i64, _>("window_started_at");
+    let retry_after = window_started_at
+        .saturating_add(window_seconds)
+        .saturating_sub(now)
+        .max(1) as u64;
+    Err(AppError::rate_limited(
+        message,
+        "auth_rate_limited",
+        retry_after,
+    ))
+}
+
+async fn ensure_device_registration_available(
+    db: &SqlitePool,
+    device_hash: &str,
+    limit: u32,
+) -> Result<(), AppError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT registration_count FROM registration_devices WHERE device_hash = ?",
+    )
+    .bind(device_hash)
+    .fetch_optional(db)
+    .await
+    .map_err(AppError::internal)?
+    .unwrap_or(0);
+    if count >= i64::from(limit) {
+        return Err(AppError::device_registration_limited(limit));
+    }
+    Ok(())
+}
+
+async fn reserve_device_registration(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    device_hash: &str,
+    limit: u32,
+    updated_at: &str,
+) -> Result<(), AppError> {
+    if limit == 0 {
+        return Ok(());
+    }
+    let result = sqlx::query(
+        "INSERT INTO registration_devices (device_hash, registration_count, updated_at)
+         VALUES (?, 1, ?)
+         ON CONFLICT(device_hash) DO UPDATE SET
+             registration_count = registration_devices.registration_count + 1,
+             updated_at = excluded.updated_at
+         WHERE registration_devices.registration_count < ?",
+    )
+    .bind(device_hash)
+    .bind(updated_at)
+    .bind(limit)
+    .execute(&mut **transaction)
+    .await
+    .map_err(AppError::internal)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::device_registration_limited(limit));
+    }
+    Ok(())
+}
+
+fn active_lock_retry_seconds(locked_until: Option<String>) -> Option<u64> {
+    let locked_until = locked_until?;
+    let locked_until = chrono::DateTime::parse_from_rfc3339(&locked_until).ok()?;
+    let remaining = locked_until
+        .timestamp()
+        .saturating_sub(Utc::now().timestamp());
+    (remaining > 0).then_some(remaining as u64)
+}
+
+async fn record_failed_login(
+    db: &SqlitePool,
+    user_id: &str,
+    limit: u32,
+    lock_seconds: u64,
+) -> Result<Option<u64>, AppError> {
+    if limit == 0 {
+        return Ok(None);
+    }
+    let lock_seconds = lock_seconds.max(1);
+    let locked_until =
+        (Utc::now() + Duration::seconds(lock_seconds.min(i64::MAX as u64) as i64)).to_rfc3339();
+    let row = sqlx::query(
+        "UPDATE users SET
+             locked_until = CASE WHEN failed_login_count + 1 >= ? THEN ? ELSE NULL END,
+             failed_login_count = CASE
+                 WHEN failed_login_count + 1 >= ? THEN 0
+                 ELSE failed_login_count + 1
+             END
+         WHERE id = ?
+         RETURNING locked_until",
+    )
+    .bind(limit)
+    .bind(&locked_until)
+    .bind(limit)
+    .bind(user_id)
+    .fetch_one(db)
+    .await
+    .map_err(AppError::internal)?;
+    let active_lock = row.get::<Option<String>, _>("locked_until");
+    Ok(active_lock.map(|_| lock_seconds))
+}
+
 fn validate_login_credentials(payload: &AuthRequest) -> Result<(), AppError> {
     if payload.username.trim().len() < 3 {
         return Err(AppError::bad_request("用户名至少 3 个字符"));
@@ -1747,12 +2082,46 @@ fn hash_password(password: &str) -> Result<String, AppError> {
         .map_err(|error| AppError::internal_message(format!("密码哈希失败：{error}")))
 }
 
-fn verify_password(password: &str, password_hash: &str) -> Result<(), AppError> {
+fn password_matches(password: &str, password_hash: &str) -> Result<bool, AppError> {
     let parsed = PasswordHash::new(password_hash)
         .map_err(|error| AppError::internal_message(format!("密码哈希格式无效：{error}")))?;
-    Argon2::default()
+    Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
-        .map_err(|_| AppError::unauthorized("用户名或密码错误"))
+        .is_ok())
+}
+
+async fn hash_password_with_limit(state: &AppState, password: String) -> Result<String, AppError> {
+    let permit = state
+        .auth_hash_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::internal_message("认证服务暂时不可用"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await
+    .map_err(|error| AppError::internal_message(format!("密码哈希任务失败：{error}")))?
+}
+
+async fn verify_password_with_limit(
+    state: &AppState,
+    password: String,
+    password_hash: String,
+) -> Result<bool, AppError> {
+    let permit = state
+        .auth_hash_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::internal_message("认证服务暂时不可用"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        password_matches(&password, &password_hash)
+    })
+    .await
+    .map_err(|error| AppError::internal_message(format!("密码校验任务失败：{error}")))?
 }
 
 #[derive(Debug, Clone)]
@@ -2803,6 +3172,7 @@ struct AppError {
     status: StatusCode,
     message: String,
     code: Option<&'static str>,
+    retry_after_seconds: Option<u64>,
 }
 
 impl AppError {
@@ -2811,6 +3181,7 @@ impl AppError {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             code: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -2819,6 +3190,7 @@ impl AppError {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
             code: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -2827,6 +3199,7 @@ impl AppError {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
             code: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -2835,6 +3208,7 @@ impl AppError {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
             code: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -2843,6 +3217,29 @@ impl AppError {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
             code: Some("provider_target_blocked"),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn rate_limited(
+        message: impl Into<String>,
+        code: &'static str,
+        retry_after_seconds: u64,
+    ) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            code: Some(code),
+            retry_after_seconds: Some(retry_after_seconds.max(1)),
+        }
+    }
+
+    fn device_registration_limited(limit: u32) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!("当前设备最多只能注册 {limit} 个账号。"),
+            code: Some("device_registration_limit"),
+            retry_after_seconds: None,
         }
     }
 
@@ -2851,6 +3248,7 @@ impl AppError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
             code: None,
+            retry_after_seconds: None,
         }
     }
 
@@ -2862,14 +3260,21 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(json!({
                 "error": self.message,
                 "code": self.code,
+                "retry_after_seconds": self.retry_after_seconds,
             })),
         )
-            .into_response()
+            .into_response();
+        if let Some(retry_after_seconds) = self.retry_after_seconds
+            && let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -2878,6 +3283,49 @@ mod tests {
     use super::*;
     use mew_image_shared::{GenerationRequest, ProviderEndpointMode, SyncTombstone};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn test_config(local_asset_dir: String) -> AppConfig {
+        AppConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            database_url: "sqlite::memory:".into(),
+            frontend_dist: String::new(),
+            session_secure: false,
+            trust_proxy_headers: false,
+            auth_secret: "test-auth-secret".into(),
+            register_device_limit: 3,
+            register_ip_limit: 10,
+            register_window_seconds: 86_400,
+            login_ip_limit: 20,
+            login_window_seconds: 600,
+            login_failure_limit: 5,
+            login_lock_seconds: 300,
+            auth_hash_concurrency: 2,
+            allowed_web_origins: Vec::new(),
+            trusted_provider_hosts: Vec::new(),
+            enforce_provider_host_whitelist: false,
+            enable_guest_proxy: true,
+            require_login_for_custom_provider: true,
+            admin_setup_token: None,
+            allow_first_admin_setup: false,
+            asset_store: AssetStoreKind::Local,
+            local_asset_dir,
+            s3_bucket: String::new(),
+            s3_region: "auto".into(),
+            s3_endpoint: None,
+            s3_access_key: None,
+            s3_secret_key: None,
+        }
+    }
+
+    async fn test_db() -> SqlitePool {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_db(&db).await.unwrap();
+        db
+    }
 
     #[test]
     fn builtin_openai_compatible_template_uses_config_base_url() {
@@ -2991,6 +3439,91 @@ mod tests {
     }
 
     #[test]
+    fn trusted_proxy_headers_are_only_used_when_enabled() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.9, 172.18.0.2".parse().unwrap(),
+        );
+        headers.insert("x-real-ip", "198.51.100.7".parse().unwrap());
+        let peer = SocketAddr::from(([172, 18, 0, 2], 1234));
+        let mut config = test_config(String::new());
+
+        assert_eq!(resolve_client_ip(&config, &headers, peer), peer.ip());
+        config.trust_proxy_headers = true;
+        assert_eq!(
+            resolve_client_ip(&config, &headers, peer),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_blocks_requests_after_window_limit() {
+        let db = test_db().await;
+        for _ in 0..2 {
+            enforce_auth_rate_limit(&db, "login_ip", "ip-hash", 2, 600, "blocked")
+                .await
+                .unwrap();
+        }
+        let error = enforce_auth_rate_limit(&db, "login_ip", "ip-hash", 2, 600, "blocked")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.code, Some("auth_rate_limited"));
+        assert!(error.retry_after_seconds.is_some());
+    }
+
+    #[tokio::test]
+    async fn fifth_failed_login_locks_account_and_resets_counter() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, role, status, created_at)
+             VALUES ('user-1', 'tester', 'hash', 'user', 'approved', ?)",
+        )
+        .bind(now_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap();
+
+        for _ in 0..4 {
+            assert_eq!(
+                record_failed_login(&db, "user-1", 5, 300).await.unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            record_failed_login(&db, "user-1", 5, 300).await.unwrap(),
+            Some(300)
+        );
+        let row =
+            sqlx::query("SELECT failed_login_count, locked_until FROM users WHERE id = 'user-1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(row.get::<i64, _>("failed_login_count"), 0);
+        assert!(active_lock_retry_seconds(row.get("locked_until")).is_some());
+    }
+
+    #[tokio::test]
+    async fn device_registration_limit_is_enforced_atomically() {
+        let db = test_db().await;
+        for _ in 0..3 {
+            let mut transaction = db.begin().await.unwrap();
+            reserve_device_registration(&mut transaction, "device-hash", 3, &now_rfc3339())
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+        }
+        let mut transaction = db.begin().await.unwrap();
+        let error = reserve_device_registration(&mut transaction, "device-hash", 3, &now_rfc3339())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, Some("device_registration_limit"));
+    }
+
+    #[test]
     fn responses_result_can_find_nested_base64() {
         let request = GenerationRequest {
             prompt: "test".into(),
@@ -3043,26 +3576,7 @@ mod tests {
             .unwrap();
         init_db(&db).await.unwrap();
         let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
-        let config = AppConfig {
-            listen_addr: "127.0.0.1:0".into(),
-            database_url: "sqlite::memory:".into(),
-            frontend_dist: String::new(),
-            session_secure: false,
-            allowed_web_origins: Vec::new(),
-            trusted_provider_hosts: Vec::new(),
-            enforce_provider_host_whitelist: false,
-            enable_guest_proxy: true,
-            require_login_for_custom_provider: true,
-            admin_setup_token: None,
-            allow_first_admin_setup: false,
-            asset_store: AssetStoreKind::Local,
-            local_asset_dir: asset_dir.to_string_lossy().into_owned(),
-            s3_bucket: String::new(),
-            s3_region: "auto".into(),
-            s3_endpoint: None,
-            s3_access_key: None,
-            s3_secret_key: None,
-        };
+        let config = test_config(asset_dir.to_string_lossy().into_owned());
         let state = AppState {
             config,
             db,
@@ -3072,6 +3586,8 @@ mod tests {
             generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_PROXY_GENERATIONS,
             )),
+            auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            dummy_password_hash: hash_password("dummy").unwrap(),
         };
         let object_key = "users/user-1/assets/shared.bin";
         put_object(&state, object_key, "image/png", b"image".to_vec())

@@ -1444,6 +1444,8 @@ pub struct MeResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UploadInitRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
     pub file_name: String,
     pub mime_type: String,
     pub byte_len: u64,
@@ -1921,6 +1923,19 @@ mod tests {
         let decoded: LocalTaskRecord = serde_json::from_value(value).unwrap();
 
         assert!(!decoded.detached_from_thread);
+    }
+
+    #[test]
+    fn legacy_upload_init_without_asset_id_remains_readable() {
+        let request: UploadInitRequest = serde_json::from_value(serde_json::json!({
+            "file_name": "image.png",
+            "mime_type": "image/png",
+            "byte_len": 4,
+            "sha256": "hash"
+        }))
+        .unwrap();
+
+        assert_eq!(request.asset_id, None);
     }
 
     #[test]

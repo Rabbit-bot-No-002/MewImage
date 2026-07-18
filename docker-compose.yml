@@ -11,6 +11,16 @@ services:
       MEW_DATABASE_URL: sqlite:///data/mew-image.db
       MEW_FRONTEND_DIST: /app/frontend/dist-app
       MEW_SESSION_SECURE: "false"
+      MEW_AUTH_SECRET: "please-change-this-auth-secret"
+      MEW_TRUST_PROXY_HEADERS: "false"
+      MEW_REGISTER_DEVICE_LIMIT: "3"
+      MEW_REGISTER_IP_LIMIT: "10"
+      MEW_REGISTER_WINDOW_SECONDS: "86400"
+      MEW_LOGIN_IP_LIMIT: "20"
+      MEW_LOGIN_WINDOW_SECONDS: "600"
+      MEW_LOGIN_FAILURE_LIMIT: "5"
+      MEW_LOGIN_LOCK_SECONDS: "300"
+      MEW_AUTH_HASH_CONCURRENCY: "2"
       MEW_ADMIN_TOKEN: "please-change-this-admin-bootstrap-token"
       MEW_ALLOW_ADMIN_SETUP: "true"
       MEW_ALLOWED_ORIGINS: http://127.0.0.1:3000,http://localhost:3000

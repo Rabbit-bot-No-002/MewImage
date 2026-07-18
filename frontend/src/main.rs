@@ -24,8 +24,9 @@ use mew_image_shared::{
     EncryptedApiConfig, FavoriteFolder, GenerationSettingsSnapshot, ImageAssetRef, LocalAppState,
     LocalTaskRecord, MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
     ProviderTemplate, RegisterRequest, SyncCheckpoint, SyncEntityKind, SyncPullResponse,
-    SyncTombstone, TaskStatus, ThemePreference, UserSummary, UsernameAvailabilityResponse,
-    clamp_size, new_id, normalize_api_config, now_rfc3339, strip_successful_task_payloads,
+    SyncTombstone, TaskStatus, ThemePreference, UploadCompleteRequest, UploadCompleteResponse,
+    UploadInitRequest, UploadInitResponse, UserSummary, UsernameAvailabilityResponse, clamp_size,
+    new_id, normalize_api_config, now_rfc3339, strip_successful_task_payloads,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -138,6 +139,8 @@ struct TextPopoverState {
 #[derive(Clone, PartialEq)]
 enum ConfirmPopoverKind {
     CancelGeneration,
+    DeleteAsset(String),
+    DeleteConfig(String),
     DeleteThread(String),
     DeleteFavoriteFolder(String),
     DeleteTask(String),
@@ -182,11 +185,188 @@ fn MaterialSymbolIcon(name: &'static str, filled: bool) -> impl IntoView {
     }
 }
 
+#[component]
+fn PaginationControls(
+    page: RwSignal<usize>,
+    page_count: Memo<usize>,
+    favorite: bool,
+) -> impl IntoView {
+    let show_picker = RwSignal::new(false);
+    let candidate = RwSignal::new(1usize);
+    let page_label = Memo::new(move |_| format!("{}/{}", page.get(), page_count.get()));
+    let picker_rows = Memo::new(move |_| {
+        let total = page_count.get().max(1);
+        let current = candidate.get().clamp(1, total) as isize;
+        (-2..=2)
+            .filter_map(|offset| {
+                let page = current + offset;
+                (1..=total as isize)
+                    .contains(&page)
+                    .then_some((page as usize, offset))
+            })
+            .collect::<Vec<_>>()
+    });
+    let can_prev = Memo::new(move |_| page.get() > 1);
+    let can_next = Memo::new(move |_| page.get() < page_count.get());
+    let step_candidate = move |delta: isize| {
+        let total = page_count.get_untracked().max(1);
+        let current = candidate.get_untracked().clamp(1, total) as isize;
+        candidate.set((current + delta).clamp(1, total as isize) as usize);
+    };
+    let submit = move || {
+        let total = page_count.get_untracked().max(1);
+        page.set(candidate.get_untracked().clamp(1, total));
+        show_picker.set(false);
+    };
+
+    Effect::new(move |_| {
+        let total = page_count.get().max(1);
+        if page.get() > total {
+            page.set(total);
+        }
+    });
+
+    view! {
+        <div
+            class="gallery-pagination-footer"
+            class:favorite-pagination-footer=favorite
+        >
+            <div class="gallery-pagination-anchor">
+                {move || if show_picker.get() {
+                    view! {
+                        <>
+                            <button
+                                class="gallery-page-dismiss-layer"
+                                aria-label="关闭页码选择"
+                                on:click=move |_| show_picker.set(false)
+                            ></button>
+                            <div class="gallery-page-popover-layer">
+                                <div
+                                    class="gallery-page-popover"
+                                    on:wheel=move |ev: WheelEvent| {
+                                        ev.prevent_default();
+                                        if ev.delta_y() < 0.0 {
+                                            step_candidate(-1);
+                                        } else if ev.delta_y() > 0.0 {
+                                            step_candidate(1);
+                                        }
+                                    }
+                                >
+                                    <div class="gallery-page-popover-body">
+                                        <div
+                                            class="gallery-page-wheel"
+                                            tabindex="0"
+                                            on:keydown=move |ev: KeyboardEvent| {
+                                                match ev.key().as_str() {
+                                                    "ArrowUp" => {
+                                                        ev.prevent_default();
+                                                        step_candidate(-1);
+                                                    }
+                                                    "ArrowDown" => {
+                                                        ev.prevent_default();
+                                                        step_candidate(1);
+                                                    }
+                                                    "Enter" => submit(),
+                                                    "Escape" => show_picker.set(false),
+                                                    _ => {}
+                                                }
+                                            }
+                                        >
+                                            <For
+                                                each=move || picker_rows.get()
+                                                key=|(page, offset)| format!("{page}-{offset}")
+                                                children=move |(target_page, offset)| {
+                                                    let is_focused = offset == 0;
+                                                    let is_near = offset.abs() == 1;
+                                                    let is_far = offset.abs() >= 2;
+                                                    view! {
+                                                        <button
+                                                            class="gallery-page-wheel-item"
+                                                            class:is-focused=is_focused
+                                                            class:is-near=is_near
+                                                            class:is-far=is_far
+                                                            on:click=move |_| candidate.set(target_page)
+                                                            on:wheel=move |ev: WheelEvent| {
+                                                                ev.prevent_default();
+                                                                if ev.delta_y() < 0.0 {
+                                                                    step_candidate(-1);
+                                                                } else if ev.delta_y() > 0.0 {
+                                                                    step_candidate(1);
+                                                                }
+                                                            }
+                                                        >
+                                                            {target_page.to_string()}
+                                                        </button>
+                                                    }
+                                                }
+                                            />
+                                        </div>
+                                        <button
+                                            class="button secondary gallery-page-confirm"
+                                            on:click=move |_| submit()
+                                        >
+                                            <MaterialSymbolIcon name="check" filled=false />
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </>
+                    }.into_any()
+                } else {
+                    ().into_any()
+                }}
+                <div class="gallery-pagination-cluster">
+                    <button
+                        class="button ghost icon-button pagination-icon-button"
+                        title="上一页"
+                        disabled=move || !can_prev.get()
+                        on:click=move |_| page.update(|value| *value = value.saturating_sub(1).max(1))
+                    >
+                        <MaterialSymbolIcon name="chevron_left" filled=false />
+                    </button>
+                    <button
+                        class="button ghost pagination-page-button"
+                        title="跳转页码"
+                        on:click=move |_| {
+                            if show_picker.get_untracked() {
+                                show_picker.set(false);
+                            } else {
+                                candidate.set(page.get_untracked().max(1));
+                                show_picker.set(true);
+                            }
+                        }
+                    >
+                        {move || page_label.get()}
+                    </button>
+                    <button
+                        class="button ghost icon-button pagination-icon-button"
+                        title="下一页"
+                        disabled=move || !can_next.get()
+                        on:click=move |_| {
+                            let total = page_count.get_untracked().max(1);
+                            page.update(|value| *value = (*value + 1).min(total));
+                        }
+                    >
+                        <MaterialSymbolIcon name="chevron_right" filled=false />
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 const THUMBNAIL_DATA_URL_KEY: &str = "thumbnail_data_url";
 const FAVORITE_ARCHIVE_ASSET_KEY: &str = "favorite_archive";
 const THUMBNAIL_MAX_EDGE: u32 = 320;
 const GALLERY_PAGE_SIZE: usize = 10;
+const FAVORITE_PAGE_SIZE: usize = 9;
 const VISIBLE_THREAD_LIMIT: usize = 5;
+const ASSET_PAYLOAD_CACHE_MAX_ITEMS: usize = 6;
+const ASSET_PAYLOAD_CACHE_MAX_BYTES: u64 = 48 * 1024 * 1024;
+
+thread_local! {
+    static ASSET_PAYLOAD_LRU: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
 
 #[component]
 fn App() -> impl IntoView {
@@ -256,9 +436,7 @@ fn App() -> impl IntoView {
     let confirm_popover = RwSignal::new(None::<ConfirmPopoverState>);
     let show_thread_archive_menu = RwSignal::new(false);
     let gallery_page = RwSignal::new(1usize);
-    let show_gallery_page_picker = RwSignal::new(false);
-    let gallery_page_candidate = RwSignal::new(1usize);
-    let gallery_page_picker_thread_marker = RwSignal::new(String::new());
+    let favorite_page = RwSignal::new(1usize);
     let show_settings = RwSignal::new(false);
     let show_settings_menu = RwSignal::new(false);
     let settings_tab = RwSignal::new("providers".to_string());
@@ -952,79 +1130,31 @@ fn App() -> impl IntoView {
     });
     let paged_gallery_entries = Memo::new(move |_| {
         let entries = gallery_entries.get();
-        let page = gallery_page.get().max(1);
-        let start = page.saturating_sub(1) * GALLERY_PAGE_SIZE;
-        if start >= entries.len() {
-            return Vec::new();
-        }
-        let end = (start + GALLERY_PAGE_SIZE).min(entries.len());
-        entries[start..end].to_vec()
+        paged_items(
+            &entries,
+            gallery_page.get().min(gallery_page_count.get()),
+            GALLERY_PAGE_SIZE,
+        )
     });
-    let gallery_page_label =
-        Memo::new(move |_| format!("{}/{}", gallery_page.get(), gallery_page_count.get()));
-    let gallery_page_picker_rows = Memo::new(move |_| {
-        let total = gallery_page_count.get().max(1);
-        let current = gallery_page_candidate.get().clamp(1, total) as isize;
-        (-2..=2)
-            .filter_map(|offset| {
-                let page = current + offset;
-                if !(1..=total as isize).contains(&page) {
-                    return None;
-                }
-                Some((page as usize, offset))
-            })
-            .collect::<Vec<_>>()
+    let favorite_page_count = Memo::new(move |_| {
+        favorite_gallery_entries
+            .get()
+            .len()
+            .max(1)
+            .div_ceil(FAVORITE_PAGE_SIZE)
     });
-    let can_prev_gallery_page = Memo::new(move |_| gallery_page.get() > 1);
-    let can_next_gallery_page = Memo::new(move |_| gallery_page.get() < gallery_page_count.get());
-
-    let jump_gallery_page = move |_| {
-        if show_gallery_page_picker.get_untracked() {
-            show_gallery_page_picker.set(false);
-            return;
-        }
-        let current = gallery_page.get_untracked().max(1);
-        gallery_page_candidate.set(current);
-        show_gallery_page_picker.set(true);
-    };
-    let close_gallery_page_picker = move || {
-        show_gallery_page_picker.set(false);
-    };
-    let submit_gallery_page_picker = move || {
-        let total = gallery_page_count.get_untracked().max(1);
-        gallery_page.set(gallery_page_candidate.get_untracked().clamp(1, total));
-        show_gallery_page_picker.set(false);
-    };
-    let go_prev_gallery_page = move |_| {
-        gallery_page.update(|page| *page = page.saturating_sub(1).max(1));
-    };
-    let go_next_gallery_page = move |_| {
-        let total = gallery_page_count.get_untracked();
-        gallery_page.update(|page| *page = (*page + 1).min(total));
-    };
-    let step_gallery_page_candidate = move |delta: isize| {
-        let total = gallery_page_count.get_untracked().max(1);
-        let current = gallery_page_candidate.get_untracked().clamp(1, total) as isize;
-        let next = (current + delta).clamp(1, total as isize);
-        gallery_page_candidate.set(next as usize);
-    };
-
-    Effect::new(move |_| {
-        let total_pages = gallery_page_count.get().max(1);
-        if gallery_page.get() > total_pages {
-            gallery_page.set(total_pages);
-        }
+    let paged_favorite_gallery_entries = Memo::new(move |_| {
+        let entries = favorite_gallery_entries.get();
+        paged_items(
+            &entries,
+            favorite_page.get().min(favorite_page_count.get()),
+            FAVORITE_PAGE_SIZE,
+        )
     });
 
     Effect::new(move |_| {
-        let thread_id = current_thread_id.get();
-        if gallery_page_picker_thread_marker.get_untracked() == thread_id {
-            return;
-        }
-        gallery_page_picker_thread_marker.set(thread_id);
-        if show_gallery_page_picker.get_untracked() {
-            show_gallery_page_picker.set(false);
-        }
+        let _ = active_favorite_folder_id.get();
+        favorite_page.set(1);
     });
 
     let update_current_config = move |updater: fn(&mut EncryptedApiConfig, String),
@@ -1104,12 +1234,6 @@ fn App() -> impl IntoView {
             .filter(|asset| asset.remote_object_key.is_none())
             .map(|asset| asset.byte_len)
             .sum::<u64>();
-        let resident_payload_ids = state
-            .assets
-            .iter()
-            .filter(|asset| asset.data_url.is_some())
-            .map(|asset| asset.id.clone())
-            .collect::<HashSet<_>>();
         let secret = sync_secret.get_untracked();
         let legacy_secret = legacy_sync_secret.get_untracked();
         let status_signal = sync_status_text;
@@ -1134,38 +1258,91 @@ fn App() -> impl IntoView {
         spawn_local(async move {
             let started_at = js_sys::Date::now();
             let mut state = state;
-            let missing_payload_ids = state
+            let pending_asset_ids = state
                 .assets
                 .iter()
-                .filter(|asset| asset.remote_object_key.is_none() && asset.data_url.is_none())
+                .filter(|asset| asset.remote_object_key.is_none())
                 .map(|asset| asset.id.clone())
                 .collect::<Vec<_>>();
-            if !missing_payload_ids.is_empty() {
+            for (index, asset_id) in pending_asset_ids.iter().enumerate() {
+                let Some(asset) = state
+                    .assets
+                    .iter()
+                    .find(|asset| asset.id == *asset_id)
+                    .cloned()
+                else {
+                    continue;
+                };
                 status_signal.set(Some(format!(
-                    "正在读取 {} 张本地图片……",
-                    missing_payload_ids.len()
+                    "正在分批上传图片 {}/{}，当前 {}……",
+                    index + 1,
+                    pending_asset_ids.len(),
+                    format_byte_size(asset.byte_len),
                 )));
-                match load_asset_payloads(&missing_payload_ids).await {
-                    Ok(payloads) => {
-                        let _ = merge_asset_payloads(&mut state.assets, &payloads);
+                let data_url = if let Some(data_url) = asset.data_url.clone() {
+                    data_url
+                } else {
+                    match load_asset_payloads(std::slice::from_ref(asset_id)).await {
+                        Ok(mut payloads) => match payloads.remove(asset_id) {
+                            Some(data_url) => data_url,
+                            None => {
+                                syncing_signal.set(false);
+                                status_signal.set(Some(format!(
+                                    "同步中止：图片 {} 缺少可读取的本地原文件。",
+                                    index + 1
+                                )));
+                                return;
+                            }
+                        },
+                        Err(error) => {
+                            syncing_signal.set(false);
+                            status_signal.set(Some(format!("读取本地图片失败：{error}")));
+                            return;
+                        }
                     }
+                };
+                let uploaded = match upload_asset_for_sync(&asset, &data_url).await {
+                    Ok(uploaded) => uploaded,
                     Err(error) => {
                         syncing_signal.set(false);
-                        status_signal.set(Some(format!("读取本地图片失败：{error}")));
+                        status_signal.set(Some(format!(
+                            "第 {} 张图片上传失败：{error}。已完成部分会保留，下次可继续同步。",
+                            index + 1
+                        )));
                         return;
                     }
+                };
+                let apply_remote_fields = |target: &mut ImageAssetRef| {
+                    target.sha256 = uploaded.sha256.clone();
+                    target.mime_type = uploaded.mime_type.clone();
+                    target.byte_len = uploaded.byte_len;
+                    target.remote_object_key = uploaded.remote_object_key.clone();
+                    target.remote_url = uploaded.remote_url.clone();
+                };
+                if let Some(target) = state.assets.iter_mut().find(|item| item.id == *asset_id) {
+                    apply_remote_fields(target);
                 }
+                assets_signal.update(|items| {
+                    if let Some(target) = items.iter_mut().find(|item| item.id == *asset_id) {
+                        apply_remote_fields(target);
+                    }
+                });
+                persist();
             }
             status_signal.set(Some(if pending_asset_count == 0 {
                 "正在同步配置、会话和图片索引……".into()
             } else {
                 format!(
-                    "正在同步 {pending_asset_count} 张新图片，约 {}……",
+                    "已上传 {pending_asset_count} 张新图片，共约 {}，正在同步索引……",
                     format_byte_size(pending_asset_bytes)
                 )
             }));
+            let mut envelope_state = state.clone();
+            for asset in &mut envelope_state.assets {
+                asset.data_url = None;
+            }
             let envelope = match prepare_sync_envelope(
-                &state,
+                &envelope_state,
                 if !sync_api_keys || secret.is_empty() {
                     None
                 } else {
@@ -1180,11 +1357,6 @@ fn App() -> impl IntoView {
                     return;
                 }
             };
-            for asset in &mut state.assets {
-                if !resident_payload_ids.contains(&asset.id) {
-                    asset.data_url = None;
-                }
-            }
             let request = mew_image_shared::SyncPushRequest {
                 client_updated_at: now_rfc3339(),
                 envelope,
@@ -1449,12 +1621,13 @@ fn App() -> impl IntoView {
                         }
                     }
                 }
-                Ok(response) => sync_status_text.set(Some(
-                    response
+                Ok(response) => {
+                    let raw = response
                         .text()
                         .await
-                        .unwrap_or_else(|_| "账号密码验证失败。".into()),
-                )),
+                        .unwrap_or_else(|_| "账号密码验证失败。".into());
+                    sync_status_text.set(Some(api_error_message(raw, "账号密码验证失败。")));
+                }
                 Err(error) => sync_status_text.set(Some(format!("解锁失败：{error}"))),
             }
             sync_unlocking.set(false);
@@ -1589,9 +1762,8 @@ fn App() -> impl IntoView {
                     Err(error) => auth_form_message.set(Some(format!("认证响应解析失败：{error}"))),
                 },
                 Ok(response) => {
-                    auth_form_message.set(Some(
-                        response.text().await.unwrap_or_else(|_| "认证失败".into()),
-                    ));
+                    let raw = response.text().await.unwrap_or_else(|_| "认证失败".into());
+                    auth_form_message.set(Some(api_error_message(raw, "认证失败")));
                 }
                 Err(error) => auth_form_message.set(Some(format!("认证失败：{error}"))),
             }
@@ -1637,12 +1809,11 @@ fn App() -> impl IntoView {
                     }
                 },
                 Ok(response) => {
-                    auth_form_message.set(Some(
-                        response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "管理员初始化失败。".into()),
-                    ));
+                    let raw = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "管理员初始化失败。".into());
+                    auth_form_message.set(Some(api_error_message(raw, "管理员初始化失败。")));
                 }
                 Err(error) => auth_form_message.set(Some(format!("管理员初始化失败：{error}"))),
             }
@@ -1711,12 +1882,11 @@ fn App() -> impl IntoView {
                     status_text.set("密码已更新，下次登录请使用新密码。".into());
                 }
                 Ok(response) => {
-                    password_form_message.set(Some(
-                        response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "修改密码失败".into()),
-                    ));
+                    let raw = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "修改密码失败".into());
+                    password_form_message.set(Some(api_error_message(raw, "修改密码失败")));
                 }
                 Err(error) => password_form_message.set(Some(format!("修改密码失败：{error}"))),
             }
@@ -2170,25 +2340,14 @@ fn App() -> impl IntoView {
         persist_ui_state();
     };
 
-    let delete_config = move |_| {
-        let Some(current) = configs.with_untracked(|items| {
-            items
-                .iter()
-                .find(|config| config.id == current_config_id.get_untracked())
-                .cloned()
-        }) else {
-            return;
-        };
-        if !confirm_action(&format!(
-            "删除配置「{}」后无法恢复，是否继续？",
-            current.name
-        )) {
+    let perform_delete_config = move |config_id: String| {
+        if !configs.with_untracked(|items| items.iter().any(|config| config.id == config_id)) {
             return;
         }
         configs.update(|items| {
-            items.retain(|config| config.id != current.id);
+            items.retain(|config| config.id != config_id);
         });
-        record_sync_tombstones(tombstones, [(SyncEntityKind::Config, current.id.clone())]);
+        record_sync_tombstones(tombstones, [(SyncEntityKind::Config, config_id.clone())]);
         let next_id = configs
             .get_untracked()
             .first()
@@ -2197,6 +2356,24 @@ fn App() -> impl IntoView {
         current_config_id.set(next_id);
         persist_state();
         persist_ui_state();
+    };
+
+    let delete_config = move |event: MouseEvent| {
+        let Some(current) = configs.with_untracked(|items| {
+            items
+                .iter()
+                .find(|config| config.id == current_config_id.get_untracked())
+                .cloned()
+        }) else {
+            return;
+        };
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::DeleteConfig(current.id),
+            title: "删除配置".into(),
+            message: format!("删除配置「{}」后无法恢复，是否继续？", current.name),
+            x: event.client_x() as f64,
+            y: event.client_y() as f64,
+        }));
     };
 
     let new_thread = move |_| {
@@ -2387,7 +2564,10 @@ fn App() -> impl IntoView {
                     let payloads = asset_payload_pairs(&imported);
                     let imported_ids: Vec<String> =
                         imported.iter().map(|asset| asset.id.clone()).collect();
-                    assets_signal.update(|items| items.extend(imported));
+                    assets_signal.update(|items| {
+                        items.extend(imported);
+                        touch_and_trim_asset_payload_cache(items, &imported_ids, false);
+                    });
                     enqueue_payload_writes(payloads);
                     selected_reference_ids.update(|current| {
                         for id in reused_ids.iter().chain(imported_ids.iter()) {
@@ -2440,12 +2620,7 @@ fn App() -> impl IntoView {
         });
     };
 
-    let delete_asset = move |asset_id: String| {
-        if !confirm_action(
-            "删除后将从当前浏览器移除这张参考图，并让所有引用它的结果失效，是否继续？",
-        ) {
-            return;
-        }
+    let perform_delete_asset = move |asset_id: String| {
         assets.update(|items| items.retain(|asset| asset.id != asset_id));
         selected_reference_ids.update(|ids| ids.retain(|id| id != &asset_id));
         if dragging_reference_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
@@ -2462,6 +2637,17 @@ fn App() -> impl IntoView {
         enqueue_payload_deletes(removed_asset_ids);
         persist_state();
         status_text.set("参考图已删除。".into());
+    };
+
+    let delete_asset = move |asset_id: String, x: f64, y: f64| {
+        confirm_popover.set(Some(ConfirmPopoverState {
+            kind: ConfirmPopoverKind::DeleteAsset(asset_id),
+            title: "删除参考图".into(),
+            message: "删除后将从当前浏览器移除这张参考图，并让所有引用它的结果失效，是否继续？"
+                .into(),
+            x,
+            y,
+        }));
     };
 
     let continue_from_task = move |task_id: String| {
@@ -2762,6 +2948,8 @@ fn App() -> impl IntoView {
                 }
                 status_text.set("正在停止当前生成任务……".into());
             }
+            ConfirmPopoverKind::DeleteAsset(asset_id) => perform_delete_asset(asset_id),
+            ConfirmPopoverKind::DeleteConfig(config_id) => perform_delete_config(config_id),
             ConfirmPopoverKind::DeleteThread(thread_id) => perform_delete_thread(thread_id),
             ConfirmPopoverKind::DeleteFavoriteFolder(folder_id) => {
                 perform_delete_favorite_folder(folder_id)
@@ -2899,6 +3087,7 @@ fn App() -> impl IntoView {
         preview_offset_y.set(0.0);
         preview_dragging.set(false);
         context_menu_state.set(None);
+        trim_asset_payload_cache(assets);
     };
 
     let edit_output_asset = move |task_id: String, asset_id: String| {
@@ -3138,6 +3327,7 @@ fn App() -> impl IntoView {
                 endpoint_mode: config.endpoint_mode,
                 reference_assets: references,
             };
+            trim_asset_payload_cache(assets_signal);
             let generation_result =
                 generate_with_strategy(&template, &config, &request, Some(&abort_signal)).await;
             if finish_cancelled() {
@@ -3291,9 +3481,14 @@ fn App() -> impl IntoView {
                         .unwrap_or((resolved_width, resolved_height));
                     let first_generated_id = produced_assets.first().map(|asset| asset.id.clone());
                     let produced_payloads = asset_payload_pairs(&produced_assets);
+                    let produced_asset_ids = produced_assets
+                        .iter()
+                        .map(|asset| asset.id.clone())
+                        .collect::<Vec<_>>();
                     enqueue_payload_writes(produced_payloads);
                     assets_signal.update(|items| {
                         items.extend(produced_assets);
+                        touch_and_trim_asset_payload_cache(items, &produced_asset_ids, false);
                     });
                     tasks_signal.update(|items| {
                         if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
@@ -4098,7 +4293,7 @@ fn App() -> impl IntoView {
                             </div>
                             <div class="favorite-gallery-grid">
                                 {move || {
-                                    let entries = favorite_gallery_entries.get();
+                                    let entries = paged_favorite_gallery_entries.get();
                                     if entries.is_empty() {
                                         return vec![view! {
                                             <div class="favorite-empty">
@@ -4205,6 +4400,11 @@ fn App() -> impl IntoView {
                                         .collect::<Vec<_>>()
                                 }}
                             </div>
+                            <PaginationControls
+                                page=favorite_page
+                                page_count=favorite_page_count
+                                favorite=true
+                            />
                         </div>
                     </div>
                 }.into_any()
@@ -4472,112 +4672,11 @@ fn App() -> impl IntoView {
                                 .collect::<Vec<_>>()
                         }}
                     </div>
-                    <div class="gallery-pagination-footer">
-                        <div class="gallery-pagination-anchor">
-                            {move || if show_gallery_page_picker.get() {
-                                view! {
-                                    <>
-                                    <button class="gallery-page-dismiss-layer" aria-label="关闭页码选择" on:click=move |_| close_gallery_page_picker()></button>
-                                    <div class="gallery-page-popover-layer">
-                                        <div
-                                            class="gallery-page-popover"
-                                            on:wheel=move |ev: WheelEvent| {
-                                                ev.prevent_default();
-                                                if ev.delta_y() < 0.0 {
-                                                    step_gallery_page_candidate(-1);
-                                                } else if ev.delta_y() > 0.0 {
-                                                    step_gallery_page_candidate(1);
-                                                }
-                                            }
-                                        >
-                                            <div class="gallery-page-popover-body">
-                                                <div
-                                                    class="gallery-page-wheel"
-                                                    tabindex="0"
-                                                    on:keydown=move |ev: KeyboardEvent| {
-                                                        match ev.key().as_str() {
-                                                            "ArrowUp" => {
-                                                                ev.prevent_default();
-                                                                step_gallery_page_candidate(-1);
-                                                            }
-                                                            "ArrowDown" => {
-                                                                ev.prevent_default();
-                                                                step_gallery_page_candidate(1);
-                                                            }
-                                                            "Enter" => submit_gallery_page_picker(),
-                                                            "Escape" => close_gallery_page_picker(),
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                >
-                                                    <For
-                                                        each=move || gallery_page_picker_rows.get()
-                                                        key=|(page, offset)| format!("{page}-{offset}")
-                                                        children=move |(page, offset)| {
-                                                            let target_page = page;
-                                                            let is_focused = offset == 0;
-                                                            let is_near = offset.abs() == 1;
-                                                            let is_far = offset.abs() >= 2;
-                                                            view! {
-                                                                <button
-                                                                    class="gallery-page-wheel-item"
-                                                                    class:is-focused=is_focused
-                                                                    class:is-near=is_near
-                                                                    class:is-far=is_far
-                                                                    on:click=move |_| gallery_page_candidate.set(target_page)
-                                                                    on:wheel=move |ev: WheelEvent| {
-                                                                        ev.prevent_default();
-                                                                        if ev.delta_y() < 0.0 {
-                                                                            step_gallery_page_candidate(-1);
-                                                                        } else if ev.delta_y() > 0.0 {
-                                                                            step_gallery_page_candidate(1);
-                                                                        }
-                                                                    }
-                                                                >
-                                                                    {page.to_string()}
-                                                                </button>
-                                                            }
-                                                        }
-                                                    />
-                                                </div>
-                                                <button class="button secondary gallery-page-confirm" on:click=move |_| submit_gallery_page_picker()>
-                                                    <MaterialSymbolIcon name="check" filled=false />
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    </>
-                                }.into_any()
-                            } else {
-                                ().into_any()
-                            }}
-                        <div class="gallery-pagination-cluster">
-                            <button
-                                class="button ghost icon-button pagination-icon-button"
-                                title="上一页"
-                                disabled=move || !can_prev_gallery_page.get()
-                                on:click=go_prev_gallery_page
-                            >
-                                <MaterialSymbolIcon name="chevron_left" filled=false />
-                            </button>
-                            <button
-                                class="button ghost pagination-page-button"
-                                title="跳转页码"
-                                on:click=jump_gallery_page
-                            >
-                                {move || gallery_page_label.get()}
-                            </button>
-                            <button
-                                class="button ghost icon-button pagination-icon-button"
-                                title="下一页"
-                                disabled=move || !can_next_gallery_page.get()
-                                on:click=go_next_gallery_page
-                            >
-                                <MaterialSymbolIcon name="chevron_right" filled=false />
-                            </button>
-                        </div>
-                        </div>
-                    </div>
+                    <PaginationControls
+                        page=gallery_page
+                        page_count=gallery_page_count
+                        favorite=false
+                    />
                 </aside>
 
                 <div class="workspace-main">
@@ -5145,7 +5244,7 @@ fn App() -> impl IntoView {
                                                 }>
                                                     {move || if selected_reference_ids.get().contains(&toggle_reference_label_id) { "取消参考" } else { "设为参考" }}
                                                 </button>
-                                                <button class="button ghost danger mini-action icon-action" title="删除参考图" on:click=move |_| delete_asset(delete_asset_id.clone())><MaterialSymbolIcon name="delete" filled=false /></button>
+                                                <button class="button ghost danger mini-action icon-action" title="删除参考图" on:click=move |ev: MouseEvent| delete_asset(delete_asset_id.clone(), ev.client_x() as f64, ev.client_y() as f64)><MaterialSymbolIcon name="delete" filled=false /></button>
                                             </div>
                                         </article>
                                     }
@@ -5190,9 +5289,13 @@ fn App() -> impl IntoView {
                                 }>
                                     {move || if selected_reference_ids.get().contains(&toggle_reference_label_id) { "取消参考" } else { "设为参考" }}
                                 </button>
-                                <button class="button ghost danger" on:click=move |_| {
+                                <button class="button ghost danger" on:click=move |ev: MouseEvent| {
                                     reference_menu_asset_id.set(None);
-                                    delete_asset(delete_asset_id.clone());
+                                    delete_asset(
+                                        delete_asset_id.clone(),
+                                        ev.client_x() as f64,
+                                        ev.client_y() as f64,
+                                    );
                                 }>"删除图片"</button>
                             </div>
                         </div>
@@ -6051,6 +6154,15 @@ fn gallery_items(
     items
 }
 
+fn paged_items<T: Clone>(items: &[T], page: usize, page_size: usize) -> Vec<T> {
+    let start = page.max(1).saturating_sub(1).saturating_mul(page_size);
+    if start >= items.len() {
+        return Vec::new();
+    }
+    let end = start.saturating_add(page_size).min(items.len());
+    items[start..end].to_vec()
+}
+
 fn normalized_favorite_folders(mut folders: Vec<FavoriteFolder>) -> Vec<FavoriteFolder> {
     if folders.is_empty() {
         let now = now_rfc3339();
@@ -6457,8 +6569,73 @@ async fn ensure_asset_payloads_loaded(
     }
     assets_signal.update(|items| {
         let _ = merge_asset_payloads(items, &payloads);
+        touch_and_trim_asset_payload_cache(items, asset_ids, true);
     });
     Ok(())
+}
+
+fn touch_and_trim_asset_payload_cache(
+    assets: &mut [ImageAssetRef],
+    touched_ids: &[String],
+    protect_touched: bool,
+) {
+    ASSET_PAYLOAD_LRU.with(|cache| {
+        let mut order = cache.borrow_mut();
+        let resident_ids = assets
+            .iter()
+            .filter(|asset| asset.data_url.is_some())
+            .map(|asset| asset.id.clone())
+            .collect::<HashSet<_>>();
+        order.retain(|id| resident_ids.contains(id));
+        for asset in assets.iter().filter(|asset| asset.data_url.is_some()) {
+            if !order.contains(&asset.id) {
+                order.push(asset.id.clone());
+            }
+        }
+        for touched_id in touched_ids {
+            if !resident_ids.contains(touched_id) {
+                continue;
+            }
+            order.retain(|id| id != touched_id);
+            order.push(touched_id.clone());
+        }
+
+        let protected = if protect_touched {
+            touched_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        loop {
+            let resident_count = assets
+                .iter()
+                .filter(|asset| asset.data_url.is_some())
+                .count();
+            let resident_bytes = assets
+                .iter()
+                .filter(|asset| asset.data_url.is_some())
+                .map(|asset| asset.byte_len)
+                .sum::<u64>();
+            if resident_count <= ASSET_PAYLOAD_CACHE_MAX_ITEMS
+                && resident_bytes <= ASSET_PAYLOAD_CACHE_MAX_BYTES
+            {
+                break;
+            }
+            let Some(index) = order.iter().position(|id| !protected.contains(id.as_str())) else {
+                break;
+            };
+            let evicted_id = order.remove(index);
+            if let Some(asset) = assets.iter_mut().find(|asset| asset.id == evicted_id) {
+                asset.data_url = None;
+            }
+        }
+    });
+}
+
+fn trim_asset_payload_cache(assets_signal: RwSignal<Vec<ImageAssetRef>>) {
+    assets_signal.update(|items| touch_and_trim_asset_payload_cache(items, &[], false));
 }
 
 fn schedule_background_task(callback: impl FnOnce() + 'static) {
@@ -6847,6 +7024,95 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
+fn api_error_message(raw: String, fallback: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| {
+            if raw.trim().is_empty() {
+                fallback.to_string()
+            } else {
+                raw
+            }
+        })
+}
+
+async fn upload_asset_for_sync(
+    asset: &ImageAssetRef,
+    data_url: &str,
+) -> Result<ImageAssetRef, String> {
+    let (mime_type, bytes) = decode_browser_data_url(data_url)?;
+    let sha256 = sha256_hex(&bytes);
+    let extension = extension_from_mime(&mime_type);
+    let init_request = UploadInitRequest {
+        asset_id: Some(asset.id.clone()),
+        file_name: format!("{}.{}", sha256, extension),
+        mime_type: mime_type.clone(),
+        byte_len: bytes.len() as u64,
+        sha256,
+    };
+    let init_builder = Request::post(&api_url("/api/assets/upload-init"))
+        .credentials(web_sys::RequestCredentials::Include)
+        .json(&init_request)
+        .map_err(|error| format!("上传初始化序列化失败：{error}"))?;
+    let init_response = init_builder
+        .send()
+        .await
+        .map_err(|error| format!("上传初始化失败：{error}"))?;
+    if !init_response.ok() {
+        let raw = init_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "上传初始化失败".into());
+        return Err(api_error_message(raw, "上传初始化失败"));
+    }
+    let initialized = init_response
+        .json::<UploadInitResponse>()
+        .await
+        .map_err(|error| format!("上传初始化响应解析失败：{error}"))?;
+
+    let upload_builder = Request::put(&api_url(&initialized.upload_url))
+        .credentials(web_sys::RequestCredentials::Include)
+        .header("Content-Type", &mime_type)
+        .body(bytes)
+        .map_err(|error| format!("图片上传请求构建失败：{error}"))?;
+    let upload_response = upload_builder
+        .send()
+        .await
+        .map_err(|error| format!("图片上传失败：{error}"))?;
+    if !upload_response.ok() {
+        let raw = upload_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "图片上传失败".into());
+        return Err(api_error_message(raw, "图片上传失败"));
+    }
+
+    let complete_builder = Request::post(&api_url("/api/assets/complete"))
+        .credentials(web_sys::RequestCredentials::Include)
+        .json(&UploadCompleteRequest {
+            upload_token: initialized.upload_token,
+        })
+        .map_err(|error| format!("上传确认序列化失败：{error}"))?;
+    let complete_response = complete_builder
+        .send()
+        .await
+        .map_err(|error| format!("上传确认失败：{error}"))?;
+    if !complete_response.ok() {
+        let raw = complete_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "上传确认失败".into());
+        return Err(api_error_message(raw, "上传确认失败"));
+    }
+    complete_response
+        .json::<UploadCompleteResponse>()
+        .await
+        .map(|response| response.asset)
+        .map_err(|error| format!("上传确认响应解析失败：{error}"))
+}
+
 fn mark_api_keys_for_reencryption(configs: &mut [EncryptedApiConfig]) {
     let updated_at = now_rfc3339();
     for config in configs {
@@ -6947,12 +7213,6 @@ fn gcd(left: u32, right: u32) -> u32 {
         b = remainder;
     }
     a
-}
-
-fn confirm_action(message: &str) -> bool {
-    web_sys::window()
-        .and_then(|window| window.confirm_with_message(message).ok())
-        .unwrap_or(false)
 }
 
 fn format_duration_ms(duration_ms: u64) -> String {
@@ -7855,5 +8115,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["archived", "current"]
         );
+    }
+
+    #[test]
+    fn favorite_pagination_uses_nine_items_per_page() {
+        let items = (1..=20).collect::<Vec<_>>();
+
+        assert_eq!(
+            paged_items(&items, 1, FAVORITE_PAGE_SIZE),
+            (1..=9).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            paged_items(&items, 2, FAVORITE_PAGE_SIZE),
+            (10..=18).collect::<Vec<_>>()
+        );
+        assert_eq!(paged_items(&items, 3, FAVORITE_PAGE_SIZE), vec![19, 20]);
+    }
+
+    #[test]
+    fn asset_payload_lru_evicts_oldest_unprotected_originals() {
+        ASSET_PAYLOAD_LRU.with(|cache| cache.borrow_mut().clear());
+        let mut assets = (0..8)
+            .map(|index| {
+                let mut asset = test_asset(&format!("lru-{index}"), None, None);
+                asset.byte_len = 10 * 1024 * 1024;
+                asset.data_url = Some(format!("data:image/png;base64,{index}"));
+                asset
+            })
+            .collect::<Vec<_>>();
+        let touched = assets
+            .iter()
+            .map(|asset| asset.id.clone())
+            .collect::<Vec<_>>();
+
+        touch_and_trim_asset_payload_cache(&mut assets, &touched, false);
+
+        assert_eq!(
+            assets
+                .iter()
+                .filter(|asset| asset.data_url.is_some())
+                .count(),
+            4
+        );
+        assert!(assets[..4].iter().all(|asset| asset.data_url.is_none()));
+        assert!(assets[4..].iter().all(|asset| asset.data_url.is_some()));
     }
 }
