@@ -1190,6 +1190,25 @@ body[data-theme="night"] .sync-key-settings {
   font-weight: 800;
 }
 
+.settings-github-button {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--text);
+}
+
+.github-brand-icon {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+}
+
 .settings-config-actions {
   justify-content: flex-end;
   align-items: center;
