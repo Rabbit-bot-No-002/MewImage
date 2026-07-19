@@ -1585,6 +1585,19 @@ async fn normalize_envelope_assets(
             );
         }
 
+        if let Some((object_key, mime_type, byte_len, sha256)) =
+            find_indexed_asset_object(&state.db, user_id, &asset.id).await?
+        {
+            asset.remote_object_key = Some(object_key.clone());
+            asset.remote_url = Some(format!("/api/assets/{}", asset.id));
+            asset.data_url = None;
+            asset.mime_type = mime_type.clone();
+            asset.byte_len = byte_len.max(0) as u64;
+            asset.sha256 = sha256;
+            upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
+            continue;
+        }
+
         if let Some((object_key, mime_type, byte_len)) =
             find_existing_asset_object(&state.db, user_id, &asset.sha256).await?
         {
@@ -1609,6 +1622,22 @@ async fn normalize_envelope_assets(
     }
     envelope.updated_at = now_rfc3339();
     Ok(envelope)
+}
+
+async fn find_indexed_asset_object(
+    db: &SqlitePool,
+    user_id: &str,
+    asset_id: &str,
+) -> Result<Option<(String, String, i64, String)>, AppError> {
+    sqlx::query_as::<_, (String, String, i64, String)>(
+        "SELECT object_key, mime_type, byte_len, sha256 FROM assets
+         WHERE user_id = ? AND id = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(asset_id)
+    .fetch_optional(db)
+    .await
+    .map_err(AppError::internal)
 }
 
 fn is_user_asset_object_key(object_key: &str, user_id: &str, sha256: &str) -> bool {
@@ -3521,6 +3550,34 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, Some("device_registration_limit"));
+    }
+
+    #[tokio::test]
+    async fn indexed_asset_can_be_recovered_by_stable_id_when_hash_changed() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("asset-1")
+        .bind("user-1")
+        .bind("users/user-1/assets/real-hash.bin")
+        .bind("image/png")
+        .bind("real-hash")
+        .bind(4_i64)
+        .bind(now_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let indexed = find_indexed_asset_object(&db, "user-1", "asset-1")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(indexed.0, "users/user-1/assets/real-hash.bin");
+        assert_eq!(indexed.3, "real-hash");
     }
 
     #[test]

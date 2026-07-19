@@ -706,8 +706,12 @@ body[data-theme="night"] .thread-chip-actions {
   min-width: 94px;
 }
 
-.settings-inline .compact-select:nth-of-type(4) {
-  min-width: 116px;
+.settings-inline .codex-compat-select {
+  flex-basis: 142px;
+  width: 142px;
+  min-width: 142px;
+  max-width: 142px;
+  padding-right: 28px;
 }
 
 .field,
@@ -2140,14 +2144,14 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 .inline-popover-dismiss {
   position: fixed;
   inset: 0;
-  z-index: 57;
+  z-index: 89;
   border: 0;
   background: transparent;
 }
 
 .inline-action-popover {
   position: fixed;
-  z-index: 58;
+  z-index: 90;
   width: min(280px, calc(100vw - 24px));
   display: grid;
   gap: 10px;
@@ -2664,12 +2668,30 @@ body[data-theme="day"] .floating-tip {
 }
 
 .preview-actions {
-  gap: 10px;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.preview-actions-primary {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.preview-actions-primary::-webkit-scrollbar {
+  display: none;
 }
 
 .preview-actions .button {
   flex: 1 1 0;
+  min-width: 0;
+  padding-inline: 8px;
   justify-content: center;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.preview-actions-primary .button {
+  min-width: max-content;
 }
 
 .context-menu {

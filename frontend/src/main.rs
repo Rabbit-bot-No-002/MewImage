@@ -1223,17 +1223,6 @@ fn App() -> impl IntoView {
             ));
             return;
         }
-        let pending_asset_count = state
-            .assets
-            .iter()
-            .filter(|asset| asset.remote_object_key.is_none())
-            .count();
-        let pending_asset_bytes = state
-            .assets
-            .iter()
-            .filter(|asset| asset.remote_object_key.is_none())
-            .map(|asset| asset.byte_len)
-            .sum::<u64>();
         let secret = sync_secret.get_untracked();
         let legacy_secret = legacy_sync_secret.get_untracked();
         let status_signal = sync_status_text;
@@ -1264,6 +1253,9 @@ fn App() -> impl IntoView {
                 .filter(|asset| asset.remote_object_key.is_none())
                 .map(|asset| asset.id.clone())
                 .collect::<Vec<_>>();
+            let mut missing_local_asset_ids = Vec::new();
+            let mut uploaded_asset_count = 0usize;
+            let mut uploaded_asset_bytes = 0u64;
             for (index, asset_id) in pending_asset_ids.iter().enumerate() {
                 let Some(asset) = state
                     .assets
@@ -1286,12 +1278,8 @@ fn App() -> impl IntoView {
                         Ok(mut payloads) => match payloads.remove(asset_id) {
                             Some(data_url) => data_url,
                             None => {
-                                syncing_signal.set(false);
-                                status_signal.set(Some(format!(
-                                    "同步中止：图片 {} 缺少可读取的本地原文件。",
-                                    index + 1
-                                )));
-                                return;
+                                missing_local_asset_ids.push(asset_id.clone());
+                                continue;
                             }
                         },
                         Err(error) => {
@@ -1327,14 +1315,16 @@ fn App() -> impl IntoView {
                         apply_remote_fields(target);
                     }
                 });
+                uploaded_asset_count += 1;
+                uploaded_asset_bytes = uploaded_asset_bytes.saturating_add(uploaded.byte_len);
                 persist();
             }
-            status_signal.set(Some(if pending_asset_count == 0 {
+            status_signal.set(Some(if uploaded_asset_count == 0 {
                 "正在同步配置、会话和图片索引……".into()
             } else {
                 format!(
-                    "已上传 {pending_asset_count} 张新图片，共约 {}，正在同步索引……",
-                    format_byte_size(pending_asset_bytes)
+                    "已上传 {uploaded_asset_count} 张新图片，共约 {}，正在同步索引……",
+                    format_byte_size(uploaded_asset_bytes)
                 )
             }));
             let mut envelope_state = state.clone();
@@ -1427,6 +1417,17 @@ fn App() -> impl IntoView {
                         if hydrated.threads.is_empty() {
                             hydrated.threads.push(default_thread());
                         }
+                        let unresolved_asset_count = missing_local_asset_ids
+                            .iter()
+                            .filter(|asset_id| {
+                                hydrated
+                                    .assets
+                                    .iter()
+                                    .find(|asset| asset.id == asset_id.as_str())
+                                    .map(|asset| asset.remote_object_key.is_none())
+                                    .unwrap_or(false)
+                            })
+                            .count();
                         let retained_asset_ids = hydrated
                             .assets
                             .iter()
@@ -1508,10 +1509,16 @@ fn App() -> impl IntoView {
                         persist_ui_state();
                         let elapsed_seconds = (js_sys::Date::now() - started_at) / 1_000.0;
                         let remote_seconds = (js_sys::Date::now() - request_started_at) / 1_000.0;
-                        status_signal.set(Some(format!(
-                            "已完成与 {} 的云端同步，总用时 {:.1} 秒（网络与服务器 {:.1} 秒）。",
-                            user.username, elapsed_seconds, remote_seconds
-                        )));
+                        status_signal.set(Some(if unresolved_asset_count == 0 {
+                            format!(
+                                "已完成与 {} 的云端同步，总用时 {:.1} 秒（网络与服务器 {:.1} 秒）。",
+                                user.username, elapsed_seconds, remote_seconds
+                            )
+                        } else {
+                            format!(
+                                "同步已完成，但有 {unresolved_asset_count} 张图片在当前设备和云端都缺少原文件；其余数据已正常同步。"
+                            )
+                        }));
                         if let Ok(response) = Request::get(&api_url("/api/auth/me"))
                             .credentials(web_sys::RequestCredentials::Include)
                             .send()
@@ -2709,6 +2716,11 @@ fn App() -> impl IntoView {
     };
 
     let perform_delete_task = move |task_id: String| {
+        let deleting_current_preview = preview_state
+            .get_untracked()
+            .as_ref()
+            .map(|preview| preview.task_id == task_id)
+            .unwrap_or(false);
         let mut next_tasks = tasks.get_untracked();
         let deleted_reference_ids = next_tasks
             .iter()
@@ -2776,6 +2788,17 @@ fn App() -> impl IntoView {
         }
         if !removed_asset_ids.is_empty() {
             enqueue_payload_deletes(removed_asset_ids.clone());
+        }
+        if deleting_current_preview {
+            preview_state.set(None);
+            preview_panel_state.set(None);
+            preview_fullscreen.set(false);
+            preview_zoom.set(1.0);
+            preview_offset_x.set(0.0);
+            preview_offset_y.set(0.0);
+            preview_dragging.set(false);
+            context_menu_state.set(None);
+            trim_asset_payload_cache(assets);
         }
         persist_state();
         status_text.set("历史记录已删除。".into());
@@ -4957,7 +4980,7 @@ fn App() -> impl IntoView {
                                         <option value="low">"审核：宽松"</option>
                                     </select>
                                     <select
-                                        class="select-input compact-select"
+                                        class="select-input compact-select codex-compat-select"
                                         prop:value=move || {
                                             current_config
                                                 .get()
@@ -5574,14 +5597,13 @@ fn App() -> impl IntoView {
                                     <span>"·"</span>
                                     <span>{format!("耗时 {}", panel.duration_label.clone())}</span>
                                 </div>
-                                <div class="row preview-actions">
+                                <div class="row preview-actions preview-actions-primary">
                                     <button class="button ghost" on:click=move |_| {
                                         continue_from_task(task.id.clone());
                                         close_preview();
                                     }>"复用配置"</button>
                                     <button class="button secondary" on:click=move |_| edit_output_asset(edit_task_id.clone(), edit_asset_id.clone())>"编辑输出"</button>
                                     <button class="button ghost danger" on:click=move |ev: MouseEvent| {
-                                        close_preview();
                                         delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64);
                                     }>"删除记录"</button>
                                     <button class="button ghost" on:click=move |ev: MouseEvent| {

@@ -1563,6 +1563,34 @@ pub fn merge_records<T: SyncEntity>(left: &[T], right: &[T]) -> Vec<T> {
     values
 }
 
+pub fn merge_asset_records(left: &[ImageAssetRef], right: &[ImageAssetRef]) -> Vec<ImageAssetRef> {
+    let mut merged = HashMap::<String, ImageAssetRef>::new();
+    for asset in left.iter().chain(right.iter()) {
+        let should_replace = merged.get(&asset.id).is_none_or(|existing| {
+            if existing.updated_at != asset.updated_at {
+                return existing.updated_at < asset.updated_at;
+            }
+            asset_storage_rank(asset) > asset_storage_rank(existing)
+        });
+        if should_replace {
+            merged.insert(asset.id.clone(), asset.clone());
+        }
+    }
+    let mut values = merged.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| left.updated_at.cmp(&right.updated_at));
+    values
+}
+
+fn asset_storage_rank(asset: &ImageAssetRef) -> u8 {
+    if asset.remote_object_key.is_some() {
+        2
+    } else if asset.data_url.is_some() {
+        1
+    } else {
+        0
+    }
+}
+
 pub fn merge_tombstones(left: &[SyncTombstone], right: &[SyncTombstone]) -> Vec<SyncTombstone> {
     let mut merged = HashMap::<(SyncEntityKind, String), SyncTombstone>::new();
     for item in left.iter().chain(right.iter()) {
@@ -1625,7 +1653,7 @@ pub fn merge_envelopes(left: &SyncEnvelope, right: &SyncEnvelope) -> SyncEnvelop
             SyncEntityKind::Thread,
         ),
         assets: apply_tombstones(
-            merge_records(&left.assets, &right.assets),
+            merge_asset_records(&left.assets, &right.assets),
             &tombstones,
             SyncEntityKind::Asset,
         ),
@@ -1936,6 +1964,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.asset_id, None);
+    }
+
+    #[test]
+    fn equal_timestamp_asset_prefers_remote_object_metadata() {
+        let local = ImageAssetRef {
+            id: "asset-1".into(),
+            sha256: "old-hash".into(),
+            mime_type: "image/png".into(),
+            byte_len: 4,
+            width: Some(1),
+            height: Some(1),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+            data_url: None,
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        };
+        let remote = ImageAssetRef {
+            sha256: "real-hash".into(),
+            remote_object_key: Some("users/user-1/assets/real-hash.bin".into()),
+            remote_url: Some("/api/assets/asset-1".into()),
+            ..local.clone()
+        };
+
+        let merged = merge_asset_records(&[local], &[remote.clone()]);
+
+        assert_eq!(merged, vec![remote]);
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use mew_image_shared::{
-    EncryptedApiConfig, LocalAppState, SyncEntityKind, apply_tombstones, merge_records,
-    merge_tombstones, new_id, normalize_api_config, now_rfc3339,
+    EncryptedApiConfig, LocalAppState, SyncEntityKind, apply_tombstones, merge_asset_records,
+    merge_records, merge_tombstones, new_id, normalize_api_config, now_rfc3339,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -268,7 +268,7 @@ fn merge_backup(
         .filter(|asset| !deduplicated_asset_ids.contains(&asset.id))
         .collect::<Vec<_>>();
     let assets = apply_tombstones(
-        merge_records(&local.assets, &imported_assets),
+        merge_asset_records(&local.assets, &imported_assets),
         &tombstones,
         SyncEntityKind::Asset,
     );
