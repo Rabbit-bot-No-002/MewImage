@@ -4772,6 +4772,7 @@ fn App() -> impl IntoView {
                                 let thread_id = thread.id.clone();
                                 let active_thread_id = thread_id.clone();
                                 let click_thread_id = thread_id.clone();
+                                let label_thread_id = thread_id.clone();
                                 let rename_thread_id = thread_id.clone();
                                 let delete_thread_id = thread_id.clone();
                                 view! {
@@ -4782,9 +4783,13 @@ fn App() -> impl IntoView {
                                             on:click=move |_| select_thread(click_thread_id.clone())
                                         >
                                             <span class="thread-chip-label">
-                                                {move || {
-                                                    thread_display_name(&thread)
-                                                }}
+                                                {move || threads.with(|items| {
+                                                    items
+                                                        .iter()
+                                                        .find(|item| item.id == label_thread_id)
+                                                        .map(thread_display_name)
+                                                        .unwrap_or_else(|| "新的会话".into())
+                                                })}
                                             </span>
                                         </button>
                                         <div class="thread-chip-actions">
@@ -4828,10 +4833,19 @@ fn App() -> impl IntoView {
                                                         key=|thread| thread.id.clone()
                                                         children=move |thread| {
                                                             let thread_id = thread.id.clone();
+                                                            let label_thread_id = thread_id.clone();
                                                             view! {
                                                                 <button class="thread-archive-item" on:click=move |_| select_thread(thread_id.clone())>
                                                                     <MaterialSymbolIcon name="forum" filled=false />
-                                                                    <span>{thread_display_name(&thread)}</span>
+                                                                    <span>
+                                                                        {move || threads.with(|items| {
+                                                                            items
+                                                                                .iter()
+                                                                                .find(|item| item.id == label_thread_id)
+                                                                                .map(thread_display_name)
+                                                                                .unwrap_or_else(|| "新的会话".into())
+                                                                        })}
+                                                                    </span>
                                                                 </button>
                                                             }
                                                         }
