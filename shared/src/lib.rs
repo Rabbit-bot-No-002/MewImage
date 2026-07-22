@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SYNC_SCHEMA_VERSION: u32 = 2;
+pub const SYNC_SCHEMA_VERSION: u32 = 3;
 
 pub fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
@@ -1226,6 +1226,12 @@ pub struct FavoriteFolder {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FavoriteFolderTombstone {
+    pub folder_id: String,
+    pub deleted_at: String,
+}
+
 pub fn default_favorite_folders() -> Vec<FavoriteFolder> {
     let now = now_rfc3339();
     vec![FavoriteFolder {
@@ -1246,6 +1252,8 @@ pub struct AppPreferences {
     pub favorite_folders: Vec<FavoriteFolder>,
     #[serde(default)]
     pub active_favorite_folder_id: Option<String>,
+    #[serde(default)]
+    pub favorite_folder_tombstones: Vec<FavoriteFolderTombstone>,
 }
 
 impl Default for AppPreferences {
@@ -1257,6 +1265,7 @@ impl Default for AppPreferences {
             reuse_last_config: true,
             favorite_folders: default_favorite_folders(),
             active_favorite_folder_id: Some(DEFAULT_FAVORITE_FOLDER_ID.into()),
+            favorite_folder_tombstones: Vec::new(),
         }
     }
 }
@@ -1634,6 +1643,11 @@ pub fn apply_tombstones<T: SyncEntity>(
 
 pub fn merge_envelopes(left: &SyncEnvelope, right: &SyncEnvelope) -> SyncEnvelope {
     let tombstones = merge_tombstones(&left.tombstones, &right.tombstones);
+    let preferences = merge_preferences(
+        &left.preferences,
+        &right.preferences,
+        left.updated_at >= right.updated_at,
+    );
     SyncEnvelope {
         schema_version: left.schema_version.max(right.schema_version),
         updated_at: left.updated_at.clone().max(right.updated_at.clone()),
@@ -1657,13 +1671,99 @@ pub fn merge_envelopes(left: &SyncEnvelope, right: &SyncEnvelope) -> SyncEnvelop
             &tombstones,
             SyncEntityKind::Asset,
         ),
-        preferences: if left.updated_at >= right.updated_at {
-            left.preferences.clone()
-        } else {
-            right.preferences.clone()
-        },
+        preferences,
         tombstones,
     }
+}
+
+fn merge_preferences(
+    left: &AppPreferences,
+    right: &AppPreferences,
+    prefer_left: bool,
+) -> AppPreferences {
+    let mut merged = if prefer_left {
+        left.clone()
+    } else {
+        right.clone()
+    };
+    merged.favorite_folder_tombstones = merge_favorite_folder_tombstones(left, right);
+    merged.favorite_folders = merge_favorite_folders(
+        &left.favorite_folders,
+        &right.favorite_folders,
+        &merged.favorite_folder_tombstones,
+    );
+    if !merged
+        .favorite_folders
+        .iter()
+        .any(|folder| merged.active_favorite_folder_id.as_deref() == Some(folder.id.as_str()))
+    {
+        merged.active_favorite_folder_id = Some(DEFAULT_FAVORITE_FOLDER_ID.into());
+    }
+    merged
+}
+
+fn merge_favorite_folder_tombstones(
+    left: &AppPreferences,
+    right: &AppPreferences,
+) -> Vec<FavoriteFolderTombstone> {
+    let mut merged = HashMap::<String, FavoriteFolderTombstone>::new();
+    for tombstone in left
+        .favorite_folder_tombstones
+        .iter()
+        .chain(&right.favorite_folder_tombstones)
+    {
+        let should_replace = merged
+            .get(&tombstone.folder_id)
+            .map(|existing| existing.deleted_at < tombstone.deleted_at)
+            .unwrap_or(true);
+        if should_replace {
+            merged.insert(tombstone.folder_id.clone(), tombstone.clone());
+        }
+    }
+    let mut values = merged.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| left.deleted_at.cmp(&right.deleted_at));
+    values
+}
+
+fn merge_favorite_folders(
+    left: &[FavoriteFolder],
+    right: &[FavoriteFolder],
+    tombstones: &[FavoriteFolderTombstone],
+) -> Vec<FavoriteFolder> {
+    let mut merged = HashMap::<String, FavoriteFolder>::new();
+    for folder in left.iter().chain(right) {
+        let should_replace = merged
+            .get(&folder.id)
+            .map(|existing| existing.updated_at < folder.updated_at)
+            .unwrap_or(true);
+        if should_replace {
+            merged.insert(folder.id.clone(), folder.clone());
+        }
+    }
+    for tombstone in tombstones {
+        if tombstone.folder_id == DEFAULT_FAVORITE_FOLDER_ID {
+            continue;
+        }
+        let should_remove = merged
+            .get(&tombstone.folder_id)
+            .map(|folder| folder.updated_at <= tombstone.deleted_at)
+            .unwrap_or(false);
+        if should_remove {
+            merged.remove(&tombstone.folder_id);
+        }
+    }
+    if !merged.contains_key(DEFAULT_FAVORITE_FOLDER_ID) {
+        let default_folder = default_favorite_folders().remove(0);
+        merged.insert(default_folder.id.clone(), default_folder);
+    }
+    let mut values = merged.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        (left.id != DEFAULT_FAVORITE_FOLDER_ID)
+            .cmp(&(right.id != DEFAULT_FAVORITE_FOLDER_ID))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    values
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1872,6 +1972,104 @@ mod tests {
     }
 
     #[test]
+    fn favorite_folders_merge_by_folder_timestamp_instead_of_envelope_timestamp() {
+        let stale_folder = FavoriteFolder {
+            id: "folder-1".into(),
+            name: "文件夹 2".into(),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+        };
+        let renamed_folder = FavoriteFolder {
+            name: "角色收藏".into(),
+            updated_at: "2026-01-03T00:00:00+00:00".into(),
+            ..stale_folder.clone()
+        };
+        let second_folder = FavoriteFolder {
+            id: "folder-2".into(),
+            name: "场景收藏".into(),
+            created_at: "2026-01-02T00:00:00+00:00".into(),
+            updated_at: "2026-01-02T00:00:00+00:00".into(),
+        };
+        let mut stale_preferences = AppPreferences::default();
+        stale_preferences.favorite_folders.push(stale_folder);
+        let mut current_preferences = AppPreferences::default();
+        current_preferences
+            .favorite_folders
+            .extend([renamed_folder, second_folder]);
+
+        let merged = merge_envelopes(
+            &SyncEnvelope {
+                updated_at: "2026-01-04T00:00:00+00:00".into(),
+                preferences: stale_preferences,
+                ..SyncEnvelope::default()
+            },
+            &SyncEnvelope {
+                updated_at: "2026-01-03T00:00:00+00:00".into(),
+                preferences: current_preferences,
+                ..SyncEnvelope::default()
+            },
+        );
+
+        assert_eq!(merged.preferences.favorite_folders.len(), 3);
+        assert_eq!(
+            merged
+                .preferences
+                .favorite_folders
+                .iter()
+                .find(|folder| folder.id == "folder-1")
+                .map(|folder| folder.name.as_str()),
+            Some("角色收藏")
+        );
+        assert!(
+            merged
+                .preferences
+                .favorite_folders
+                .iter()
+                .any(|folder| folder.id == "folder-2")
+        );
+    }
+
+    #[test]
+    fn favorite_folder_tombstone_blocks_stale_device_restore() {
+        let folder = FavoriteFolder {
+            id: "folder-1".into(),
+            name: "待删除".into(),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+        };
+        let mut stale_preferences = AppPreferences::default();
+        stale_preferences.favorite_folders.push(folder);
+        let mut deleted_preferences = AppPreferences::default();
+        deleted_preferences
+            .favorite_folder_tombstones
+            .push(FavoriteFolderTombstone {
+                folder_id: "folder-1".into(),
+                deleted_at: "2026-01-02T00:00:00+00:00".into(),
+            });
+
+        let merged = merge_envelopes(
+            &SyncEnvelope {
+                updated_at: "2026-01-03T00:00:00+00:00".into(),
+                preferences: stale_preferences,
+                ..SyncEnvelope::default()
+            },
+            &SyncEnvelope {
+                updated_at: "2026-01-02T00:00:00+00:00".into(),
+                preferences: deleted_preferences,
+                ..SyncEnvelope::default()
+            },
+        );
+
+        assert!(
+            merged
+                .preferences
+                .favorite_folders
+                .iter()
+                .all(|folder| folder.id != "folder-1")
+        );
+    }
+
+    #[test]
     fn newer_tombstone_removes_record_and_blocks_old_device_restore() {
         let task = LocalTaskRecord {
             id: "task-1".into(),
@@ -1918,9 +2116,15 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.insert("schema_version".into(), serde_json::json!(1));
         object.remove("tombstones");
+        object
+            .get_mut("preferences")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("favorite_folder_tombstones");
         let decoded: SyncEnvelope = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.schema_version, 1);
         assert!(decoded.tombstones.is_empty());
+        assert!(decoded.preferences.favorite_folder_tombstones.is_empty());
     }
 
     #[test]

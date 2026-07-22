@@ -2122,14 +2122,14 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 .folder-picker-dismiss {
   position: fixed;
   inset: 0;
-  z-index: 55;
+  z-index: 91;
   border: 0;
   background: transparent;
 }
 
 .folder-picker-popover {
   position: fixed;
-  z-index: 56;
+  z-index: 92;
   min-width: 172px;
   display: grid;
   gap: 6px;

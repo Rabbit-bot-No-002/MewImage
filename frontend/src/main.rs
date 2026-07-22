@@ -21,12 +21,13 @@ use mew_image_shared::{
     AdminUsersResponse, AppPreferences, AuthRequest, AuthResponse,
     BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, CloudDataClearRequest,
     CloudDataClearScope, CloudDataStatsResponse, ConversationThread, DEFAULT_FAVORITE_FOLDER_ID,
-    EncryptedApiConfig, FavoriteFolder, GenerationSettingsSnapshot, ImageAssetRef, LocalAppState,
-    LocalTaskRecord, MeResponse, ProviderAccessMode, ProviderEndpointMode, ProviderKind,
-    ProviderTemplate, RegisterRequest, SyncCheckpoint, SyncEntityKind, SyncPullResponse,
-    SyncTombstone, TaskStatus, ThemePreference, UploadCompleteRequest, UploadCompleteResponse,
-    UploadInitRequest, UploadInitResponse, UserSummary, UsernameAvailabilityResponse, clamp_size,
-    new_id, normalize_api_config, now_rfc3339, strip_successful_task_payloads,
+    EncryptedApiConfig, FavoriteFolder, FavoriteFolderTombstone, GenerationSettingsSnapshot,
+    ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse, ProviderAccessMode,
+    ProviderEndpointMode, ProviderKind, ProviderTemplate, RegisterRequest, SyncCheckpoint,
+    SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus, ThemePreference,
+    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
+    UserSummary, UsernameAvailabilityResponse, clamp_size, new_id, normalize_api_config,
+    now_rfc3339, strip_successful_task_payloads,
 };
 use providers::{
     default_config, generate_with_strategy, hydrate_local_state, load_templates,
@@ -375,6 +376,61 @@ const ASSET_PAYLOAD_CACHE_MAX_BYTES: u64 = 48 * 1024 * 1024;
 
 thread_local! {
     static ASSET_PAYLOAD_LRU: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static GENERATION_AUDIO_CONTEXT: RefCell<Option<web_sys::AudioContext>> = const { RefCell::new(None) };
+}
+
+fn prepare_generation_notification_audio() {
+    GENERATION_AUDIO_CONTEXT.with(|slot| {
+        let mut context = slot.borrow_mut();
+        if context.is_none() {
+            *context = web_sys::AudioContext::new().ok();
+        }
+        if let Some(context) = context.as_ref() {
+            let _ = context.resume();
+        }
+    });
+}
+
+fn play_generation_notification(success: bool) {
+    GENERATION_AUDIO_CONTEXT.with(|slot| {
+        let context = slot.borrow();
+        let Some(context) = context.as_ref() else {
+            return;
+        };
+        let _ = context.resume();
+        let Ok(oscillator) = context.create_oscillator() else {
+            return;
+        };
+        let Ok(gain) = context.create_gain() else {
+            return;
+        };
+        if oscillator.connect_with_audio_node(&gain).is_err()
+            || gain
+                .connect_with_audio_node(&context.destination())
+                .is_err()
+        {
+            return;
+        }
+
+        let now = context.current_time();
+        let (first_frequency, second_frequency, oscillator_type) = if success {
+            (659.25, 880.0, web_sys::OscillatorType::Sine)
+        } else {
+            (440.0, 329.63, web_sys::OscillatorType::Triangle)
+        };
+        oscillator.set_type(oscillator_type);
+        let _ = oscillator
+            .frequency()
+            .set_value_at_time(first_frequency, now);
+        let _ = oscillator
+            .frequency()
+            .set_value_at_time(second_frequency, now + 0.14);
+        let _ = gain.gain().set_value_at_time(0.0001, now);
+        let _ = gain.gain().linear_ramp_to_value_at_time(0.09, now + 0.025);
+        let _ = gain.gain().linear_ramp_to_value_at_time(0.0001, now + 0.38);
+        let _ = oscillator.start_with_when(now);
+        let _ = oscillator.stop_with_when(now + 0.4);
+    });
 }
 
 #[component]
@@ -2882,9 +2938,24 @@ fn App() -> impl IntoView {
             if folder_id == DEFAULT_FAVORITE_FOLDER_ID {
                 return;
             }
+            let deleted_at = now_rfc3339();
             value
                 .favorite_folders
                 .retain(|folder| folder.id != folder_id);
+            if let Some(tombstone) = value
+                .favorite_folder_tombstones
+                .iter_mut()
+                .find(|item| item.folder_id == folder_id)
+            {
+                tombstone.deleted_at = deleted_at;
+            } else {
+                value
+                    .favorite_folder_tombstones
+                    .push(FavoriteFolderTombstone {
+                        folder_id: folder_id.clone(),
+                        deleted_at,
+                    });
+            }
             if value.active_favorite_folder_id.as_deref() == Some(folder_id.as_str()) {
                 value.active_favorite_folder_id = Some(DEFAULT_FAVORITE_FOLDER_ID.into());
             }
@@ -2898,6 +2969,7 @@ fn App() -> impl IntoView {
             }
         });
         persist_state();
+        persist_ui_state();
     };
 
     let delete_favorite_folder = move |folder_id: String, x: f64, y: f64| {
@@ -3180,6 +3252,7 @@ fn App() -> impl IntoView {
             status_text.set("请输入提示词后再开始生成。".into());
             return;
         }
+        prepare_generation_notification_audio();
         let thread_id = current_thread_id.get_untracked();
         let template = templates
             .get_untracked()
@@ -3328,6 +3401,7 @@ fn App() -> impl IntoView {
                 status_signal.set(format!("生成失败：{error}"));
                 abort_controller_signal.set(None);
                 generating_signal.set(false);
+                play_generation_notification(false);
                 return;
             }
             let references = assets_signal.with_untracked(|items| {
@@ -3505,6 +3579,7 @@ fn App() -> impl IntoView {
                         status_signal.set(format!("生成失败：{error}"));
                         abort_controller_signal.set(None);
                         generating_signal.set(false);
+                        play_generation_notification(false);
                         return;
                     }
                     let (actual_width, actual_height) = produced_assets
@@ -3546,6 +3621,7 @@ fn App() -> impl IntoView {
                     } else {
                         "生成完成，已自动进入连续修改模式，结果已写入当前会话。".into()
                     });
+                    play_generation_notification(true);
                 }
                 Err(error) => {
                     tasks_signal.update(|items| {
@@ -3557,6 +3633,7 @@ fn App() -> impl IntoView {
                     });
                     persist();
                     status_signal.set(format!("生成失败：{error}"));
+                    play_generation_notification(false);
                 }
             }
             abort_controller_signal.set(None);
@@ -4221,7 +4298,7 @@ fn App() -> impl IntoView {
                                                     <div class="stack">
                                                         <div class="row settings-about-title">
                                                             <h2>"关于 MewImage"</h2>
-                                                            <span class="tag settings-version-tag">"v1.0.1"</span>
+                                                            <span class="tag settings-version-tag">"v1.0.2"</span>
                                                             <a
                                                                 class="button ghost icon-button settings-github-button"
                                                                 href="https://github.com/Rabbit-bot-No-002/MewImage"
