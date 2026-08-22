@@ -3,7 +3,8 @@ use mew_image_shared::{
     BUILTIN_NANO_BANANA_TEMPLATE_ID, BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
     BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, EncryptedApiConfig, GenerateViaProxyRequest,
     GenerationRequest, GenerationResult, ImageAssetRef, LocalAppState, ProviderAccessMode,
-    ProviderEndpointMode, ProviderKind, ProviderTemplate, SyncCheckpoint, SyncEnvelope,
+    ProviderEndpointMode, ProviderKind, ProviderTemplate, ProxyGenerationJobAccepted,
+    ProxyGenerationJobResponse, ProxyGenerationJobStatus, SyncCheckpoint, SyncEnvelope,
     aspect_ratio_from_dimensions, build_gemini_generation_request,
     extract_gemini_generation_result, extract_openai_compatible_result,
     extract_openai_responses_result, gemini_auth_header, gemini_generate_content_url,
@@ -14,17 +15,24 @@ use mew_image_shared::{
 use serde_json::json;
 
 use crate::api::api_candidates;
+use crate::app::{blob_from_bytes, reencode_asset_bytes};
 use crate::crypto::{decrypt_secret, encrypt_secret};
-use crate::{blob_from_bytes, reencode_asset_bytes};
 
 const PROMPT_REWRITE_GUARD_PREFIX: &str =
     "Use the following text as the complete prompt. Do not rewrite it:";
+const PROXY_GENERATION_POLL_INTERVAL_MS: u32 = 1_500;
+const MAX_PROXY_POLL_NETWORK_FAILURES: u8 = 5;
 
 #[derive(Clone)]
 struct TransportAsset {
     meta: ImageAssetRef,
     bytes: Vec<u8>,
     mime_type: String,
+}
+
+enum ProxyGenerationSubmission {
+    Completed(GenerationResult),
+    Accepted(String),
 }
 
 pub fn default_config(template_id: &str) -> EncryptedApiConfig {
@@ -571,13 +579,20 @@ async fn proxy_generate(
             .map_err(|error| error.to_string())?;
         match builder.send().await {
             Ok(response) if response.ok() => {
-                return response.json().await.map_err(|error| error.to_string());
+                let body = response.text().await.map_err(|error| error.to_string())?;
+                match parse_proxy_generation_submission(&body)? {
+                    ProxyGenerationSubmission::Completed(result) => return Ok(result),
+                    ProxyGenerationSubmission::Accepted(job_id) => {
+                        return poll_proxy_generation(&url, &job_id, abort_signal).await;
+                    }
+                }
             }
             Ok(response) => {
-                return Err(response
+                let body = response
                     .text()
                     .await
-                    .unwrap_or_else(|_| "代理生成失败".into()));
+                    .unwrap_or_else(|_| "代理生成失败".into());
+                return Err(proxy_error_message(&body, "代理生成失败"));
             }
             Err(error) => {
                 errors.push(format!("{url} -> {error}"));
@@ -592,6 +607,104 @@ async fn proxy_generate(
             errors.join(" | ")
         }
     ))
+}
+
+fn parse_proxy_generation_submission(body: &str) -> Result<ProxyGenerationSubmission, String> {
+    // 兼容升级期间仍返回同步结果的旧版后端。
+    if let Ok(result) = serde_json::from_str::<GenerationResult>(body) {
+        return Ok(ProxyGenerationSubmission::Completed(result));
+    }
+    serde_json::from_str::<ProxyGenerationJobAccepted>(body)
+        .map(|accepted| ProxyGenerationSubmission::Accepted(accepted.job_id))
+        .map_err(|error| format!("代理任务响应解析失败：{error}"))
+}
+
+async fn poll_proxy_generation(
+    submit_url: &str,
+    job_id: &str,
+    abort_signal: Option<&web_sys::AbortSignal>,
+) -> Result<GenerationResult, String> {
+    let poll_url = format!("{}/{}", submit_url.trim_end_matches('/'), job_id);
+    let mut consecutive_network_failures = 0_u8;
+    loop {
+        if abort_signal.is_some_and(web_sys::AbortSignal::aborted) {
+            remove_proxy_generation_job(&poll_url).await;
+            return Err("当前生成任务已停止。".into());
+        }
+        gloo_timers::future::TimeoutFuture::new(PROXY_GENERATION_POLL_INTERVAL_MS).await;
+
+        let response = Request::get(&poll_url)
+            .abort_signal(abort_signal)
+            .credentials(web_sys::RequestCredentials::Include)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => {
+                consecutive_network_failures = 0;
+                response
+            }
+            Err(error) => {
+                if abort_signal.is_some_and(web_sys::AbortSignal::aborted) {
+                    remove_proxy_generation_job(&poll_url).await;
+                    return Err("当前生成任务已停止。".into());
+                }
+                consecutive_network_failures = consecutive_network_failures.saturating_add(1);
+                if consecutive_network_failures < MAX_PROXY_POLL_NETWORK_FAILURES {
+                    continue;
+                }
+                return Err(format!("代理任务状态查询失败：{error}"));
+            }
+        };
+        if !response.ok() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "代理任务状态查询失败".into());
+            return Err(proxy_error_message(&body, "代理任务状态查询失败"));
+        }
+
+        let job = response
+            .json::<ProxyGenerationJobResponse>()
+            .await
+            .map_err(|error| format!("代理任务状态解析失败：{error}"))?;
+        match job.status {
+            ProxyGenerationJobStatus::Queued | ProxyGenerationJobStatus::Running => continue,
+            ProxyGenerationJobStatus::Succeeded => {
+                let result = job
+                    .result
+                    .ok_or_else(|| "代理任务缺少生成结果。".to_string())?;
+                remove_proxy_generation_job(&poll_url).await;
+                return Ok(result);
+            }
+            ProxyGenerationJobStatus::Failed => {
+                let error = job.error.unwrap_or_else(|| "代理生成失败。".into());
+                remove_proxy_generation_job(&poll_url).await;
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn remove_proxy_generation_job(poll_url: &str) {
+    let _ = Request::delete(poll_url)
+        .credentials(web_sys::RequestCredentials::Include)
+        .send()
+        .await;
+}
+
+fn proxy_error_message(body: &str, fallback: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| {
+            let message = body.trim();
+            if message.is_empty() {
+                fallback.into()
+            } else {
+                message.into()
+            }
+        })
 }
 
 async fn prepare_transport_assets(assets: &[ImageAssetRef]) -> Result<Vec<TransportAsset>, String> {
@@ -974,7 +1087,40 @@ fn mask_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mew_image_shared::{SyncEntityKind, SyncTombstone};
+    use mew_image_shared::{ParameterSnapshot, SyncEntityKind, SyncTombstone};
+
+    #[test]
+    fn proxy_submission_parser_accepts_job_and_legacy_result() {
+        let accepted = parse_proxy_generation_submission(r#"{"job_id":"job-1"}"#).unwrap();
+        assert!(matches!(
+            accepted,
+            ProxyGenerationSubmission::Accepted(job_id) if job_id == "job-1"
+        ));
+
+        let expected = GenerationResult {
+            images: Vec::new(),
+            parameter_snapshot: ParameterSnapshot::default(),
+            raw_response_json: None,
+        };
+        let body = serde_json::to_string(&expected).unwrap();
+        let completed = parse_proxy_generation_submission(&body).unwrap();
+        assert!(matches!(
+            completed,
+            ProxyGenerationSubmission::Completed(result) if result == expected
+        ));
+    }
+
+    #[test]
+    fn proxy_error_prefers_backend_json_message() {
+        assert_eq!(
+            proxy_error_message(r#"{"error":"任务队列已满"}"#, "代理失败"),
+            "任务队列已满"
+        );
+        assert_eq!(
+            proxy_error_message("openresty 504", "代理失败"),
+            "openresty 504"
+        );
+    }
 
     #[test]
     fn responses_request_keeps_quality_with_prompt_guard() {

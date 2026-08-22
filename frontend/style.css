@@ -444,7 +444,7 @@ body[data-theme="night"] .gallery-page-wheel {
   position: absolute;
   top: 100%;
   right: 0;
-  width: 112px;
+  width: 128px;
   height: 3px;
   pointer-events: auto;
 }
@@ -540,6 +540,8 @@ body[data-theme="night"] .thread-chip-actions {
 }
 
 .thread-archive-item {
+  min-width: 0;
+  width: 100%;
   min-height: 38px;
   display: grid;
   grid-template-columns: 20px minmax(0, 1fr);
@@ -552,6 +554,30 @@ body[data-theme="night"] .thread-chip-actions {
   color: var(--text);
   cursor: pointer;
   text-align: left;
+}
+
+.thread-archive-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 4px;
+  align-items: center;
+}
+
+.thread-archive-export {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.thread-archive-export:hover,
+.thread-archive-export:focus-visible {
+  background: rgba(140, 202, 255, 0.15);
+  color: var(--text);
 }
 
 .thread-archive-item:hover {
@@ -1418,6 +1444,33 @@ body[data-theme="night"] .admin-user-row {
   color: #fff;
 }
 
+.session-export-card {
+  align-items: flex-end;
+}
+
+.session-export-controls {
+  width: min(420px, 100%);
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.session-export-select {
+  min-width: 0;
+}
+
+.session-export-controls .button {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 13px;
+  border-radius: 14px;
+  white-space: nowrap;
+}
+
 .danger-zone {
   border-color: color-mix(in srgb, var(--danger) 28%, var(--line));
   background: linear-gradient(145deg, color-mix(in srgb, var(--danger) 7%, var(--panel-strong)), var(--panel-strong));
@@ -1512,6 +1565,37 @@ body[data-theme="night"] .resolution-sheet {
   color: var(--muted);
   font-weight: 700;
   user-select: none;
+}
+
+.custom-ratio-editor {
+  display: grid;
+  gap: 8px;
+}
+
+.custom-ratio-editor-hidden {
+  display: none;
+}
+
+.custom-ratio-editor label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.field.invalid-field {
+  border-color: color-mix(in srgb, var(--danger) 70%, var(--line));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.resolution-effective-card {
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--secondary) 28%, var(--line));
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--secondary) 8%, var(--panel-strong));
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.5;
 }
 
 .resolution-panel {
@@ -2130,7 +2214,7 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 .folder-picker-popover {
   position: fixed;
   z-index: 92;
-  min-width: 172px;
+  width: min(240px, calc(100vw - 24px));
   display: grid;
   gap: 6px;
   padding: 10px;
@@ -2140,13 +2224,24 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
     linear-gradient(135deg, rgba(255, 125, 176, 0.12), rgba(140, 202, 255, 0.1)),
     var(--panel);
   box-shadow: 0 18px 40px rgba(32, 38, 64, 0.16);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .folder-picker-item {
+  width: 100%;
+  min-width: 0;
   min-height: 32px;
   padding: 7px 10px;
   border-radius: 12px;
   justify-content: flex-start;
+}
+
+.folder-picker-item span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .folder-picker-item:hover {
@@ -2837,6 +2932,10 @@ body[data-theme="night"] .config-switcher-menu {
     justify-content: flex-start;
   }
 
+  .session-export-controls {
+    width: 100%;
+  }
+
   .cloud-stat-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -2885,6 +2984,14 @@ body[data-theme="night"] .config-switcher-menu {
   .settings-inline {
     grid-template-columns: repeat(auto-fill, minmax(68px, max-content));
     gap: 4px;
+  }
+
+  .session-export-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .session-export-controls .button {
+    width: 100%;
   }
 
   .resolution-sheet,

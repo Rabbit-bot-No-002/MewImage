@@ -1,11 +1,12 @@
 mod state;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     path::{Component, Path as FsPath, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::{Duration as StdDuration, Instant},
 };
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -35,6 +36,7 @@ use mew_image_shared::{
     GenerateViaProxyRequest, GeneratedImageResult, GenerationResult, ImageAssetRef, MeResponse,
     MergePreviewResponse, OpenAiResponsesStreamAccumulator, ParameterSnapshot,
     ProviderEndpointMode, ProviderKind, ProviderTemplate, ProviderTemplateImportRequest,
+    ProxyGenerationJobAccepted, ProxyGenerationJobResponse, ProxyGenerationJobStatus,
     RegisterRequest, SyncEntityKind, SyncEnvelope, SyncPullResponse, SyncPushRequest,
     UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
     UserSummary, UsernameAvailabilityResponse, aspect_ratio_from_dimensions,
@@ -53,7 +55,7 @@ use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use state::{AppConfig, AppState, AssetStoreKind};
+use state::{AppConfig, AppState, AssetStoreKind, ProxyGenerationJob, ProxyGenerationJobState};
 use tokio::net::TcpListener;
 use tower_cookies::{
     Cookie, CookieManagerLayer, Cookies,
@@ -70,6 +72,10 @@ use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
 use tracing::{error, info, warn};
 
 const MAX_CONCURRENT_PROXY_GENERATIONS: usize = 5;
+const MAX_ACTIVE_PROXY_GENERATION_JOBS: usize = 20;
+const MAX_STORED_PROXY_GENERATION_JOBS: usize = 32;
+const PROXY_GENERATION_JOB_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
+const PROXY_GENERATION_RESULT_TTL: StdDuration = StdDuration::from_secs(10 * 60);
 const REGISTRATION_DEVICE_COOKIE: &str = "mew_registration_device";
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 static MALLOC_TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -136,6 +142,10 @@ async fn main() -> anyhow::Result<()> {
         generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
             MAX_CONCURRENT_PROXY_GENERATIONS,
         )),
+        generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
+            MAX_ACTIVE_PROXY_GENERATION_JOBS,
+        )),
+        generation_jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(config.auth_hash_concurrency)),
         dummy_password_hash,
     });
@@ -182,6 +192,10 @@ async fn main() -> anyhow::Result<()> {
             get(list_provider_templates).post(import_provider_template),
         )
         .route("/api/providers/generate", post(generate_via_proxy))
+        .route(
+            "/api/providers/generate/{job_id}",
+            get(get_proxy_generation_job).delete(cancel_proxy_generation_job),
+        )
         .route("/api/assets/upload-init", post(upload_init))
         .route("/api/assets/upload/{token}", put(upload_bytes))
         .route("/api/assets/complete", post(upload_complete))
@@ -384,7 +398,13 @@ fn build_cors_layer(config: &AppConfig) -> anyhow::Result<CorsLayer> {
     Ok(CorsLayer::new()
         .allow_credentials(true)
         .allow_headers(AllowHeaders::mirror_request())
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_origin(AllowOrigin::list(origin_headers)))
 }
 
@@ -1368,22 +1388,98 @@ async fn generate_via_proxy(
     State(state): State<Arc<AppState>>,
     session: Session,
     multipart: Multipart,
-) -> Result<Response, AppError> {
-    let _generation_permit = state
-        .generation_semaphore
-        .acquire()
-        .await
-        .map_err(|_| AppError::internal_message("代理生成并发控制器已关闭"))?;
-    let _memory_trim_guard = GenerationMemoryTrimGuard;
+) -> Result<(StatusCode, Json<ProxyGenerationJobAccepted>), AppError> {
+    let job_slot = state
+        .generation_job_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            AppError::rate_limited(
+                "当前代理生成任务较多，请稍后重试。",
+                "proxy_generation_queue_full",
+                5,
+            )
+        })?;
     let payload = parse_generate_multipart(multipart).await?;
     let user = current_user(&state, &session).await?;
     validate_generate_request(&state, user.as_ref(), &payload)?;
+
+    cleanup_proxy_generation_jobs(&state).await;
+    let job_id = format!("{}{}", new_id(), new_id());
+    state.generation_jobs.lock().await.insert(
+        job_id.clone(),
+        ProxyGenerationJob {
+            state: ProxyGenerationJobState::Queued,
+            updated_at: Instant::now(),
+            abort_handle: None,
+        },
+    );
+    let task_state = state.clone();
+    let task = tokio::spawn(run_proxy_generation_job(
+        state,
+        job_id.clone(),
+        payload,
+        job_slot,
+    ));
+    if let Some(job) = task_state.generation_jobs.lock().await.get_mut(&job_id) {
+        job.abort_handle = Some(task.abort_handle());
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ProxyGenerationJobAccepted { job_id }),
+    ))
+}
+
+async fn run_proxy_generation_job(
+    state: Arc<AppState>,
+    job_id: String,
+    payload: GenerateViaProxyRequest,
+    job_slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    let result = tokio::time::timeout(PROXY_GENERATION_JOB_TIMEOUT, async {
+        let _generation_permit = state
+            .generation_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::internal_message("代理生成并发控制器已关闭"))?;
+        update_proxy_generation_job(&state, &job_id, ProxyGenerationJobState::Running).await;
+        execute_proxy_generation(&state, &payload).await
+    })
+    .await;
+
+    let final_state = {
+        // 结果完成序列化并释放大型临时对象后，再尝试归还 glibc 堆内存。
+        let _memory_trim_guard = GenerationMemoryTrimGuard;
+        match result {
+            Ok(Ok(result)) => serialize_proxy_generation_result(result)
+                .map(ProxyGenerationJobState::Succeeded)
+                .unwrap_or_else(ProxyGenerationJobState::Failed),
+            Ok(Err(error)) => ProxyGenerationJobState::Failed(error.message),
+            Err(_) => ProxyGenerationJobState::Failed(
+                "代理生成等待超过 30 分钟，任务已停止，请稍后重试。".into(),
+            ),
+        }
+    };
+    update_proxy_generation_job(&state, &job_id, final_state).await;
+    drop(job_slot);
+
+    // 即使浏览器关闭后不再轮询，也会按时释放未读取结果。
+    tokio::time::sleep(PROXY_GENERATION_RESULT_TTL).await;
+    cleanup_proxy_generation_jobs(&state).await;
+}
+
+async fn execute_proxy_generation(
+    state: &AppState,
+    payload: &GenerateViaProxyRequest,
+) -> Result<GenerationResult, AppError> {
     let started_at = Utc::now();
     let response_json = match payload.template.kind {
-        ProviderKind::OpenAiImage => invoke_openai_image(&state, &payload).await?,
-        ProviderKind::NanoBanana => invoke_nano_banana(&state, &payload).await?,
-        ProviderKind::OpenAiCompatible => invoke_openai_compatible_image(&state, &payload).await?,
-        ProviderKind::CustomHttp => invoke_custom_http(&state, &payload).await?,
+        ProviderKind::OpenAiImage => invoke_openai_image(state, payload).await?,
+        ProviderKind::NanoBanana => invoke_nano_banana(state, payload).await?,
+        ProviderKind::OpenAiCompatible => invoke_openai_compatible_image(state, payload).await?,
+        ProviderKind::CustomHttp => invoke_custom_http(state, payload).await?,
     };
 
     let duration_ms = (Utc::now() - started_at).num_milliseconds().max(0) as u64;
@@ -1394,8 +1490,135 @@ async fn generate_via_proxy(
         response_json,
         duration_ms,
     );
-    let result = hydrate_proxy_result_images(&state, result).await?;
-    Ok(Json(result).into_response())
+    hydrate_proxy_result_images(state, result).await
+}
+
+async fn update_proxy_generation_job(
+    state: &AppState,
+    job_id: &str,
+    job_state: ProxyGenerationJobState,
+) {
+    if let Some(job) = state.generation_jobs.lock().await.get_mut(job_id) {
+        job.state = job_state;
+        job.updated_at = Instant::now();
+    }
+}
+
+async fn get_proxy_generation_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Response, AppError> {
+    let mut jobs = state.generation_jobs.lock().await;
+    cleanup_proxy_generation_job_entries(&mut jobs, Instant::now());
+    let Some(job) = jobs.get(&job_id) else {
+        return Err(AppError::not_found(
+            "代理生成任务不存在或结果已过期，请重新生成。",
+        ));
+    };
+
+    Ok(match &job.state {
+        ProxyGenerationJobState::Queued => proxy_generation_job_response(
+            StatusCode::ACCEPTED,
+            ProxyGenerationJobStatus::Queued,
+            None,
+        ),
+        ProxyGenerationJobState::Running => proxy_generation_job_response(
+            StatusCode::ACCEPTED,
+            ProxyGenerationJobStatus::Running,
+            None,
+        ),
+        ProxyGenerationJobState::Succeeded(body) => {
+            serialized_proxy_generation_job_response(body.clone())
+        }
+        ProxyGenerationJobState::Failed(error) => proxy_generation_job_response(
+            StatusCode::OK,
+            ProxyGenerationJobStatus::Failed,
+            Some(error.clone()),
+        ),
+    })
+}
+
+async fn cancel_proxy_generation_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> StatusCode {
+    let job = state.generation_jobs.lock().await.remove(&job_id);
+    if let Some(abort_handle) = job.and_then(|job| job.abort_handle) {
+        abort_handle.abort();
+    }
+    StatusCode::NO_CONTENT
+}
+
+fn serialize_proxy_generation_result(result: GenerationResult) -> Result<Bytes, String> {
+    serde_json::to_vec(&ProxyGenerationJobResponse {
+        status: ProxyGenerationJobStatus::Succeeded,
+        result: Some(result),
+        error: None,
+    })
+    .map(Bytes::from)
+    .map_err(|error| format!("代理生成结果序列化失败：{error}"))
+}
+
+fn proxy_generation_job_response(
+    http_status: StatusCode,
+    status: ProxyGenerationJobStatus,
+    error: Option<String>,
+) -> Response {
+    let mut response = (
+        http_status,
+        Json(ProxyGenerationJobResponse {
+            status,
+            result: None,
+            error,
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn serialized_proxy_generation_job_response(body: Bytes) -> Response {
+    let mut response = body.into_response();
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn cleanup_proxy_generation_jobs(state: &AppState) {
+    let mut jobs = state.generation_jobs.lock().await;
+    cleanup_proxy_generation_job_entries(&mut jobs, Instant::now());
+}
+
+fn cleanup_proxy_generation_job_entries(
+    jobs: &mut HashMap<String, ProxyGenerationJob>,
+    now: Instant,
+) {
+    jobs.retain(|_, job| {
+        !job.state.is_terminal()
+            || now.saturating_duration_since(job.updated_at) < PROXY_GENERATION_RESULT_TTL
+    });
+    if jobs.len() <= MAX_STORED_PROXY_GENERATION_JOBS {
+        return;
+    }
+
+    let mut completed_jobs = jobs
+        .iter()
+        .filter(|(_, job)| job.state.is_terminal())
+        .map(|(job_id, job)| (job_id.clone(), job.updated_at))
+        .collect::<Vec<_>>();
+    completed_jobs.sort_by_key(|(_, updated_at)| *updated_at);
+    let remove_count = jobs.len().saturating_sub(MAX_STORED_PROXY_GENERATION_JOBS);
+    for (job_id, _) in completed_jobs.into_iter().take(remove_count) {
+        jobs.remove(&job_id);
+    }
 }
 
 async fn parse_generate_multipart(
@@ -3357,6 +3580,60 @@ mod tests {
     }
 
     #[test]
+    fn proxy_generation_job_cleanup_expires_and_caps_completed_results() {
+        let now = Instant::now();
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "running".into(),
+            ProxyGenerationJob {
+                state: ProxyGenerationJobState::Running,
+                updated_at: now - PROXY_GENERATION_RESULT_TTL - StdDuration::from_secs(1),
+                abort_handle: None,
+            },
+        );
+        jobs.insert(
+            "expired".into(),
+            ProxyGenerationJob {
+                state: ProxyGenerationJobState::Failed("expired".into()),
+                updated_at: now - PROXY_GENERATION_RESULT_TTL - StdDuration::from_secs(1),
+                abort_handle: None,
+            },
+        );
+        for index in 0..=MAX_STORED_PROXY_GENERATION_JOBS {
+            jobs.insert(
+                format!("completed-{index}"),
+                ProxyGenerationJob {
+                    state: ProxyGenerationJobState::Failed("failed".into()),
+                    updated_at: now - StdDuration::from_secs(index as u64),
+                    abort_handle: None,
+                },
+            );
+        }
+
+        cleanup_proxy_generation_job_entries(&mut jobs, now);
+
+        assert!(jobs.contains_key("running"));
+        assert!(!jobs.contains_key("expired"));
+        assert_eq!(jobs.len(), MAX_STORED_PROXY_GENERATION_JOBS);
+        assert!(!jobs.contains_key(&format!("completed-{}", MAX_STORED_PROXY_GENERATION_JOBS)));
+    }
+
+    #[test]
+    fn proxy_generation_result_serializes_as_reusable_poll_response() {
+        let body = serialize_proxy_generation_result(GenerationResult {
+            images: Vec::new(),
+            parameter_snapshot: ParameterSnapshot::default(),
+            raw_response_json: None,
+        })
+        .unwrap();
+        let response: ProxyGenerationJobResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(response.status, ProxyGenerationJobStatus::Succeeded);
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
+
+    #[test]
     fn builtin_openai_compatible_template_uses_config_base_url() {
         let builtin = ProviderTemplate::builtin_openai_compatible();
         assert!(builtin.base_url.is_empty());
@@ -3643,6 +3920,10 @@ mod tests {
             generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_PROXY_GENERATIONS,
             )),
+            generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_ACTIVE_PROXY_GENERATION_JOBS,
+            )),
+            generation_jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             dummy_password_hash: hash_password("dummy").unwrap(),
         };

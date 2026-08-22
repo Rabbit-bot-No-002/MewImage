@@ -23,7 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"
 sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "fs"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "fs", "sync", "time"] }
 tower = "0.5.2"
 tower-cookies = "0.11.0"
 tower-http = { version = "0.6.6", features = ["cors", "fs", "trace"] }

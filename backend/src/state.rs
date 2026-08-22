@@ -1,8 +1,28 @@
 use aws_sdk_s3::Client as S3Client;
+use bytes::Bytes;
 use mew_image_shared::{ProviderTemplate, new_id};
 use sqlx::SqlitePool;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::{collections::HashMap, sync::Arc, time::Instant};
+use tokio::sync::{Mutex, Semaphore};
+
+pub enum ProxyGenerationJobState {
+    Queued,
+    Running,
+    Succeeded(Bytes),
+    Failed(String),
+}
+
+impl ProxyGenerationJobState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded(_) | Self::Failed(_))
+    }
+}
+
+pub struct ProxyGenerationJob {
+    pub state: ProxyGenerationJobState,
+    pub updated_at: Instant,
+    pub abort_handle: Option<tokio::task::AbortHandle>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetStoreKind {
@@ -181,6 +201,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub provider_builtins: Vec<ProviderTemplate>,
     pub generation_semaphore: Arc<Semaphore>,
+    pub generation_job_slots: Arc<Semaphore>,
+    pub generation_jobs: Arc<Mutex<HashMap<String, ProxyGenerationJob>>>,
     pub auth_hash_semaphore: Arc<Semaphore>,
     pub dummy_password_hash: String,
 }

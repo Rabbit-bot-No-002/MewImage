@@ -1153,6 +1153,27 @@ pub struct GenerateViaProxyRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxyGenerationJobAccepted {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyGenerationJobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProxyGenerationJobResponse {
+    pub status: ProxyGenerationJobStatus,
+    pub result: Option<GenerationResult>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenerationSettingsSnapshot {
     pub width: u32,
     pub height: u32,
