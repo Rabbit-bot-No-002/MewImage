@@ -386,6 +386,10 @@ pub(crate) fn build_data_actions(
     let perform_clear_cloud_data = move |scope: CloudDataClearScope| {
         data_management_busy.set(true);
         data_management_message.set(Some("正在清除所选云端数据……".into()));
+        let clears_sync_data = matches!(
+            scope,
+            CloudDataClearScope::SyncData | CloudDataClearScope::All
+        );
         spawn_local(async move {
             let request = Request::post(&api_url("/api/data/clear"))
                 .credentials(web_sys::RequestCredentials::Include)
@@ -400,11 +404,29 @@ pub(crate) fn build_data_actions(
             };
             match result {
                 Ok(response) if response.ok() => {
+                    if clears_sync_data {
+                        assets.update(|items| {
+                            for asset in items {
+                                if asset.remote_object_key.is_none() && asset.remote_url.is_none() {
+                                    continue;
+                                }
+                                asset.remote_object_key = None;
+                                asset.remote_url = None;
+                                asset.updated_at = now_rfc3339();
+                            }
+                        });
+                        checkpoint.set(SyncCheckpoint::default());
+                        persist_state();
+                    }
                     match response.json::<CloudDataStatsResponse>().await {
                         Ok(stats) => {
                             cloud_data_stats.set(Some(stats));
-                            data_management_message
-                                .set(Some("所选云端数据已清除，本地工作区未受影响。".into()));
+                            data_management_message.set(Some(if clears_sync_data {
+                                "云端同步数据与图片已清除；本地原图仍保留，下次同步会重新上传。"
+                                    .into()
+                            } else {
+                                "所选云端数据已清除，本地工作区未受影响。".into()
+                            }));
                         }
                         Err(error) => {
                             data_management_message.set(Some(format!("清除结果解析失败：{error}")))

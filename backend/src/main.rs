@@ -31,20 +31,20 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use mew_image_shared::{
     AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUserSummary,
-    AdminUsersResponse, AuthRequest, AuthResponse, BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
-    ChangePasswordRequest, CloudDataClearRequest, CloudDataClearScope, CloudDataStatsResponse,
-    GenerateViaProxyRequest, GeneratedImageResult, GenerationResult, ImageAssetRef, MeResponse,
-    MergePreviewResponse, OpenAiResponsesStreamAccumulator, ParameterSnapshot,
-    ProviderEndpointMode, ProviderKind, ProviderTemplate, ProviderTemplateImportRequest,
-    ProxyGenerationJobAccepted, ProxyGenerationJobResponse, ProxyGenerationJobStatus,
-    RegisterRequest, SyncEntityKind, SyncEnvelope, SyncPullResponse, SyncPushRequest,
-    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
-    UserSummary, UsernameAvailabilityResponse, aspect_ratio_from_dimensions,
-    build_gemini_generation_request, extract_gemini_generation_result,
-    extract_openai_compatible_result, extract_openai_responses_result, gemini_auth_header,
-    gemini_generate_content_url, is_google_official_gemini_base_url, merge_envelopes,
-    nano_banana_image_size_from_dimensions, new_id, now_rfc3339,
-    parse_openai_responses_event_stream, resolve_responses_main_model,
+    AdminUsersResponse, AssetPresenceRequest, AssetPresenceResponse, AuthRequest, AuthResponse,
+    BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID, ChangePasswordRequest, CloudDataClearRequest,
+    CloudDataClearScope, CloudDataStatsResponse, GenerateViaProxyRequest, GeneratedImageResult,
+    GenerationResult, ImageAssetRef, MeResponse, MergePreviewResponse,
+    OpenAiResponsesStreamAccumulator, ParameterSnapshot, ProviderEndpointMode, ProviderKind,
+    ProviderTemplate, ProviderTemplateImportRequest, ProxyGenerationJobAccepted,
+    ProxyGenerationJobResponse, ProxyGenerationJobStatus, RegisterRequest, SyncEntityKind,
+    SyncEnvelope, SyncPullResponse, SyncPushRequest, UploadCompleteRequest, UploadCompleteResponse,
+    UploadInitRequest, UploadInitResponse, UserSummary, UsernameAvailabilityResponse,
+    aspect_ratio_from_dimensions, build_gemini_generation_request,
+    extract_gemini_generation_result, extract_openai_compatible_result,
+    extract_openai_responses_result, gemini_auth_header, gemini_generate_content_url,
+    is_google_official_gemini_base_url, merge_envelopes, nano_banana_image_size_from_dimensions,
+    new_id, now_rfc3339, parse_openai_responses_event_stream, resolve_responses_main_model,
     strip_successful_task_payloads,
 };
 use rand::distr::{Alphanumeric, SampleString};
@@ -76,6 +76,7 @@ const MAX_ACTIVE_PROXY_GENERATION_JOBS: usize = 20;
 const MAX_STORED_PROXY_GENERATION_JOBS: usize = 32;
 const PROXY_GENERATION_JOB_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
 const PROXY_GENERATION_RESULT_TTL: StdDuration = StdDuration::from_secs(10 * 60);
+const MAX_ASSET_PRESENCE_CHECKS: usize = 10_000;
 const REGISTRATION_DEVICE_COOKIE: &str = "mew_registration_device";
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 static MALLOC_TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -199,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/assets/upload-init", post(upload_init))
         .route("/api/assets/upload/{token}", put(upload_bytes))
         .route("/api/assets/complete", post(upload_complete))
+        .route("/api/assets/presence", post(check_asset_presence))
         .route("/api/assets/{asset_id}", get(get_asset))
         .route("/api/images/fetch", post(fetch_image_via_proxy))
         .fallback_service(
@@ -1165,6 +1167,62 @@ async fn import_provider_template(
     Ok(Json(payload.template))
 }
 
+async fn check_asset_presence(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(payload): Json<AssetPresenceRequest>,
+) -> Result<Json<AssetPresenceResponse>, AppError> {
+    let user = require_approved_user(&state, &session).await?;
+    if payload.asset_ids.len() > MAX_ASSET_PRESENCE_CHECKS {
+        return Err(AppError::bad_request("单次图片完整性检查数量过多。"));
+    }
+
+    let rows = sqlx::query("SELECT id, object_key FROM assets WHERE user_id = ?")
+        .bind(&user.id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let indexed_objects = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("id"),
+                row.get::<String, _>("object_key"),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut checked_objects = HashMap::<String, bool>::new();
+    let mut missing_asset_ids = Vec::new();
+    let mut stale_object_keys = BTreeSet::new();
+    let mut seen_asset_ids = BTreeSet::new();
+
+    for asset_id in payload.asset_ids {
+        if !seen_asset_ids.insert(asset_id.clone()) {
+            continue;
+        }
+        let Some(object_key) = indexed_objects.get(&asset_id) else {
+            missing_asset_ids.push(asset_id);
+            continue;
+        };
+        let exists = if let Some(exists) = checked_objects.get(object_key) {
+            *exists
+        } else {
+            let exists = object_exists(&state, object_key).await?;
+            checked_objects.insert(object_key.clone(), exists);
+            exists
+        };
+        if !exists {
+            stale_object_keys.insert(object_key.clone());
+            missing_asset_ids.push(asset_id);
+        }
+    }
+
+    for object_key in stale_object_keys {
+        delete_asset_indexes_for_object(&state.db, &user.id, &object_key).await?;
+    }
+    Ok(Json(AssetPresenceResponse { missing_asset_ids }))
+}
+
 async fn upload_init(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -1360,7 +1418,14 @@ async fn get_asset(
         return Err(AppError::unauthorized("当前登录用户无权访问该资源"));
     }
 
-    let bytes = get_object_bytes(&state, &row.get::<String, _>("object_key")).await?;
+    let object_key = row.get::<String, _>("object_key");
+    if !object_exists(&state, &object_key).await? {
+        delete_asset_indexes_for_object(&state.db, &user.id, &object_key).await?;
+        return Err(AppError::not_found(
+            "资源原文件不存在，请重新同步本地原图。",
+        ));
+    }
+    let bytes = get_object_bytes(&state, &object_key).await?;
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1793,23 +1858,35 @@ async fn normalize_envelope_assets(
     }
     strip_successful_task_payloads(&mut envelope.tasks);
     for asset in &mut envelope.assets {
+        let mut invalidated_remote_reference = false;
         if let Some(object_key) = asset.remote_object_key.take() {
             if is_user_asset_object_key(&object_key, user_id, &asset.sha256) {
-                asset.remote_object_key = Some(object_key.clone());
-                asset.remote_url = Some(format!("/api/assets/{}", asset.id));
-                asset.data_url = None;
-                let mime_type = asset.mime_type.clone();
-                upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
-                continue;
+                if object_exists(state, &object_key).await? {
+                    asset.remote_object_key = Some(object_key.clone());
+                    asset.remote_url = Some(format!("/api/assets/{}", asset.id));
+                    asset.data_url = None;
+                    let mime_type = asset.mime_type.clone();
+                    upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
+                    continue;
+                }
+                delete_asset_indexes_for_object(&state.db, user_id, &object_key).await?;
+                invalidated_remote_reference = true;
+                warn!(
+                    "discarded missing synced object for user {}: {}",
+                    user_id, object_key
+                );
+            } else {
+                invalidated_remote_reference = true;
+                warn!(
+                    "ignored invalid synced object key for user {}: {}",
+                    user_id, object_key
+                );
             }
-            warn!(
-                "ignored invalid synced object key for user {}: {}",
-                user_id, object_key
-            );
         }
+        asset.remote_url = None;
 
         if let Some((object_key, mime_type, byte_len, sha256)) =
-            find_indexed_asset_object(&state.db, user_id, &asset.id).await?
+            find_available_indexed_asset_object(state, user_id, &asset.id).await?
         {
             asset.remote_object_key = Some(object_key.clone());
             asset.remote_url = Some(format!("/api/assets/{}", asset.id));
@@ -1822,7 +1899,7 @@ async fn normalize_envelope_assets(
         }
 
         if let Some((object_key, mime_type, byte_len)) =
-            find_existing_asset_object(&state.db, user_id, &asset.sha256).await?
+            find_available_asset_object_by_hash(state, user_id, &asset.sha256).await?
         {
             asset.remote_object_key = Some(object_key.clone());
             asset.remote_url = Some(format!("/api/assets/{}", asset.id));
@@ -1833,6 +1910,10 @@ async fn normalize_envelope_assets(
             continue;
         }
 
+        if invalidated_remote_reference {
+            // 让服务器确认的“远程文件已失效”覆盖客户端同时间戳的旧远程标记。
+            asset.updated_at = now_rfc3339();
+        }
         let Some(data_url) = asset.data_url.take() else {
             continue;
         };
@@ -1863,6 +1944,21 @@ async fn find_indexed_asset_object(
     .map_err(AppError::internal)
 }
 
+async fn find_available_indexed_asset_object(
+    state: &AppState,
+    user_id: &str,
+    asset_id: &str,
+) -> Result<Option<(String, String, i64, String)>, AppError> {
+    let Some(indexed) = find_indexed_asset_object(&state.db, user_id, asset_id).await? else {
+        return Ok(None);
+    };
+    if object_exists(state, &indexed.0).await? {
+        return Ok(Some(indexed));
+    }
+    delete_asset_indexes_for_object(&state.db, user_id, &indexed.0).await?;
+    Ok(None)
+}
+
 fn is_user_asset_object_key(object_key: &str, user_id: &str, sha256: &str) -> bool {
     let expected_prefix = format!("users/{user_id}/assets/{sha256}");
     object_key
@@ -1889,6 +1985,36 @@ async fn find_existing_asset_object(
     .fetch_optional(db)
     .await
     .map_err(AppError::internal)
+}
+
+async fn find_available_asset_object_by_hash(
+    state: &AppState,
+    user_id: &str,
+    sha256: &str,
+) -> Result<Option<(String, String, i64)>, AppError> {
+    loop {
+        let Some(indexed) = find_existing_asset_object(&state.db, user_id, sha256).await? else {
+            return Ok(None);
+        };
+        if object_exists(state, &indexed.0).await? {
+            return Ok(Some(indexed));
+        }
+        delete_asset_indexes_for_object(&state.db, user_id, &indexed.0).await?;
+    }
+}
+
+async fn delete_asset_indexes_for_object(
+    db: &SqlitePool,
+    user_id: &str,
+    object_key: &str,
+) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM assets WHERE user_id = ? AND object_key = ?")
+        .bind(user_id)
+        .bind(object_key)
+        .execute(db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(())
 }
 
 async fn upsert_asset_index(
@@ -1961,6 +2087,42 @@ async fn put_object(
         AssetStoreKind::Disabled => Err(AppError::bad_request(
             "服务器未启用远程资源存储，当前操作不可用。",
         )),
+    }
+}
+
+async fn object_exists(state: &AppState, object_key: &str) -> Result<bool, AppError> {
+    match state.config.asset_store {
+        AssetStoreKind::Local => {
+            let path = local_object_path(&state.config.local_asset_dir, object_key)?;
+            match tokio::fs::metadata(path).await {
+                Ok(metadata) => Ok(metadata.is_file()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(AppError::internal(error)),
+            }
+        }
+        AssetStoreKind::S3 => {
+            let client = state.s3.as_ref().ok_or_else(|| {
+                AppError::bad_request("服务器未启用远程资源存储，当前操作不可用。")
+            })?;
+            match client
+                .head_object()
+                .bucket(&state.config.s3_bucket)
+                .key(object_key)
+                .send()
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error)
+                    if error
+                        .as_service_error()
+                        .is_some_and(|service_error| service_error.is_not_found()) =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(AppError::internal(error)),
+            }
+        }
+        AssetStoreKind::Disabled => Ok(false),
     }
 }
 
@@ -3579,6 +3741,25 @@ mod tests {
         db
     }
 
+    async fn test_app_state(local_asset_dir: String) -> AppState {
+        AppState {
+            config: test_config(local_asset_dir),
+            db: test_db().await,
+            s3: None,
+            http: reqwest::Client::new(),
+            provider_builtins: Vec::new(),
+            generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PROXY_GENERATIONS,
+            )),
+            generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_ACTIVE_PROXY_GENERATION_JOBS,
+            )),
+            generation_jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            dummy_password_hash: hash_password("dummy").unwrap(),
+        }
+    }
+
     #[test]
     fn proxy_generation_job_cleanup_expires_and_caps_completed_results() {
         let now = Instant::now();
@@ -3857,6 +4038,61 @@ mod tests {
         assert_eq!(indexed.3, "real-hash");
     }
 
+    #[tokio::test]
+    async fn sync_normalization_discards_index_when_object_file_is_missing() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        let object_key = "users/user-1/assets/hash-1.bin";
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind("asset-1")
+        .bind("user-1")
+        .bind(object_key)
+        .bind("image/png")
+        .bind("hash")
+        .bind(4_i64)
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let old_updated_at = "2026-01-01T00:00:00+00:00".to_string();
+        let envelope = SyncEnvelope {
+            assets: vec![ImageAssetRef {
+                id: "asset-1".into(),
+                sha256: "hash".into(),
+                mime_type: "image/png".into(),
+                byte_len: 4,
+                width: None,
+                height: None,
+                created_at: old_updated_at.clone(),
+                updated_at: old_updated_at.clone(),
+                data_url: None,
+                remote_object_key: Some(object_key.into()),
+                remote_url: Some("/api/assets/asset-1".into()),
+                source_task_id: None,
+                metadata: Default::default(),
+            }],
+            ..SyncEnvelope::default()
+        };
+
+        let normalized = normalize_envelope_assets(&state, "user-1", envelope)
+            .await
+            .unwrap();
+        let asset = &normalized.assets[0];
+        assert!(asset.remote_object_key.is_none());
+        assert!(asset.remote_url.is_none());
+        assert!(asset.updated_at > old_updated_at);
+        let indexed_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE user_id = 'user-1'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(indexed_count, 0);
+    }
+
     #[test]
     fn responses_result_can_find_nested_base64() {
         let request = GenerationRequest {
@@ -3903,30 +4139,8 @@ mod tests {
 
     #[tokio::test]
     async fn tombstone_cleanup_keeps_shared_object_until_last_reference_is_deleted() {
-        let db = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        init_db(&db).await.unwrap();
         let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
-        let config = test_config(asset_dir.to_string_lossy().into_owned());
-        let state = AppState {
-            config,
-            db,
-            s3: None,
-            http: reqwest::Client::new(),
-            provider_builtins: Vec::new(),
-            generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_PROXY_GENERATIONS,
-            )),
-            generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
-                MAX_ACTIVE_PROXY_GENERATION_JOBS,
-            )),
-            generation_jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
-            dummy_password_hash: hash_password("dummy").unwrap(),
-        };
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
         let object_key = "users/user-1/assets/shared.bin";
         put_object(&state, object_key, "image/png", b"image".to_vec())
             .await

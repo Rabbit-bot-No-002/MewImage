@@ -117,6 +117,46 @@ pub(crate) fn build_account_actions(
         spawn_local(async move {
             let started_at = js_sys::Date::now();
             let mut state = state;
+            let indexed_asset_ids = state
+                .assets
+                .iter()
+                .filter(|asset| asset.remote_object_key.is_some())
+                .map(|asset| asset.id.clone())
+                .collect::<Vec<_>>();
+            if !indexed_asset_ids.is_empty() {
+                status_signal.set(Some("正在核验云端图片完整性……".into()));
+                let missing_remote_ids = match missing_remote_asset_ids(indexed_asset_ids).await {
+                    Ok(asset_ids) => asset_ids,
+                    Err(error) => {
+                        syncing_signal.set(false);
+                        status_signal.set(Some(error));
+                        return;
+                    }
+                };
+                if !missing_remote_ids.is_empty() {
+                    let missing_remote_ids = missing_remote_ids.into_iter().collect::<HashSet<_>>();
+                    let invalidate_remote_fields = |asset: &mut ImageAssetRef| {
+                        if missing_remote_ids.contains(&asset.id) {
+                            asset.remote_object_key = None;
+                            asset.remote_url = None;
+                            asset.updated_at = now_rfc3339();
+                        }
+                    };
+                    for asset in &mut state.assets {
+                        invalidate_remote_fields(asset);
+                    }
+                    assets_signal.update(|items| {
+                        for asset in items {
+                            invalidate_remote_fields(asset);
+                        }
+                    });
+                    persist();
+                    status_signal.set(Some(format!(
+                        "发现 {} 张云端原图缺失，正在从当前设备恢复……",
+                        missing_remote_ids.len()
+                    )));
+                }
+            }
             let pending_asset_ids = state
                 .assets
                 .iter()

@@ -91,7 +91,9 @@ pub(crate) enum ConfirmPopoverKind {
     DeleteTask(String),
     DeleteUser(String),
     ClearLocalData(LocalDataClearScope),
+    ClearLocalDataFinal(LocalDataClearScope),
     ClearCloudData(CloudDataClearScope),
+    ClearCloudDataFinal(CloudDataClearScope),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

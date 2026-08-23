@@ -1,5 +1,40 @@
 use super::super::*;
 
+const ASSET_PRESENCE_BATCH_SIZE: usize = 500;
+
+pub(crate) async fn missing_remote_asset_ids(
+    asset_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut missing_asset_ids = Vec::new();
+    for batch in asset_ids.chunks(ASSET_PRESENCE_BATCH_SIZE) {
+        missing_asset_ids.extend(check_remote_asset_batch(batch.to_vec()).await?);
+    }
+    Ok(missing_asset_ids)
+}
+
+async fn check_remote_asset_batch(asset_ids: Vec<String>) -> Result<Vec<String>, String> {
+    let builder = Request::post(&api_url("/api/assets/presence"))
+        .credentials(web_sys::RequestCredentials::Include)
+        .json(&AssetPresenceRequest { asset_ids })
+        .map_err(|error| format!("图片完整性检查序列化失败：{error}"))?;
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| format!("图片完整性检查失败：{error}"))?;
+    if !response.ok() {
+        let raw = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "图片完整性检查失败".into());
+        return Err(api_error_message(raw, "图片完整性检查失败"));
+    }
+    response
+        .json::<AssetPresenceResponse>()
+        .await
+        .map(|result| result.missing_asset_ids)
+        .map_err(|error| format!("图片完整性检查响应解析失败：{error}"))
+}
+
 pub(crate) async fn upload_asset_for_sync(
     asset: &ImageAssetRef,
     data_url: &str,

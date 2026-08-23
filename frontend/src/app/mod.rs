@@ -30,15 +30,15 @@ use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use leptos::{prelude::*, task::spawn_local};
 use mew_image_shared::{
     AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUsersResponse,
-    AppPreferences, AuthRequest, AuthResponse, BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
-    ChangePasswordRequest, CloudDataClearRequest, CloudDataClearScope, CloudDataStatsResponse,
-    ConversationThread, DEFAULT_FAVORITE_FOLDER_ID, EncryptedApiConfig, FavoriteFolder,
-    FavoriteFolderTombstone, GenerationSettingsSnapshot, ImageAssetRef, LocalAppState,
-    LocalTaskRecord, MeResponse, ProviderKind, ProviderTemplate, RegisterRequest, SyncCheckpoint,
-    SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus, ThemePreference,
-    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
-    UserSummary, UsernameAvailabilityResponse, new_id, normalize_api_config, now_rfc3339,
-    strip_successful_task_payloads,
+    AppPreferences, AssetPresenceRequest, AssetPresenceResponse, AuthRequest, AuthResponse,
+    BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, CloudDataClearRequest,
+    CloudDataClearScope, CloudDataStatsResponse, ConversationThread, DEFAULT_FAVORITE_FOLDER_ID,
+    EncryptedApiConfig, FavoriteFolder, FavoriteFolderTombstone, GenerationSettingsSnapshot,
+    ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse, ProviderKind, ProviderTemplate,
+    RegisterRequest, SyncCheckpoint, SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus,
+    ThemePreference, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
+    UploadInitResponse, UserSummary, UsernameAvailabilityResponse, new_id, normalize_api_config,
+    now_rfc3339, strip_successful_task_payloads,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

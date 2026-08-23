@@ -401,6 +401,48 @@ pub(crate) fn cloud_clear_confirmation(
     }
 }
 
+pub(crate) fn local_clear_final_confirmation(
+    scope: LocalDataClearScope,
+) -> (&'static str, &'static str) {
+    match scope {
+        LocalDataClearScope::Workspace => (
+            "再次确认清除本地工作区",
+            "这是第二次确认：当前浏览器中的会话、任务、收藏和图片原文件将被永久删除，操作无法撤销。",
+        ),
+        LocalDataClearScope::Configs => (
+            "再次确认清除服务商配置",
+            "这是第二次确认：当前浏览器保存的服务商配置、API Key 和可信设备密钥将被永久删除。",
+        ),
+        LocalDataClearScope::Preferences => (
+            "再次确认重置界面偏好",
+            "这是第二次确认：主题、收藏文件夹和其他本地界面偏好将恢复默认值。",
+        ),
+        LocalDataClearScope::All => (
+            "再次确认清除全部本地数据",
+            "这是第二次确认：当前浏览器中的工作区、图片、配置、API Key 和偏好将被永久删除，操作无法撤销。",
+        ),
+    }
+}
+
+pub(crate) fn cloud_clear_final_confirmation(
+    scope: &CloudDataClearScope,
+) -> (&'static str, &'static str) {
+    match scope {
+        CloudDataClearScope::SyncData => (
+            "再次确认清除云端同步数据",
+            "这是第二次确认：云端同步快照和服务器原图将被永久删除；只有仍保存在设备本地的原图才能重新上传。",
+        ),
+        CloudDataClearScope::ProviderTemplates => (
+            "再次确认清除云端模板",
+            "这是第二次确认：当前账号保存的全部云端服务商模板将被永久删除。",
+        ),
+        CloudDataClearScope::All => (
+            "再次确认清除全部云端数据",
+            "这是第二次确认：当前账号的同步快照、服务器原图和云端模板将被永久删除，操作无法撤销。",
+        ),
+    }
+}
+
 pub(crate) fn mask_key(value: &str) -> String {
     if value.len() <= 6 {
         return "******".into();
@@ -422,5 +464,17 @@ mod tests {
             favorite_folder_picker_style_for_viewport(315.0, 470.0, 320.0, 480.0),
             "left: 68px; bottom: 18px; max-height: 450px;"
         );
+    }
+
+    #[test]
+    fn destructive_data_clear_has_distinct_second_confirmation() {
+        let (local_title, local_message) = local_clear_final_confirmation(LocalDataClearScope::All);
+        assert!(local_title.contains("再次确认"));
+        assert!(local_message.contains("第二次确认"));
+
+        let (cloud_title, cloud_message) =
+            cloud_clear_final_confirmation(&CloudDataClearScope::SyncData);
+        assert!(cloud_title.contains("再次确认"));
+        assert!(cloud_message.contains("第二次确认"));
     }
 }

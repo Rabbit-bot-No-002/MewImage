@@ -241,6 +241,7 @@ pub(crate) fn build_preview_actions(
         let Some(state) = confirm_popover.get_untracked() else {
             return;
         };
+        let (x, y) = (state.x, state.y);
         confirm_popover.set(None);
         match state.kind {
             ConfirmPopoverKind::CancelGeneration => {
@@ -260,8 +261,28 @@ pub(crate) fn build_preview_actions(
             ConfirmPopoverKind::DeleteUser(user_id) => {
                 admin_user_action("/api/admin/users/delete", user_id)
             }
-            ConfirmPopoverKind::ClearLocalData(scope) => perform_clear_local_data(scope),
-            ConfirmPopoverKind::ClearCloudData(scope) => perform_clear_cloud_data(scope),
+            ConfirmPopoverKind::ClearLocalData(scope) => {
+                let (title, message) = local_clear_final_confirmation(scope);
+                confirm_popover.set(Some(ConfirmPopoverState {
+                    kind: ConfirmPopoverKind::ClearLocalDataFinal(scope),
+                    title: title.into(),
+                    message: message.into(),
+                    x,
+                    y,
+                }));
+            }
+            ConfirmPopoverKind::ClearLocalDataFinal(scope) => perform_clear_local_data(scope),
+            ConfirmPopoverKind::ClearCloudData(scope) => {
+                let (title, message) = cloud_clear_final_confirmation(&scope);
+                confirm_popover.set(Some(ConfirmPopoverState {
+                    kind: ConfirmPopoverKind::ClearCloudDataFinal(scope),
+                    title: title.into(),
+                    message: message.into(),
+                    x,
+                    y,
+                }));
+            }
+            ConfirmPopoverKind::ClearCloudDataFinal(scope) => perform_clear_cloud_data(scope),
         }
     };
 

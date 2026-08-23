@@ -1500,6 +1500,16 @@ pub struct UploadCompleteResponse {
     pub asset: ImageAssetRef,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssetPresenceRequest {
+    pub asset_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AssetPresenceResponse {
+    pub missing_asset_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocalAppState {
     pub configs: Vec<EncryptedApiConfig>,
