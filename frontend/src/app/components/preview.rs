@@ -304,6 +304,10 @@ pub(crate) fn PreviewOverlay(
                                         <strong class="detail-value">{panel.moderation_label.clone()}</strong>
                                     </div>
                                     <div class="detail-card is-inline">
+                                        <span class="detail-label">"背景"</span>
+                                        <strong class="detail-value">{panel.background_label.clone()}</strong>
+                                    </div>
+                                    <div class="detail-card is-inline">
                                         <span class="detail-label">"数量"</span>
                                         <strong class="detail-value">{panel.image_count.to_string()}</strong>
                                     </div>

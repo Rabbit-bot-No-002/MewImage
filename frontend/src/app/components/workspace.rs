@@ -3,12 +3,12 @@ use mew_image_shared::{EncryptedApiConfig, clamp_size, now_rfc3339};
 use web_sys::{DragEvent, FileList, MouseEvent};
 
 use crate::app::{
-    asset_display_src,
+    asset_display_src, background_mode_label, cycle_background_mode,
     derived::AppDerived,
-    is_openai_image_model,
+    is_openai_image_config,
     models::{ConfirmPopoverKind, ConfirmPopoverState},
     state::{ComposerState, UiState, WorkspaceState},
-    thread_display_name,
+    thread_display_name, transparent_background_enabled,
     utils::resolution::{
         custom_ratio_dimensions, effective_custom_ratio, preset_dimensions, resolve_dimensions,
     },
@@ -311,7 +311,7 @@ pub(crate) fn WorkspaceMain(
                                 format!("分辨率：{} × {}", width, height)
                             }}
                         </button>
-                        {move || if current_config.get().map(|config| is_openai_image_model(&config)).unwrap_or(false) {
+                        {move || if current_config.get().map(|config| is_openai_image_config(&config)).unwrap_or(false) {
                             view! {
                                 <>
                                     <select
@@ -329,9 +329,45 @@ pub(crate) fn WorkspaceMain(
                                         on:change=move |ev| update_current_config(|config, value| config.output_format = Some(value), event_target_value(&ev))
                                     >
                                         <option value="png">"格式：PNG"</option>
-                                        <option value="jpeg">"格式：JPEG"</option>
+                                        <option
+                                            value="jpeg"
+                                            disabled=move || current_config
+                                                .get()
+                                                .is_some_and(|config| transparent_background_enabled(&config))
+                                        >"格式：JPEG"</option>
                                         <option value="webp">"格式：WEBP"</option>
                                     </select>
+                                    <button
+                                        type="button"
+                                        class="button ghost compact-toggle"
+                                        class:active-compact-toggle=move || current_config
+                                            .get()
+                                            .is_some_and(|config| transparent_background_enabled(&config))
+                                        aria-pressed=move || current_config
+                                            .get()
+                                            .is_some_and(|config| transparent_background_enabled(&config))
+                                        title="依次切换关闭、API 原生透明和浏览器本地去背景；透明输出仅支持 PNG 或 WebP"
+                                        on:click=move |_| {
+                                            configs.update(|items| {
+                                                let Some(config) = items
+                                                    .iter_mut()
+                                                    .find(|config| config.id == current_config_id.get_untracked())
+                                                else {
+                                                    return;
+                                                };
+                                                cycle_background_mode(config);
+                                                config.updated_at = now_rfc3339();
+                                            });
+                                            persist_ui_state();
+                                        }
+                                    >
+                                        <MaterialSymbolIcon name="opacity" filled=false />
+                                        {move || current_config
+                                            .get()
+                                            .as_ref()
+                                            .map(background_mode_label)
+                                            .unwrap_or("透明：关")}
+                                    </button>
                                     <div class="compact-stepper compression-stepper" aria-label="压缩率">
                                         <button
                                             type="button"

@@ -5,9 +5,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use mew_image_shared::{
-    AppPreferences, EncryptedApiConfig, LocalAppState, SyncCheckpoint, SyncEntityKind,
-    apply_tombstones, merge_asset_records, merge_records, merge_tombstones, new_id,
-    normalize_api_config, now_rfc3339,
+    AppPreferences, EncryptedApiConfig, ImageAssetRef, LocalAppState, SyncCheckpoint,
+    SyncEntityKind, SyncTombstone, apply_tombstones, merge_asset_records, merge_records,
+    merge_tombstones, new_id, normalize_api_config, now_rfc3339,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,6 +17,8 @@ const BACKUP_SCHEMA_VERSION: u32 = 1;
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const LOCAL_BACKGROUND_ROLE_KEY: &str = "local_background_role";
+const LOCAL_BACKGROUND_ROLE_SOURCE: &str = "source";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackupAssetFile {
@@ -56,6 +58,57 @@ pub struct ImportedBackup {
     pub imported_thread_title: Option<String>,
 }
 
+/// 清理旧测试版本中为本地去背隐藏保存的纯色原图。
+pub(crate) fn discard_legacy_local_background_sources(state: &mut LocalAppState) -> Vec<String> {
+    let removed_ids = state
+        .assets
+        .iter()
+        .filter(|asset| is_legacy_local_background_source(asset))
+        .map(|asset| asset.id.clone())
+        .collect::<HashSet<_>>();
+    if removed_ids.is_empty() {
+        return Vec::new();
+    }
+
+    state
+        .assets
+        .retain(|asset| !removed_ids.contains(&asset.id));
+    for task in &mut state.tasks {
+        task.reference_asset_ids
+            .retain(|asset_id| !removed_ids.contains(asset_id));
+    }
+    removed_ids.into_iter().collect()
+}
+
+fn is_legacy_local_background_source(asset: &ImageAssetRef) -> bool {
+    asset
+        .metadata
+        .get(LOCAL_BACKGROUND_ROLE_KEY)
+        .map(String::as_str)
+        == Some(LOCAL_BACKGROUND_ROLE_SOURCE)
+}
+
+fn record_removed_asset_tombstones(state: &mut LocalAppState, asset_ids: &[String]) {
+    let deleted_at = now_rfc3339();
+    for asset_id in asset_ids {
+        if let Some(existing) = state
+            .tombstones
+            .iter_mut()
+            .find(|item| item.entity_kind == SyncEntityKind::Asset && item.entity_id == *asset_id)
+        {
+            if existing.deleted_at < deleted_at {
+                existing.deleted_at = deleted_at.clone();
+            }
+            continue;
+        }
+        state.tombstones.push(SyncTombstone {
+            entity_kind: SyncEntityKind::Asset,
+            entity_id: asset_id.clone(),
+            deleted_at: deleted_at.clone(),
+        });
+    }
+}
+
 pub fn build_backup(
     state: LocalAppState,
     payloads: &HashMap<String, String>,
@@ -80,12 +133,22 @@ pub fn prepare_session_backup(
         .find(|thread| thread.id == thread_id)
         .cloned()
         .ok_or_else(|| "未找到需要导出的会话。".to_string())?;
-    let tasks = state
+    let mut tasks = state
         .tasks
         .iter()
         .filter(|task| task.thread_id == thread_id && !task.detached_from_thread)
         .cloned()
         .collect::<Vec<_>>();
+    let legacy_source_ids = state
+        .assets
+        .iter()
+        .filter(|asset| is_legacy_local_background_source(asset))
+        .map(|asset| asset.id.as_str())
+        .collect::<HashSet<_>>();
+    for task in &mut tasks {
+        task.reference_asset_ids
+            .retain(|asset_id| !legacy_source_ids.contains(asset_id.as_str()));
+    }
     let task_ids = tasks
         .iter()
         .map(|task| task.id.clone())
@@ -124,7 +187,7 @@ pub fn prepare_session_backup(
     let mut assets = state
         .assets
         .iter()
-        .filter(|asset| asset_ids.contains(&asset.id))
+        .filter(|asset| asset_ids.contains(&asset.id) && !is_legacy_local_background_source(asset))
         .cloned()
         .collect::<Vec<_>>();
     for asset in &mut assets {
@@ -145,7 +208,7 @@ pub fn prepare_session_backup(
         }
     }
 
-    Ok(LocalAppState {
+    let mut prepared = LocalAppState {
         configs: Vec::new(),
         tasks,
         threads: vec![thread],
@@ -153,7 +216,9 @@ pub fn prepare_session_backup(
         preferences: AppPreferences::default(),
         checkpoint: SyncCheckpoint::default(),
         tombstones: Vec::new(),
-    })
+    };
+    discard_legacy_local_background_sources(&mut prepared);
+    Ok(prepared)
 }
 
 fn build_archive(
@@ -161,6 +226,7 @@ fn build_archive(
     payloads: &HashMap<String, String>,
     backup_kind: BackupKind,
 ) -> Result<Vec<u8>, String> {
+    discard_legacy_local_background_sources(&mut state);
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let stored_options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let mut asset_files = BTreeMap::new();
@@ -234,7 +300,7 @@ fn build_archive(
 pub fn import_backup(bytes: &[u8], local: &LocalAppState) -> Result<ImportedBackup, String> {
     let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|_| "备份 ZIP 无法读取。")?;
     validate_archive_limits(&mut archive)?;
-    let manifest = read_manifest(&mut archive)?;
+    let mut manifest = read_manifest(&mut archive)?;
     if manifest.schema_version != BACKUP_SCHEMA_VERSION {
         return Err(format!(
             "不支持的备份版本 {}，当前支持版本 {}。",
@@ -243,9 +309,16 @@ pub fn import_backup(bytes: &[u8], local: &LocalAppState) -> Result<ImportedBack
     }
 
     let imported_task_count = manifest.workspace.tasks.len();
-    let imported_asset_count = manifest.workspace.assets.len();
     let backup_kind = manifest.backup_kind;
-    let (imported, payloads) = hydrate_imported_assets(&mut archive, manifest)?;
+    let removed_source_ids = discard_legacy_local_background_sources(&mut manifest.workspace);
+    for asset_id in &removed_source_ids {
+        manifest.asset_files.remove(asset_id);
+    }
+    let imported_asset_count = manifest.workspace.assets.len();
+    let (mut imported, payloads) = hydrate_imported_assets(&mut archive, manifest)?;
+    if backup_kind == BackupKind::Workspace {
+        record_removed_asset_tombstones(&mut imported, &removed_source_ids);
+    }
     let (state, payloads, deduplicated_asset_count, imported_thread) = match backup_kind {
         BackupKind::Workspace => {
             let (state, payloads, deduplicated) = merge_backup(local, imported, payloads);
@@ -778,11 +851,34 @@ mod tests {
             test_thread("other", "其他"),
         ];
         source.tasks = vec![
-            test_task("project-task", "project", &["cross-reference"], true),
+            test_task(
+                "project-task",
+                "project",
+                &["cross-reference", "project-source"],
+                true,
+            ),
             test_task("other-task", "other", &[], false),
         ];
+        let mut hidden_source =
+            test_scoped_asset("project-source", b"source", Some("project-task"), None);
+        hidden_source
+            .metadata
+            .insert("local_background_role".into(), "source".into());
+        hidden_source
+            .metadata
+            .insert("local_background_result_index".into(), "0".into());
+        let mut transparent_result =
+            test_scoped_asset("project-result", b"result", Some("project-task"), None);
+        transparent_result
+            .metadata
+            .insert("local_background_role".into(), "result".into());
+        transparent_result
+            .metadata
+            .insert("local_background_result_index".into(), "0".into());
         source.assets = vec![
             test_scoped_asset("project-output", b"project", Some("project-task"), None),
+            hidden_source,
+            transparent_result,
             test_scoped_asset("unused-reference", b"unused", None, Some("project")),
             test_scoped_asset("cross-reference", b"cross", Some("other-task"), None),
             test_scoped_asset("other-output", b"other", Some("other-task"), None),
@@ -807,9 +903,15 @@ mod tests {
         assert_eq!(prepared.tasks.len(), 1);
         assert!(prepared.configs.is_empty());
         assert!(prepared.tombstones.is_empty());
+        assert_eq!(prepared.tasks[0].reference_asset_ids, ["cross-reference"]);
         assert_eq!(
             asset_ids,
-            HashSet::from(["project-output", "unused-reference", "cross-reference"])
+            HashSet::from([
+                "project-output",
+                "project-result",
+                "unused-reference",
+                "cross-reference"
+            ])
         );
         assert_eq!(
             prepared
@@ -819,6 +921,34 @@ mod tests {
                 .and_then(|asset| asset.source_task_id.as_deref()),
             None
         );
+    }
+
+    #[test]
+    fn legacy_local_background_source_is_removed_with_task_references() {
+        let mut state = LocalAppState::default();
+        state.tasks.push(test_task(
+            "project-task",
+            "project",
+            &["project-source", "project-result"],
+            false,
+        ));
+        let mut hidden_source =
+            test_scoped_asset("project-source", b"source", Some("project-task"), None);
+        hidden_source.metadata.insert(
+            LOCAL_BACKGROUND_ROLE_KEY.into(),
+            LOCAL_BACKGROUND_ROLE_SOURCE.into(),
+        );
+        state.assets = vec![
+            hidden_source,
+            test_scoped_asset("project-result", b"result", Some("project-task"), None),
+        ];
+
+        let removed = discard_legacy_local_background_sources(&mut state);
+
+        assert_eq!(removed, ["project-source"]);
+        assert_eq!(state.assets.len(), 1);
+        assert_eq!(state.assets[0].id, "project-result");
+        assert_eq!(state.tasks[0].reference_asset_ids, ["project-result"]);
     }
 
     #[test]

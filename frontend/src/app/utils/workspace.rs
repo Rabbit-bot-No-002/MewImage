@@ -89,6 +89,16 @@ pub(crate) fn gallery_items(
     items
 }
 
+pub(crate) fn first_displayable_generated_asset(
+    assets: &[ImageAssetRef],
+    task_id: &str,
+) -> Option<ImageAssetRef> {
+    assets
+        .iter()
+        .find(|asset| asset.source_task_id.as_deref() == Some(task_id))
+        .cloned()
+}
+
 pub(crate) fn paged_items<T: Clone>(items: &[T], page: usize, page_size: usize) -> Vec<T> {
     let start = page.max(1).saturating_sub(1).saturating_mul(page_size);
     if start >= items.len() {
@@ -131,25 +141,30 @@ pub(crate) fn record_sync_tombstones(
     tombstones: RwSignal<Vec<SyncTombstone>>,
     entities: impl IntoIterator<Item = (SyncEntityKind, String)>,
 ) {
+    tombstones.update(|items| record_sync_tombstones_in(items, entities));
+}
+
+pub(crate) fn record_sync_tombstones_in(
+    items: &mut Vec<SyncTombstone>,
+    entities: impl IntoIterator<Item = (SyncEntityKind, String)>,
+) {
     let deleted_at = now_rfc3339();
-    tombstones.update(|items| {
-        for (entity_kind, entity_id) in entities {
-            if let Some(existing) = items
-                .iter_mut()
-                .find(|item| item.entity_kind == entity_kind && item.entity_id == entity_id)
-            {
-                if existing.deleted_at < deleted_at {
-                    existing.deleted_at = deleted_at.clone();
-                }
-            } else {
-                items.push(SyncTombstone {
-                    entity_kind,
-                    entity_id,
-                    deleted_at: deleted_at.clone(),
-                });
+    for (entity_kind, entity_id) in entities {
+        if let Some(existing) = items
+            .iter_mut()
+            .find(|item| item.entity_kind == entity_kind && item.entity_id == entity_id)
+        {
+            if existing.deleted_at < deleted_at {
+                existing.deleted_at = deleted_at.clone();
             }
+        } else {
+            items.push(SyncTombstone {
+                entity_kind,
+                entity_id,
+                deleted_at: deleted_at.clone(),
+            });
         }
-    });
+    }
 }
 
 pub(crate) fn visible_thread_items(
@@ -436,7 +451,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::app::{FAVORITE_ARCHIVE_ASSET_KEY, FAVORITE_PAGE_SIZE};
+    use crate::app::{
+        FAVORITE_ARCHIVE_ASSET_KEY, FAVORITE_PAGE_SIZE, LOCAL_BACKGROUND_RESULT_INDEX_KEY,
+        LOCAL_BACKGROUND_ROLE_KEY, LOCAL_BACKGROUND_ROLE_RESULT,
+    };
 
     fn test_task(
         id: &str,
@@ -593,5 +611,33 @@ mod tests {
             (10..=18).collect::<Vec<_>>()
         );
         assert_eq!(paged_items(&items, 3, FAVORITE_PAGE_SIZE), vec![19, 20]);
+    }
+
+    #[test]
+    fn local_background_result_is_the_only_generated_asset() {
+        let task = test_task("task", "thread", false, &[]);
+        let mut result = test_asset("result", Some("task"), None);
+        result.metadata.insert(
+            LOCAL_BACKGROUND_ROLE_KEY.into(),
+            LOCAL_BACKGROUND_ROLE_RESULT.into(),
+        );
+        result
+            .metadata
+            .insert(LOCAL_BACKGROUND_RESULT_INDEX_KEY.into(), "0".into());
+
+        let assets = vec![result];
+        let gallery = gallery_items(std::slice::from_ref(&task), &[], &assets);
+        assert_eq!(gallery.len(), 1);
+        assert_eq!(gallery[0].asset_id.as_deref(), Some("result"));
+        assert_eq!(
+            first_displayable_generated_asset(&assets, "task")
+                .unwrap()
+                .id,
+            "result"
+        );
+
+        let mut tasks = vec![task];
+        assert!(!reconcile_task_integrity(&mut tasks, &assets, false));
+        assert_eq!(tasks[0].status, TaskStatus::Succeeded);
     }
 }

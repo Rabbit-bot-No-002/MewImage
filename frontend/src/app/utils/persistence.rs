@@ -424,6 +424,7 @@ pub(crate) fn generation_settings_for_rerun(
         endpoint_mode: config.endpoint_mode,
         output_format: config.output_format.clone(),
         output_compression: config.output_compression,
+        background: config.background.clone(),
         moderation: config.moderation.clone(),
         responses_model: config.responses_model.clone(),
     }
@@ -470,6 +471,7 @@ mod tests {
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
             output_format: Some("webp".into()),
             output_compression: Some(90),
+            background: Some("transparent".into()),
             moderation: Some("low".into()),
             responses_model: Some("gpt-5.6".into()),
         };

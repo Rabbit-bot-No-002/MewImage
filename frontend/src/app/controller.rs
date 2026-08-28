@@ -141,6 +141,22 @@ pub(super) fn AppController() -> impl IntoView {
                     .and_then(|config| config.moderation.clone())
             })
             .unwrap_or_else(|| "auto".into());
+        let background_label = task
+            .generation_settings
+            .as_ref()
+            .map(|settings| settings.background.as_deref().unwrap_or("auto"))
+            .or_else(|| {
+                preview_config
+                    .as_ref()
+                    .and_then(|config| config.background.as_deref())
+            })
+            .map(|value| match normalized_background_mode(Some(value)) {
+                "transparent" => "API 原生透明",
+                "local" => "本地去背景",
+                _ => "自动",
+            })
+            .unwrap_or("自动")
+            .to_string();
         let source_label = preview_config
             .as_ref()
             .map(|config| config.name.clone())
@@ -185,6 +201,7 @@ pub(super) fn AppController() -> impl IntoView {
             source_label,
             requested_model: task.requested_model.clone(),
             moderation_label,
+            background_label,
             requested_quality_label,
             actual_quality_label,
             format_label: asset.mime_type.replace("image/", ""),

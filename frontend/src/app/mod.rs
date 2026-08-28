@@ -38,7 +38,8 @@ use mew_image_shared::{
     RegisterRequest, SyncCheckpoint, SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus,
     ThemePreference, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
     UploadInitResponse, UserSummary, UsernameAvailabilityResponse, new_id, normalize_api_config,
-    now_rfc3339, strip_successful_task_payloads,
+    normalized_background_mode, normalized_image_output_format, now_rfc3339,
+    strip_successful_task_payloads,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -75,6 +76,7 @@ pub(crate) use utils::image::*;
 use utils::persistence::*;
 use utils::resolution::*;
 use utils::sync::*;
+use utils::transparency::*;
 use utils::workspace::*;
 
 const THUMBNAIL_DATA_URL_KEY: &str = "thumbnail_data_url";

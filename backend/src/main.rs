@@ -44,7 +44,8 @@ use mew_image_shared::{
     extract_gemini_generation_result, extract_openai_compatible_result,
     extract_openai_responses_result, gemini_auth_header, gemini_generate_content_url,
     is_google_official_gemini_base_url, merge_envelopes, nano_banana_image_size_from_dimensions,
-    new_id, now_rfc3339, parse_openai_responses_event_stream, resolve_responses_main_model,
+    new_id, normalized_image_output_format, normalized_openai_background, now_rfc3339,
+    openai_output_compression, parse_openai_responses_event_stream, resolve_responses_main_model,
     strip_successful_task_payloads,
 };
 use rand::distr::{Alphanumeric, SampleString};
@@ -78,6 +79,7 @@ const PROXY_GENERATION_JOB_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60
 const PROXY_GENERATION_RESULT_TTL: StdDuration = StdDuration::from_secs(10 * 60);
 const MAX_ASSET_PRESENCE_CHECKS: usize = 10_000;
 const REGISTRATION_DEVICE_COOKIE: &str = "mew_registration_device";
+const OPENAI_EDIT_IMAGE_FIELD: &str = "image[]";
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 static MALLOC_TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -2856,6 +2858,10 @@ fn openai_images_endpoint(request: &mew_image_shared::GenerationRequest) -> &'st
     }
 }
 
+fn supports_configurable_input_fidelity(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().contains("gpt-image-1")
+}
+
 fn join_api_url(base_url: &str, endpoint_path: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let endpoint = endpoint_path.trim_start_matches('/');
@@ -2940,10 +2946,19 @@ async fn invoke_openai_image(
         if let Some(quality) = &payload.request.quality {
             form = form.text("quality", quality.clone());
         }
-        if let Some(format) = &payload.config.output_format {
-            form = form.text("output_format", format.clone());
-        }
-        if let Some(compression) = payload.config.output_compression {
+        form = form
+            .text(
+                "output_format",
+                normalized_image_output_format(payload.config.output_format.as_deref()),
+            )
+            .text(
+                "background",
+                normalized_openai_background(payload.config.background.as_deref()),
+            );
+        if let Some(compression) = openai_output_compression(
+            payload.config.output_format.as_deref(),
+            payload.config.output_compression,
+        ) {
             form = form.text("output_compression", compression.to_string());
         }
         if let Some(moderation) = &payload.config.moderation {
@@ -2955,14 +2970,9 @@ async fn invoke_openai_image(
                 .file_name(format!("{}.png", asset.id))
                 .mime_str(&mime)
                 .map_err(AppError::internal)?;
-            form = form.part("image[]", part);
+            form = form.part(OPENAI_EDIT_IMAGE_FIELD, part);
         }
-        if payload
-            .request
-            .model
-            .to_ascii_lowercase()
-            .contains("gpt-image-1")
-        {
+        if supports_configurable_input_fidelity(&payload.request.model) {
             form = form.text("input_fidelity", "high");
         }
         request.multipart(form).send().await.map_err(|error| {
@@ -2994,17 +3004,19 @@ async fn invoke_openai_image(
             "type": "image_generation",
             "action": if payload.request.reference_assets.is_empty() { "generate" } else { "edit" },
             "size": format!("{}x{}", payload.request.width, payload.request.height),
-            "output_format": payload.config.output_format.clone().unwrap_or_else(|| "png".into()),
+            "output_format": normalized_image_output_format(payload.config.output_format.as_deref()),
+            "background": normalized_openai_background(payload.config.background.as_deref()),
             "moderation": payload.config.moderation.clone().unwrap_or_else(|| "auto".into()),
             "partial_images": 1,
         });
         if let Some(quality) = &payload.request.quality {
             tool["quality"] = json!(quality);
         }
-        if payload.config.output_format.as_deref() != Some("png") {
-            if let Some(compression) = payload.config.output_compression {
-                tool["output_compression"] = json!(compression);
-            }
+        if let Some(compression) = openai_output_compression(
+            payload.config.output_format.as_deref(),
+            payload.config.output_compression,
+        ) {
+            tool["output_compression"] = json!(compression);
         }
         let body = json!({
             "model": resolve_responses_main_model(&payload.config, &payload.request.model),
@@ -3025,16 +3037,22 @@ async fn invoke_openai_image(
             AppError::bad_gateway("Responses API 请求失败")
         })?
     } else {
-        let body = json!({
+        let mut body = json!({
             "prompt": payload.request.prompt,
             "model": payload.request.model,
             "size": format!("{}x{}", payload.request.width, payload.request.height),
             "quality": payload.request.quality,
             "n": payload.request.count,
-            "output_format": payload.config.output_format,
-            "output_compression": payload.config.output_compression,
+            "output_format": normalized_image_output_format(payload.config.output_format.as_deref()),
+            "background": normalized_openai_background(payload.config.background.as_deref()),
             "moderation": payload.config.moderation,
         });
+        if let Some(compression) = openai_output_compression(
+            payload.config.output_format.as_deref(),
+            payload.config.output_compression,
+        ) {
+            body["output_compression"] = json!(compression);
+        }
         request.json(&body).send().await.map_err(|error| {
             warn!("openai image json request failed: {}", error);
             AppError::bad_gateway("Images API 请求失败")
@@ -3050,9 +3068,18 @@ async fn invoke_openai_image(
             .map(|value| value.contains("text/event-stream"))
             .unwrap_or(false);
         if !status.is_success() {
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body = response.text().await.map_err(AppError::internal)?;
+            let request_id = request_id
+                .as_deref()
+                .map(|value| format!("，request_id={value}"))
+                .unwrap_or_default();
             return Err(AppError::bad_gateway(format!(
-                "Responses API 上游请求失败：HTTP {status}，{body}"
+                "Responses API 上游请求失败：HTTP {status}{request_id}，{body}"
             )));
         }
         if is_event_stream {
@@ -3072,6 +3099,24 @@ async fn invoke_openai_image(
             return parse_openai_responses_event_stream(&body).map_err(AppError::bad_gateway);
         }
         return serde_json::from_str(&body).map_err(AppError::internal);
+    }
+
+    let status = response.status();
+    if !status.is_success() {
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().await.map_err(AppError::internal)?;
+        let request_id = request_id
+            .as_deref()
+            .map(|value| format!("，request_id={value}"))
+            .unwrap_or_default();
+        warn!("Images API upstream error: HTTP {status}{request_id}, {body}");
+        return Err(AppError::bad_gateway(format!(
+            "Images API 上游请求失败：HTTP {status}{request_id}，{body}"
+        )));
     }
 
     response.json().await.map_err(AppError::internal)
@@ -3858,6 +3903,44 @@ mod tests {
             metadata: Default::default(),
         });
         assert_eq!(openai_compatible_endpoint(&request), "/v1/images/edits");
+    }
+
+    #[test]
+    fn openai_edit_keeps_official_multipart_field_and_skips_image2_fidelity() {
+        let mut request = GenerationRequest {
+            prompt: "test".into(),
+            model: "gpt-image2-vip".into(),
+            width: 1024,
+            height: 1024,
+            quality: None,
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::ImagesApi,
+            reference_assets: Vec::new(),
+        };
+        assert_eq!(openai_images_endpoint(&request), "/v1/images/generations");
+        request.reference_assets.push(ImageAssetRef {
+            id: "asset-1".into(),
+            sha256: "hash".into(),
+            mime_type: "image/png".into(),
+            byte_len: 1,
+            width: None,
+            height: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            data_url: Some("data:image/png;base64,AA==".into()),
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        });
+
+        assert_eq!(openai_images_endpoint(&request), "/v1/images/edits");
+        assert_eq!(OPENAI_EDIT_IMAGE_FIELD, "image[]");
+        assert!(!supports_configurable_input_fidelity(&request.model));
+        assert!(supports_configurable_input_fidelity("gpt-image-1.5"));
+        assert!(supports_configurable_input_fidelity(
+            "openai/gpt-image-1.5-vip"
+        ));
     }
 
     #[test]

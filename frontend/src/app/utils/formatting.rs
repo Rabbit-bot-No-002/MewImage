@@ -129,9 +129,36 @@ pub(crate) fn auth_status_message(user: &UserSummary) -> String {
     }
 }
 
-pub(crate) fn is_openai_image_model(config: &EncryptedApiConfig) -> bool {
+pub(crate) fn is_openai_image_config(config: &EncryptedApiConfig) -> bool {
     config.provider_kind == ProviderKind::OpenAiImage
-        && config.model.to_ascii_lowercase().contains("image")
+}
+
+pub(crate) fn background_mode(config: &EncryptedApiConfig) -> &'static str {
+    normalized_background_mode(config.background.as_deref())
+}
+
+pub(crate) fn transparent_background_enabled(config: &EncryptedApiConfig) -> bool {
+    background_mode(config) != "auto"
+}
+
+pub(crate) fn cycle_background_mode(config: &mut EncryptedApiConfig) {
+    let next = match background_mode(config) {
+        "auto" => "transparent",
+        "transparent" => "local",
+        _ => "auto",
+    };
+    config.background = Some(next.into());
+    if next != "auto" && matches!(config.output_format.as_deref(), Some("jpeg" | "jpg")) {
+        config.output_format = Some("png".into());
+    }
+}
+
+pub(crate) fn background_mode_label(config: &EncryptedApiConfig) -> &'static str {
+    match background_mode(config) {
+        "transparent" => "透明：API",
+        "local" => "透明：本地",
+        _ => "透明：关",
+    }
 }
 
 pub(crate) fn aspect_ratio_label(width: u32, height: u32) -> String {
@@ -476,5 +503,31 @@ mod tests {
             cloud_clear_final_confirmation(&CloudDataClearScope::SyncData);
         assert!(cloud_title.contains("再次确认"));
         assert!(cloud_message.contains("第二次确认"));
+    }
+
+    #[test]
+    fn openai_image_options_do_not_depend_on_model_alias() {
+        let mut config = crate::providers::default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.model = "vip-4k".into();
+        assert!(is_openai_image_config(&config));
+
+        config.output_format = Some("jpeg".into());
+        cycle_background_mode(&mut config);
+        assert!(transparent_background_enabled(&config));
+        assert_eq!(config.output_format.as_deref(), Some("png"));
+        assert_eq!(background_mode(&config), "transparent");
+        assert_eq!(background_mode_label(&config), "透明：API");
+
+        cycle_background_mode(&mut config);
+        assert!(transparent_background_enabled(&config));
+        assert_eq!(background_mode(&config), "local");
+        assert_eq!(background_mode_label(&config), "透明：本地");
+
+        cycle_background_mode(&mut config);
+        assert!(!transparent_background_enabled(&config));
+        assert_eq!(background_mode(&config), "auto");
+
+        config.provider_kind = ProviderKind::OpenAiCompatible;
+        assert!(!is_openai_image_config(&config));
     }
 }

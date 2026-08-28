@@ -3,7 +3,7 @@ use web_sys::MouseEvent;
 
 use crate::app::{
     derived::AppDerived,
-    ensure_asset_payloads_loaded,
+    ensure_asset_payloads_loaded, first_displayable_generated_asset,
     models::ContextMenuState,
     state::{UiState, WorkspaceState},
 };
@@ -121,9 +121,7 @@ pub(crate) fn GallerySidebar(
                                                 <div class="row compact-actions">
                                                     <button class="button ghost mini-action icon-action" title="重新生成" on:click=move |_| rerun_task(rerun_task_id.clone())><MaterialSymbolIcon name="restart_alt" filled=false /></button>
                                                     <button class="button ghost mini-action icon-action" title="继续修改" on:click=move |_| {
-                                                        if let Some(first_asset) = assets.with_untracked(|items| {
-                                                            items.iter().find(|asset| asset.source_task_id.as_deref() == Some(continue_task_id.as_str())).cloned()
-                                                        }) {
+                                                        if let Some(first_asset) = assets.with_untracked(|items| first_displayable_generated_asset(items, &continue_task_id)) {
                                                             enter_continuation_context(continue_task_id.clone(), first_asset.id);
                                                         }
                                                     }><MaterialSymbolIcon name="edit_square" filled=false /></button>

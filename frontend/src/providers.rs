@@ -9,7 +9,8 @@ use mew_image_shared::{
     extract_gemini_generation_result, extract_openai_compatible_result,
     extract_openai_responses_result, gemini_auth_header, gemini_generate_content_url,
     is_google_official_gemini_base_url, merge_envelopes, nano_banana_image_size_from_dimensions,
-    new_id, normalize_api_config, now_rfc3339, parse_openai_responses_event_stream,
+    new_id, normalize_api_config, normalized_image_output_format, normalized_openai_background,
+    now_rfc3339, openai_output_compression, parse_openai_responses_event_stream,
     resolve_responses_main_model, strip_successful_task_payloads,
 };
 use serde_json::json;
@@ -49,6 +50,7 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
         known_requires_proxy: true,
         output_format: Some("png".into()),
         output_compression: Some(100),
+        background: None,
         moderation: Some("auto".into()),
         api_key_plaintext: None,
         api_key_encrypted: None,
@@ -498,10 +500,22 @@ async fn direct_generate(
     };
 
     if !response.ok() {
-        return Err(response
+        let status = response.status();
+        let request_id = response.headers().get("x-request-id");
+        let body = response
             .text()
             .await
-            .unwrap_or_else(|_| "上游请求失败".into()));
+            .unwrap_or_else(|_| "上游请求失败".into());
+        if config.provider_kind == ProviderKind::OpenAiImage {
+            let request_id = request_id
+                .as_deref()
+                .map(|value| format!("，request_id={value}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "OpenAI 上游请求失败：HTTP {status}{request_id}，{body}"
+            ));
+        }
+        return Err(body);
     }
     let value = if config.provider_kind == ProviderKind::OpenAiImage
         && config.endpoint_mode == ProviderEndpointMode::ResponsesApi
@@ -748,16 +762,25 @@ fn build_openai_json(
 ) -> serde_json::Value {
     match config.endpoint_mode {
         ProviderEndpointMode::ResponsesApi => build_openai_responses_json(config, request),
-        _ => json!({
-            "prompt": request.prompt,
-            "model": request.model,
-            "size": format!("{}x{}", request.width, request.height),
-            "quality": request.quality,
-            "n": request.count,
-            "output_format": config.output_format,
-            "output_compression": config.output_compression,
-            "moderation": config.moderation,
-        }),
+        _ => {
+            let mut body = json!({
+                "prompt": request.prompt,
+                "model": request.model,
+                "size": format!("{}x{}", request.width, request.height),
+                "quality": request.quality,
+                "n": request.count,
+                "output_format": normalized_image_output_format(config.output_format.as_deref()),
+                "background": normalized_openai_background(config.background.as_deref()),
+                "moderation": config.moderation,
+            });
+            if let Some(compression) = openai_output_compression(
+                config.output_format.as_deref(),
+                config.output_compression,
+            ) {
+                body["output_compression"] = json!(compression);
+            }
+            body
+        }
     }
 }
 
@@ -839,7 +862,8 @@ fn build_openai_responses_json(
         "type": "image_generation",
         "action": if request.reference_assets.is_empty() { "generate" } else { "edit" },
         "size": format!("{}x{}", request.width, request.height),
-        "output_format": config.output_format.clone().unwrap_or_else(|| "png".into()),
+        "output_format": normalized_image_output_format(config.output_format.as_deref()),
+        "background": normalized_openai_background(config.background.as_deref()),
         "moderation": config.moderation.clone().unwrap_or_else(|| "auto".into()),
         "partial_images": 1,
     });
@@ -847,10 +871,10 @@ fn build_openai_responses_json(
     if let Some(quality) = &request.quality {
         tool["quality"] = json!(quality);
     }
-    if config.output_format.as_deref() != Some("png") {
-        if let Some(compression) = config.output_compression {
-            tool["output_compression"] = json!(compression);
-        }
+    if let Some(compression) =
+        openai_output_compression(config.output_format.as_deref(), config.output_compression)
+    {
+        tool["output_compression"] = json!(compression);
     }
 
     json!({
@@ -1128,6 +1152,7 @@ mod tests {
         config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
         config.prompt_guard_enabled = true;
         config.responses_model = Some("gpt-5.6".into());
+        config.background = Some("transparent".into());
         let request = GenerationRequest {
             prompt: "test".into(),
             model: "gpt-image-2".into(),
@@ -1143,6 +1168,41 @@ mod tests {
         assert_eq!(body["model"], "gpt-5.6");
         assert_eq!(body["tools"][0]["size"], "3840x2160");
         assert_eq!(body["tools"][0]["quality"], "high");
+        assert_eq!(body["tools"][0]["background"], "transparent");
+        assert!(body["tools"][0].get("output_compression").is_none());
+    }
+
+    #[test]
+    fn images_request_omits_png_compression_and_keeps_webp_compression() {
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.background = Some("transparent".into());
+        let request = GenerationRequest {
+            prompt: "test".into(),
+            model: "gpt-image2-vip".into(),
+            width: 1024,
+            height: 1024,
+            quality: Some("high".into()),
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::ImagesApi,
+            reference_assets: Vec::new(),
+        };
+
+        let png_body = build_openai_json(&config, &request);
+        assert_eq!(png_body["background"], "transparent");
+        assert!(png_body.get("output_compression").is_none());
+
+        config.output_format = Some("webp".into());
+        config.output_compression = Some(82);
+        let webp_body = build_openai_json(&config, &request);
+        assert_eq!(webp_body["output_compression"], 82);
+
+        config.background = Some("local".into());
+        let local_body = build_openai_json(&config, &request);
+        assert_eq!(local_body["background"], "auto");
+
+        config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        let local_responses_body = build_openai_json(&config, &request);
+        assert_eq!(local_responses_body["tools"][0]["background"], "auto");
     }
 
     #[test]

@@ -4,4 +4,5 @@ pub(crate) mod image;
 pub(crate) mod persistence;
 pub(crate) mod resolution;
 pub(crate) mod sync;
+pub(crate) mod transparency;
 pub(crate) mod workspace;

@@ -1,5 +1,148 @@
 use super::super::*;
 
+struct PreparedGeneratedImage {
+    assets: Vec<ImageAssetRef>,
+    visible_asset_id: String,
+    local_background_error: Option<String>,
+}
+
+async fn prepare_generated_image(
+    image: &mew_image_shared::GeneratedImageResult,
+    result_index: usize,
+    task_id: &str,
+    fallback_width: u32,
+    fallback_height: u32,
+    local_background: bool,
+    output_format: Option<&str>,
+    output_compression: Option<u8>,
+) -> Result<PreparedGeneratedImage, String> {
+    let (data_url, remote_url, bytes, mime_type) = match (&image.data_url, &image.url) {
+        (Some(data_url), _) => {
+            let (mime_type, bytes) = decode_browser_data_url(data_url)?;
+            (data_url.clone(), None, bytes, mime_type)
+        }
+        (None, Some(url)) => {
+            let (bytes, mime_type) = fetch_image_bytes(url).await?;
+            let data_url = bytes_to_data_url(&bytes, &mime_type);
+            (data_url, Some(url.clone()), bytes, mime_type)
+        }
+        (None, None) => return Err("上游结果缺少图像数据。".into()),
+    };
+    let (width, height) = load_image_dimensions(&data_url)
+        .await
+        .unwrap_or((fallback_width, fallback_height));
+    let now = now_rfc3339();
+    let mut source = ImageAssetRef {
+        id: new_id(),
+        sha256: sha256_hex(&bytes),
+        mime_type,
+        byte_len: bytes.len() as u64,
+        width: Some(width),
+        height: Some(height),
+        created_at: now.clone(),
+        updated_at: now,
+        data_url: Some(data_url.clone()),
+        remote_object_key: None,
+        remote_url,
+        source_task_id: Some(task_id.to_string()),
+        metadata: BTreeMap::new(),
+    };
+
+    if !local_background {
+        add_generated_thumbnail(&mut source).await;
+        return Ok(PreparedGeneratedImage {
+            visible_asset_id: source.id.clone(),
+            assets: vec![source],
+            local_background_error: None,
+        });
+    }
+
+    match remove_keyed_background_from_data_url(&data_url, output_format, output_compression).await
+    {
+        Ok(output) => {
+            let now = now_rfc3339();
+            let mut result = ImageAssetRef {
+                id: new_id(),
+                sha256: sha256_hex(&output.bytes),
+                mime_type: output.mime_type,
+                byte_len: output.bytes.len() as u64,
+                width: Some(output.width),
+                height: Some(output.height),
+                created_at: now.clone(),
+                updated_at: now,
+                data_url: Some(output.data_url),
+                remote_object_key: None,
+                remote_url: None,
+                source_task_id: Some(task_id.to_string()),
+                metadata: BTreeMap::new(),
+            };
+            set_local_background_metadata(
+                &mut result,
+                LOCAL_BACKGROUND_ROLE_RESULT,
+                result_index,
+                Some(output.key_color),
+                None,
+            );
+            add_generated_thumbnail(&mut result).await;
+            Ok(PreparedGeneratedImage {
+                visible_asset_id: result.id.clone(),
+                // 去背成功后不再持久化纯色原图，避免同一结果占用双份空间。
+                assets: vec![result],
+                local_background_error: None,
+            })
+        }
+        Err(error) => {
+            set_local_background_metadata(
+                &mut source,
+                LOCAL_BACKGROUND_ROLE_FALLBACK,
+                result_index,
+                None,
+                Some(&error),
+            );
+            add_generated_thumbnail(&mut source).await;
+            Ok(PreparedGeneratedImage {
+                visible_asset_id: source.id.clone(),
+                assets: vec![source],
+                local_background_error: Some(error),
+            })
+        }
+    }
+}
+
+fn set_local_background_metadata(
+    asset: &mut ImageAssetRef,
+    role: &str,
+    result_index: usize,
+    key_color: Option<&str>,
+    error: Option<&str>,
+) {
+    asset
+        .metadata
+        .insert(LOCAL_BACKGROUND_ROLE_KEY.into(), role.into());
+    asset.metadata.insert(
+        LOCAL_BACKGROUND_RESULT_INDEX_KEY.into(),
+        result_index.to_string(),
+    );
+    if let Some(key_color) = key_color {
+        asset
+            .metadata
+            .insert(LOCAL_BACKGROUND_KEY_COLOR_KEY.into(), key_color.into());
+    }
+    if let Some(error) = error {
+        asset
+            .metadata
+            .insert(LOCAL_BACKGROUND_ERROR_KEY.into(), error.into());
+    }
+}
+
+async fn add_generated_thumbnail(asset: &mut ImageAssetRef) {
+    if let Ok(thumbnail) = thumbnail_data_url_from_asset(asset, THUMBNAIL_MAX_EDGE).await {
+        asset
+            .metadata
+            .insert(THUMBNAIL_DATA_URL_KEY.into(), thumbnail);
+    }
+}
+
 pub(crate) fn build_generation_actions(
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
     enqueue_payload_writes: impl Fn(Vec<(String, String)>) + Copy + Send + Sync + 'static,
@@ -69,6 +212,12 @@ pub(crate) fn build_generation_actions(
             status_text.set("请输入提示词后再开始生成。".into());
             return;
         }
+        let local_background = local_background_enabled(&config);
+        let effective_prompt = if local_background {
+            build_local_background_prompt(&prompt)
+        } else {
+            prompt.clone()
+        };
         prepare_generation_notification_audio();
         let thread_id = current_thread_id.get_untracked();
         let template = templates
@@ -147,6 +296,7 @@ pub(crate) fn build_generation_actions(
                     endpoint_mode: config.endpoint_mode,
                     output_format: config.output_format.clone(),
                     output_compression: config.output_compression,
+                    background: config.background.clone(),
                     moderation: config.moderation.clone(),
                     responses_model: config.responses_model.clone(),
                 }),
@@ -242,7 +392,7 @@ pub(crate) fn build_generation_actions(
                 references
             });
             let request = mew_image_shared::GenerationRequest {
-                prompt: prompt.clone(),
+                prompt: effective_prompt,
                 model: config.model.clone(),
                 width: resolved_width,
                 height: resolved_height,
@@ -259,100 +409,55 @@ pub(crate) fn build_generation_actions(
             }
             match generation_result {
                 Ok((result, used_proxy)) => {
+                    let upstream_result_count = result.images.len();
                     let mut produced_assets = Vec::new();
+                    let mut visible_asset_ids = Vec::new();
                     let mut asset_build_errors = Vec::new();
+                    let mut local_background_errors = Vec::new();
                     for (index, image) in result.images.iter().enumerate() {
                         if cancel_requested_signal.get_untracked() {
                             break;
                         }
-                        let asset_payload = match (image.data_url.clone(), image.url.clone()) {
-                            (Some(data_url), _) => match decode_browser_data_url(&data_url) {
-                                Ok((mime_type, bytes)) => Some((
-                                    Some(data_url),
-                                    None,
-                                    bytes.len() as u64,
-                                    sha256_hex(&bytes),
-                                    mime_type,
-                                )),
-                                Err(error) => {
-                                    asset_build_errors.push(format!(
-                                        "第 {} 张结果数据解析失败：{}",
-                                        index + 1,
-                                        error
-                                    ));
-                                    None
-                                }
-                            },
-                            (None, Some(url)) => match fetch_image_bytes(&url).await {
-                                Ok((bytes, mime_type)) => {
-                                    let data_url = bytes_to_data_url(&bytes, &mime_type);
-                                    let byte_len = bytes.len() as u64;
-                                    let sha256 = sha256_hex(&bytes);
-                                    Some((Some(data_url), Some(url), byte_len, sha256, mime_type))
-                                }
-                                Err(error) => {
-                                    asset_build_errors.push(format!(
-                                        "第 {} 张结果下载失败：{}",
-                                        index + 1,
-                                        error
-                                    ));
-                                    None
-                                }
-                            },
-                            (None, None) => {
-                                asset_build_errors
-                                    .push(format!("第 {} 张结果缺少图像数据。", index + 1));
-                                None
-                            }
-                        };
-                        let Some((data_url, remote_url, byte_len, sha256, mime_type)) =
-                            asset_payload
-                        else {
-                            continue;
-                        };
-                        let (actual_width, actual_height) = match data_url.as_deref() {
-                            Some(data_url) => load_image_dimensions(data_url)
-                                .await
-                                .unwrap_or((resolved_width, resolved_height)),
-                            None => (resolved_width, resolved_height),
-                        };
-                        let mut metadata = BTreeMap::new();
-                        let thumbnail_source = ImageAssetRef {
-                            id: String::new(),
-                            sha256: sha256.clone(),
-                            mime_type: mime_type.clone(),
-                            byte_len,
-                            width: Some(actual_width),
-                            height: Some(actual_height),
-                            created_at: String::new(),
-                            updated_at: String::new(),
-                            data_url: data_url.clone(),
-                            remote_object_key: None,
-                            remote_url: remote_url.clone(),
-                            source_task_id: None,
-                            metadata: BTreeMap::new(),
-                        };
-                        if let Ok(thumbnail) =
-                            thumbnail_data_url_from_asset(&thumbnail_source, THUMBNAIL_MAX_EDGE)
-                                .await
-                        {
-                            metadata.insert(THUMBNAIL_DATA_URL_KEY.into(), thumbnail);
+                        if local_background {
+                            status_signal.set(format!(
+                                "正在本地去除背景（{}/{}）……",
+                                index + 1,
+                                upstream_result_count
+                            ));
+                            gloo_timers::future::TimeoutFuture::new(0).await;
                         }
-                        produced_assets.push(ImageAssetRef {
-                            id: new_id(),
-                            sha256,
-                            mime_type,
-                            byte_len,
-                            width: Some(actual_width),
-                            height: Some(actual_height),
-                            created_at: now_rfc3339(),
-                            updated_at: now_rfc3339(),
-                            data_url,
-                            remote_object_key: None,
-                            remote_url,
-                            source_task_id: Some(task_id.clone()),
-                            metadata,
-                        });
+                        match prepare_generated_image(
+                            image,
+                            index,
+                            &task_id,
+                            resolved_width,
+                            resolved_height,
+                            local_background,
+                            config.output_format.as_deref(),
+                            config.output_compression,
+                        )
+                        .await
+                        {
+                            Ok(prepared) => {
+                                if let Some(error) = prepared.local_background_error {
+                                    local_background_errors.push(format!(
+                                        "第 {} 张：{}",
+                                        index + 1,
+                                        error
+                                    ));
+                                }
+                                visible_asset_ids.push(prepared.visible_asset_id);
+                                produced_assets.extend(prepared.assets);
+                            }
+                            Err(error) => asset_build_errors.push(format!(
+                                "第 {} 张结果保存失败：{}",
+                                index + 1,
+                                error
+                            )),
+                        }
+                        if local_background {
+                            gloo_timers::future::TimeoutFuture::new(0).await;
+                        }
                     }
                     if finish_cancelled() {
                         return;
@@ -402,9 +507,10 @@ pub(crate) fn build_generation_actions(
                     }
                     let (actual_width, actual_height) = produced_assets
                         .iter()
+                        .filter(|asset| visible_asset_ids.contains(&asset.id))
                         .find_map(|asset| asset.width.zip(asset.height))
                         .unwrap_or((resolved_width, resolved_height));
-                    let first_generated_id = produced_assets.first().map(|asset| asset.id.clone());
+                    let first_generated_id = visible_asset_ids.first().cloned();
                     let produced_payloads = asset_payload_pairs(&produced_assets);
                     let produced_asset_ids = produced_assets
                         .iter()
@@ -415,6 +521,8 @@ pub(crate) fn build_generation_actions(
                         items.extend(produced_assets);
                         touch_and_trim_asset_payload_cache(items, &produced_asset_ids, false);
                     });
+                    let local_background_error_message = (!local_background_errors.is_empty())
+                        .then(|| local_background_errors.join("；"));
                     tasks_signal.update(|items| {
                         if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
                             let mut result = result;
@@ -423,12 +531,32 @@ pub(crate) fn build_generation_actions(
                             task.status = TaskStatus::Succeeded;
                             task.updated_at = now_rfc3339();
                             task.result = Some(result);
+                            task.error_message = local_background_error_message.clone();
                             strip_successful_task_payloads(std::slice::from_mut(task));
                         }
                     });
                     continuation_signal.set(first_generated_id);
                     persist();
-                    status_signal.set(if !asset_build_errors.is_empty() {
+                    status_signal.set(if local_background && !local_background_errors.is_empty() {
+                        let mut detail = local_background_errors.join("；");
+                        if !asset_build_errors.is_empty() {
+                            detail = format!("{detail}；{}", asset_build_errors.join("；"));
+                        }
+                        format!(
+                            "生成完成，其中 {}/{} 张本地去背景失败，已保留原图。{}",
+                            local_background_errors.len(),
+                            upstream_result_count,
+                            detail
+                        )
+                    } else if local_background && !asset_build_errors.is_empty() {
+                        format!(
+                            "本地去背景完成，但有 {} 张上游结果未能保存。{}",
+                            asset_build_errors.len(),
+                            asset_build_errors.join("；")
+                        )
+                    } else if local_background {
+                        "生成完成，已在浏览器本地去除背景，并自动进入连续修改模式。".into()
+                    } else if !asset_build_errors.is_empty() {
                         format!(
                             "生成完成，但有 {} 张结果未能保存到本地。{}",
                             asset_build_errors.len(),

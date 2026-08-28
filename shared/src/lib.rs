@@ -197,6 +197,8 @@ pub struct EncryptedApiConfig {
     pub known_requires_proxy: bool,
     pub output_format: Option<String>,
     pub output_compression: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
     pub moderation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_plaintext: Option<String>,
@@ -249,18 +251,69 @@ pub struct GenerationResult {
     pub raw_response_json: Option<serde_json::Value>,
 }
 
-pub fn image_mime_from_output_format(output_format: Option<&str>) -> &'static str {
+pub fn normalized_image_output_format(output_format: Option<&str>) -> &'static str {
     match output_format
         .unwrap_or("png")
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "jpg" | "jpeg" => "image/jpeg",
+        "jpg" | "jpeg" => "jpeg",
+        "webp" => "webp",
+        _ => "png",
+    }
+}
+
+pub fn image_mime_from_output_format(output_format: Option<&str>) -> &'static str {
+    match normalized_image_output_format(output_format) {
+        "jpeg" => "image/jpeg",
         "webp" => "image/webp",
-        "png" => "image/png",
         _ => "image/png",
     }
+}
+
+pub fn openai_output_compression(
+    output_format: Option<&str>,
+    output_compression: Option<u8>,
+) -> Option<u8> {
+    matches!(
+        normalized_image_output_format(output_format),
+        "jpeg" | "webp"
+    )
+    .then_some(output_compression)
+    .flatten()
+}
+
+pub fn normalized_background_mode(background: Option<&str>) -> &'static str {
+    match background
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "transparent" => "transparent",
+        "local" => "local",
+        _ => "auto",
+    }
+}
+
+pub fn normalized_openai_background(background: Option<&str>) -> &'static str {
+    if normalized_background_mode(background) == "transparent" {
+        "transparent"
+    } else {
+        // “local” 是浏览器后处理模式，上游仍应按普通背景生成。
+        "auto"
+    }
+}
+
+fn normalize_openai_image_options(config: &mut EncryptedApiConfig) {
+    let background = normalized_background_mode(config.background.as_deref());
+    let mut output_format = normalized_image_output_format(config.output_format.as_deref());
+    if background != "auto" && output_format == "jpeg" {
+        output_format = "png";
+    }
+    config.output_format = Some(output_format.into());
+    config.background = Some(background.into());
 }
 
 pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
@@ -277,6 +330,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
         if config.model.trim().is_empty() {
             config.model = "gpt-image-2".into();
         }
+        normalize_openai_image_options(config);
         normalize_responses_model(config);
         return;
     }
@@ -311,6 +365,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
             if config.model.trim().is_empty() {
                 config.model = "gpt-image-2".into();
             }
+            normalize_openai_image_options(config);
             normalize_responses_model(config);
             config.endpoint_mode = match config.endpoint_mode {
                 ProviderEndpointMode::ResponsesApi => ProviderEndpointMode::ResponsesApi,
@@ -1182,6 +1237,8 @@ pub struct GenerationSettingsSnapshot {
     pub endpoint_mode: ProviderEndpointMode,
     pub output_format: Option<String>,
     pub output_compression: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
     pub moderation: Option<String>,
     pub responses_model: Option<String>,
 }
@@ -2507,6 +2564,7 @@ mod tests {
             known_requires_proxy: true,
             output_format: Some("png".into()),
             output_compression: Some(100),
+            background: None,
             moderation: Some("auto".into()),
             api_key_plaintext: None,
             api_key_encrypted: None,
@@ -2515,10 +2573,40 @@ mod tests {
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
         };
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized.get("background").is_none());
+        config = serde_json::from_value(serialized).unwrap();
         normalize_api_config(&mut config);
         assert_eq!(config.provider_kind, ProviderKind::OpenAiImage);
         assert_eq!(config.endpoint_mode, ProviderEndpointMode::ResponsesApi);
         assert_eq!(config.responses_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(config.background.as_deref(), Some("auto"));
+
+        config.background = Some("transparent".into());
+        config.output_format = Some("jpeg".into());
+        normalize_api_config(&mut config);
+        assert_eq!(config.output_format.as_deref(), Some("png"));
+        assert_eq!(config.background.as_deref(), Some("transparent"));
+
+        config.background = Some("local".into());
+        normalize_api_config(&mut config);
+        assert_eq!(config.background.as_deref(), Some("local"));
+        assert_eq!(
+            normalized_openai_background(config.background.as_deref()),
+            "auto"
+        );
+
+        config.background = Some("unsupported".into());
+        normalize_api_config(&mut config);
+        assert_eq!(config.background.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn openai_compression_only_applies_to_lossy_formats() {
+        assert_eq!(openai_output_compression(Some("png"), Some(80)), None);
+        assert_eq!(openai_output_compression(None, Some(80)), None);
+        assert_eq!(openai_output_compression(Some("jpeg"), Some(80)), Some(80));
+        assert_eq!(openai_output_compression(Some("webp"), Some(75)), Some(75));
     }
 
     #[test]
@@ -2536,6 +2624,7 @@ mod tests {
             known_requires_proxy: true,
             output_format: Some("png".into()),
             output_compression: Some(100),
+            background: None,
             moderation: Some("auto".into()),
             api_key_plaintext: None,
             api_key_encrypted: None,

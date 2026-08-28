@@ -31,6 +31,7 @@ pub(crate) struct PreviewPanelState {
     pub(crate) source_label: String,
     pub(crate) requested_model: String,
     pub(crate) moderation_label: String,
+    pub(crate) background_label: String,
     pub(crate) requested_quality_label: String,
     pub(crate) actual_quality_label: String,
     pub(crate) format_label: String,

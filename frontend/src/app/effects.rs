@@ -129,6 +129,15 @@ async fn initialize_app_state(
     state
         .assets
         .retain(|asset| !asset.metadata.contains_key("mask_base_asset_id"));
+    let removed_local_background_source_ids =
+        data_management::discard_legacy_local_background_sources(&mut state);
+    record_sync_tombstones_in(
+        &mut state.tombstones,
+        removed_local_background_source_ids
+            .iter()
+            .cloned()
+            .map(|asset_id| (SyncEntityKind::Asset, asset_id)),
+    );
     let had_embedded_payloads = state.assets.iter().any(|asset| asset.data_url.is_some());
     reconcile_task_integrity(&mut state.tasks, &state.assets, true);
     let initial_thread_id = state
@@ -176,7 +185,21 @@ async fn initialize_app_state(
         });
         request_payload_flush_for_state(persistence);
     }
-    if had_embedded_payloads || stripped_task_payloads {
+    if !removed_local_background_source_ids.is_empty() {
+        persistence.payload_write_queue.update(|queued| {
+            for asset_id in &removed_local_background_source_ids {
+                queued.remove(asset_id);
+            }
+        });
+        persistence.payload_delete_queue.update(|queued| {
+            queued.extend(removed_local_background_source_ids.iter().cloned());
+        });
+        request_payload_flush_for_state(persistence);
+    }
+    if had_embedded_payloads
+        || stripped_task_payloads
+        || !removed_local_background_source_ids.is_empty()
+    {
         request_workspace_persist_for_state(workspace, persistence);
     }
 
