@@ -5,15 +5,20 @@ RUN rustup target add wasm32-unknown-unknown && cargo install trunk
 WORKDIR /app
 COPY . .
 
-RUN cargo build -p mew-image-backend --release
+RUN cargo build -p mew-image-backend --profile docker-release
 RUN cd frontend && trunk build --release --dist dist-app
+
+FROM debian:bookworm-slim AS certificates
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
-COPY --from=builder /app/target/release/mew-image-backend /usr/local/bin/mew-image-backend
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /app/target/docker-release/mew-image-backend /usr/local/bin/mew-image-backend
 COPY --from=builder /app/frontend/dist-app /app/frontend/dist-app
 
 ENV MEW_LISTEN=0.0.0.0:3000

@@ -1,18 +1,19 @@
 use leptos::{prelude::*, task::spawn_local};
+use mew_image_shared::TaskStatus;
 use web_sys::MouseEvent;
 
 use crate::app::{
     derived::AppDerived,
     ensure_asset_payloads_loaded, first_displayable_generated_asset,
-    models::ContextMenuState,
-    state::{UiState, WorkspaceState},
+    models::{ConfirmPopoverKind, ConfirmPopoverState, ContextMenuState},
+    state::{ComposerState, UiState, WorkspaceState},
 };
 
 use super::common::{MaterialSymbolIcon, PaginationControls};
 
 #[component]
 pub(crate) fn GallerySidebar(
-    open_preview: impl Fn(String, String) + Copy + Send + Sync + 'static,
+    open_preview: impl Fn(String, Option<String>) + Copy + Send + Sync + 'static,
     enter_continuation_context: impl Fn(String, String) + Copy + Send + Sync + 'static,
     rerun_task: impl Fn(String) + Copy + Send + Sync + 'static,
     toggle_favorite_for_task: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
@@ -20,12 +21,15 @@ pub(crate) fn GallerySidebar(
     delete_task: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
     let workspace = expect_context::<WorkspaceState>();
+    let composer = expect_context::<ComposerState>();
     let ui = expect_context::<UiState>();
     let derived = expect_context::<AppDerived>();
     let tasks = workspace.tasks;
     let assets = workspace.assets;
     let gallery_page = ui.gallery_page;
     let context_menu_state = ui.context_menu_state;
+    let confirm_popover = ui.confirm_popover;
+    let generation_runtimes = composer.generation_runtimes;
     let gallery_entries = derived.gallery_entries;
     let paged_gallery_entries = derived.paged_gallery_entries;
     let gallery_page_count = derived.gallery_page_count;
@@ -35,7 +39,29 @@ pub(crate) fn GallerySidebar(
                     <div class="row">
                         <h2>"结果画廊"</h2>
                         <div class="row gallery-title-actions">
-                            <span class="tag gallery-count-tag">{move || format!("{} 张", gallery_entries.get().len())}</span>
+                            <span class="tag gallery-count-tag">{move || {
+                                let entries = gallery_entries.get();
+                                let completed = entries
+                                    .iter()
+                                    .filter(|item| item.status == TaskStatus::Succeeded)
+                                    .count();
+                                let running = entries
+                                    .iter()
+                                    .filter(|item| item.status == TaskStatus::Running)
+                                    .count();
+                                let failed = entries
+                                    .iter()
+                                    .filter(|item| item.status == TaskStatus::Failed)
+                                    .count();
+                                let mut summary = vec![format!("{completed} 张")];
+                                if running > 0 {
+                                    summary.push(format!("{running} 个进行中"));
+                                }
+                                if failed > 0 {
+                                    summary.push(format!("{failed} 个失败"));
+                                }
+                                summary.join(" · ")
+                            }}</span>
                         </div>
                     </div>
                     <div class="gallery sidebar-gallery">
@@ -61,12 +87,34 @@ pub(crate) fn GallerySidebar(
                                     let favorite_icon_task_id = task_id.clone();
                                     let favorite_fill_task_id = task_id.clone();
                                     let preview_task_id = task_id.clone();
+                                    let running_preview_task_id = task_id.clone();
                                     let preview_asset_id = asset_id.clone();
                                     let context_task_id = task_id.clone();
                                     let context_asset_id = asset_id.clone();
+                                    let cancel_task_id = task_id.clone();
+                                    let item_status = item.status;
+                                    let error_message = item.error_message.clone();
+                                    let progress_label = generation_runtimes.with(|items| {
+                                        items
+                                            .get(&task_id)
+                                            .map(|runtime| runtime.progress_label.clone())
+                                            .unwrap_or_else(|| "等待结果".into())
+                                    });
                                     view! {
                                         <article class="card gallery-card-compact">
-                                            {item.src.clone().map(|src| {
+                                            {if item_status == TaskStatus::Running {
+                                                view! {
+                                                    <button
+                                                        class="image-button compact-preview-button gallery-running-preview"
+                                                        title="查看任务详情"
+                                                        on:click=move |_| open_preview(running_preview_task_id.clone(), None)
+                                                    >
+                                                        <span class="gallery-running-spinner"></span>
+                                                        <strong>{progress_label}</strong>
+                                                    </button>
+                                                }.into_any()
+                                            } else {
+                                                item.src.clone().map(|src| {
                                                 let preview_src = src.clone();
                                                 let ratio_label = item.ratio_label.clone();
                                                 let size_label = item.size_label.clone();
@@ -75,7 +123,7 @@ pub(crate) fn GallerySidebar(
                                                         class="image-button compact-preview-button"
                                                         on:click=move |_| {
                                                             if let Some(asset_id) = preview_asset_id.clone() {
-                                                                open_preview(preview_task_id.clone(), asset_id);
+                                                                open_preview(preview_task_id.clone(), Some(asset_id));
                                                             }
                                                         }
                                                         on:contextmenu=move |ev: MouseEvent| {
@@ -106,9 +154,13 @@ pub(crate) fn GallerySidebar(
                                                         <img class="compact-preview-image" src=preview_src alt=item.prompt.clone() />
                                                     </button>
                                                 }.into_any()
-                                            }).unwrap_or_else(|| view! { <div class="compact-preview-fallback muted">"无预览"</div> }.into_any())}
+                                            }).unwrap_or_else(|| view! { <div class="compact-preview-fallback muted">"无预览"</div> }.into_any())
+                                            }}
                                             <div class="card-body stack compact-card-body">
                                                 <p class="gallery-card-title">{item.prompt.clone()}</p>
+                                                {error_message.map(|error| view! {
+                                                    <span class="status gallery-failure-summary">{format!("失败：{error}")}</span>
+                                                })}
                                                 {
                                                     let meta_label =
                                                         format!("{} · {}", item.config_name, item.model);
@@ -118,7 +170,29 @@ pub(crate) fn GallerySidebar(
                                                         </div>
                                                     }
                                                 }
-                                                <div class="row compact-actions">
+                                                {if item_status == TaskStatus::Running {
+                                                    view! {
+                                                        <div class="row compact-actions">
+                                                            <button
+                                                                class="button ghost danger mini-action gallery-stop-action"
+                                                                title="停止这个生成任务"
+                                                                on:click=move |ev: MouseEvent| {
+                                                                    confirm_popover.set(Some(ConfirmPopoverState {
+                                                                        kind: ConfirmPopoverKind::CancelGeneration(cancel_task_id.clone()),
+                                                                        title: "停止生成".into(),
+                                                                        message: "确定停止这个生成任务吗？已经发送到上游的请求可能仍会产生消耗。".into(),
+                                                                        x: ev.client_x() as f64,
+                                                                        y: ev.client_y() as f64,
+                                                                    }));
+                                                                }
+                                                            >
+                                                                <MaterialSymbolIcon name="stop" filled=true />
+                                                                <span>"停止"</span>
+                                                            </button>
+                                                        </div>
+                                                    }.into_any()
+                                                } else {
+                                                    view! { <div class="row compact-actions">
                                                     <button class="button ghost mini-action icon-action" title="重新生成" on:click=move |_| rerun_task(rerun_task_id.clone())><MaterialSymbolIcon name="restart_alt" filled=false /></button>
                                                     <button class="button ghost mini-action icon-action" title="继续修改" on:click=move |_| {
                                                         if let Some(first_asset) = assets.with_untracked(|items| first_displayable_generated_asset(items, &continue_task_id)) {
@@ -179,7 +253,8 @@ pub(crate) fn GallerySidebar(
                                                         ().into_any()
                                                     }}
                                                     <button class="button ghost danger mini-action icon-action" title="删除记录" on:click=move |ev: MouseEvent| delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64)><MaterialSymbolIcon name="delete" filled=false /></button>
-                                                </div>
+                                                    </div> }.into_any()
+                                                }}
                                             </div>
                                         </article>
                                     }.into_any()

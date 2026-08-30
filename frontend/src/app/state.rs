@@ -7,6 +7,8 @@ use mew_image_shared::{
     SyncTombstone, UserSummary,
 };
 
+use crate::storage::load_generation_queue_mode;
+
 use super::{
     default_thread,
     models::{
@@ -29,9 +31,18 @@ pub(crate) struct WorkspaceState {
     pub(crate) current_config_id: RwSignal<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ActiveGenerationRuntime {
+    pub(crate) abort_controller: web_sys::AbortController,
+    pub(crate) dependency_asset_ids: HashSet<String>,
+    pub(crate) thread_id: String,
+    pub(crate) progress_label: String,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ComposerState {
     pub(crate) selected_reference_ids: RwSignal<Vec<String>>,
+    pub(crate) show_all_reference_assets: RwSignal<bool>,
     pub(crate) dragging_reference_id: RwSignal<Option<String>>,
     pub(crate) drag_over_reference_id: RwSignal<Option<String>>,
     pub(crate) reference_menu_asset_id: RwSignal<Option<String>>,
@@ -48,9 +59,12 @@ pub(crate) struct ComposerState {
     pub(crate) quality: RwSignal<String>,
     pub(crate) count: RwSignal<u32>,
     pub(crate) status_text: RwSignal<String>,
+    pub(crate) queue_mode_enabled: RwSignal<bool>,
+    pub(crate) active_generation_ids: RwSignal<HashSet<String>>,
+    pub(crate) cancelled_generation_ids: RwSignal<HashSet<String>>,
+    pub(crate) generation_runtimes: RwSignal<HashMap<String, ActiveGenerationRuntime>>,
+    pub(crate) foreground_generation_task_id: RwSignal<Option<String>>,
     pub(crate) generating: RwSignal<bool>,
-    pub(crate) generation_cancel_requested: RwSignal<bool>,
-    pub(crate) generation_abort_controller: RwSignal<Option<web_sys::AbortController>>,
 }
 
 #[derive(Clone, Copy)]
@@ -161,6 +175,7 @@ impl AppState {
         };
         let composer = ComposerState {
             selected_reference_ids: RwSignal::new(Vec::new()),
+            show_all_reference_assets: RwSignal::new(false),
             dragging_reference_id: RwSignal::new(None),
             drag_over_reference_id: RwSignal::new(None),
             reference_menu_asset_id: RwSignal::new(None),
@@ -179,9 +194,12 @@ impl AppState {
             status_text: RwSignal::new(
                 "准备就绪，当前默认是游客本地 + 受限代理模式：数据留在浏览器，本服务仅对受信任图像上游做临时中转。".into(),
             ),
+            queue_mode_enabled: RwSignal::new(load_generation_queue_mode()),
+            active_generation_ids: RwSignal::new(HashSet::new()),
+            cancelled_generation_ids: RwSignal::new(HashSet::new()),
+            generation_runtimes: RwSignal::new(HashMap::new()),
+            foreground_generation_task_id: RwSignal::new(None),
             generating: RwSignal::new(false),
-            generation_cancel_requested: RwSignal::new(false),
-            generation_abort_controller: RwSignal::new(None),
         };
         let account = AccountState {
             auth_user: RwSignal::new(None),

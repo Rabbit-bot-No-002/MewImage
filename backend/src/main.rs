@@ -72,7 +72,6 @@ use tower_sessions_sqlx_store::SqliteStore;
 use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
 use tracing::{error, info, warn};
 
-const MAX_CONCURRENT_PROXY_GENERATIONS: usize = 5;
 const MAX_ACTIVE_PROXY_GENERATION_JOBS: usize = 20;
 const MAX_STORED_PROXY_GENERATION_JOBS: usize = 32;
 const PROXY_GENERATION_JOB_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
@@ -142,9 +141,6 @@ async fn main() -> anyhow::Result<()> {
         s3,
         http: reqwest::Client::builder().build()?,
         provider_builtins: builtins,
-        generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
-            MAX_CONCURRENT_PROXY_GENERATIONS,
-        )),
         generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
             MAX_ACTIVE_PROXY_GENERATION_JOBS,
         )),
@@ -1505,12 +1501,6 @@ async fn run_proxy_generation_job(
     job_slot: tokio::sync::OwnedSemaphorePermit,
 ) {
     let result = tokio::time::timeout(PROXY_GENERATION_JOB_TIMEOUT, async {
-        let _generation_permit = state
-            .generation_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::internal_message("代理生成并发控制器已关闭"))?;
         update_proxy_generation_job(&state, &job_id, ProxyGenerationJobState::Running).await;
         execute_proxy_generation(&state, &payload).await
     })
@@ -3793,9 +3783,6 @@ mod tests {
             s3: None,
             http: reqwest::Client::new(),
             provider_builtins: Vec::new(),
-            generation_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_PROXY_GENERATIONS,
-            )),
             generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
                 MAX_ACTIVE_PROXY_GENERATION_JOBS,
             )),
@@ -3842,6 +3829,20 @@ mod tests {
         assert!(!jobs.contains_key("expired"));
         assert_eq!(jobs.len(), MAX_STORED_PROXY_GENERATION_JOBS);
         assert!(!jobs.contains_key(&format!("completed-{}", MAX_STORED_PROXY_GENERATION_JOBS)));
+    }
+
+    #[test]
+    fn proxy_generation_active_slots_are_capped_at_twenty() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(
+            MAX_ACTIVE_PROXY_GENERATION_JOBS,
+        ));
+        let permits = (0..MAX_ACTIVE_PROXY_GENERATION_JOBS)
+            .map(|_| slots.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(slots.clone().try_acquire_owned().is_err());
+        drop(permits);
+        assert!(slots.try_acquire_owned().is_ok());
     }
 
     #[test]

@@ -6,7 +6,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.0.5"
+version = "1.0.6"
 
 [workspace.dependencies]
 base64 = "0.22.1"
@@ -15,3 +15,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
 uuid = { version = "1.18.1", features = ["serde", "v4", "js"] }
+
+[profile.docker-release]
+inherits = "release"
+# 仅优化 Docker 后端，避免改变前端 WASM 的目标特性和浏览器兼容范围。
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

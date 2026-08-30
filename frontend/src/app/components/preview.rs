@@ -44,24 +44,29 @@ pub(crate) fn PreviewOverlay(
     view! {
             {move || current_preview.get().zip(preview_panel_state.get()).map(|((task, asset), panel)| {
                 let preview_task_id = panel.task_id.clone();
-                let preview_asset_id = panel.asset_id.clone();
+                let preview_asset_id = asset.as_ref().map(|asset| asset.id.clone());
                 let favorite_task_id = panel.task_id.clone();
                 let delete_task_id = panel.task_id.clone();
                 let edit_task_id = panel.task_id.clone();
-                let edit_asset_id = panel.asset_id.clone();
-                let fullscreen_src = {
-                    let source = asset_src(&asset);
-                    if source.is_empty() {
-                        panel.display_src.clone()
-                    } else {
-                        source
-                    }
-                };
+                let edit_asset_id = asset
+                    .as_ref()
+                    .map(|asset| asset.id.clone())
+                    .unwrap_or_default();
+                let has_asset = asset.is_some();
+                let fullscreen_src = asset
+                    .as_ref()
+                    .map(asset_src)
+                    .filter(|source| !source.is_empty())
+                    .or_else(|| panel.display_src.clone())
+                    .unwrap_or_default();
                 let preview_image_src = fullscreen_src.clone();
                 let copy_src = fullscreen_src.clone();
                 let toolbar_download_src = fullscreen_src.clone();
                 let download_src = fullscreen_src.clone();
-                let toolbar_download_name = download_file_name_for_asset(&asset);
+                let toolbar_download_name = asset
+                    .as_ref()
+                    .map(download_file_name_for_asset)
+                    .unwrap_or_default();
                 let download_name = toolbar_download_name.clone();
                 let prompt_text = panel.prompt.clone();
                 let reference_thumb_ids = panel
@@ -82,7 +87,7 @@ pub(crate) fn PreviewOverlay(
                                     <span class="tag">{format!("{}x{}", panel.width, panel.height)}</span>
                                 </div>
                                 {move || {
-                                    if preview_fullscreen.get() {
+                                    if has_asset && preview_fullscreen.get() {
                                         let toolbar_download_src = toolbar_download_src.clone();
                                         let toolbar_download_name = toolbar_download_name.clone();
                                         view! {
@@ -119,7 +124,11 @@ pub(crate) fn PreviewOverlay(
                                 <button
                                     class="image-button preview-image-button"
                                     class:is-pan-enabled=move || preview_fullscreen.get()
+                                    disabled=move || !has_asset
                                     on:click=move |_| {
+                                        if !has_asset {
+                                            return;
+                                        }
                                         if !preview_fullscreen.get_untracked() {
                                             preview_fullscreen.set(true);
                                             preview_zoom.set(1.0);
@@ -128,7 +137,7 @@ pub(crate) fn PreviewOverlay(
                                         }
                                     }
                                     on:mousedown=move |ev: MouseEvent| {
-                                        if !preview_fullscreen.get_untracked() {
+                                        if !has_asset || !preview_fullscreen.get_untracked() {
                                             return;
                                         }
                                         ev.prevent_default();
@@ -154,7 +163,7 @@ pub(crate) fn PreviewOverlay(
                                         preview_dragging.set(false);
                                     }
                                     on:wheel=move |ev: WheelEvent| {
-                                        if !preview_fullscreen.get_untracked() {
+                                        if !has_asset || !preview_fullscreen.get_untracked() {
                                             return;
                                         }
                                         ev.prevent_default();
@@ -169,29 +178,44 @@ pub(crate) fn PreviewOverlay(
                                         }
                                     }
                                     on:contextmenu=move |ev: MouseEvent| {
+                                        let Some(asset_id) = preview_asset_id.clone() else {
+                                            return;
+                                        };
                                         ev.prevent_default();
                                         context_menu_state.set(Some(ContextMenuState {
                                             task_id: preview_task_id.clone(),
-                                            asset_id: preview_asset_id.clone(),
+                                            asset_id,
                                             x: ev.client_x() as f64,
                                             y: ev.client_y() as f64,
                                         }));
                                     }
                                 >
-                                    <img
-                                        class="preview-image"
-                                        class:is-zoomed=move || preview_fullscreen.get()
-                                        style=move || {
-                                            format!(
-                                                "transform: translate({:.1}px, {:.1}px) scale({:.3});",
-                                                preview_offset_x.get(),
-                                                preview_offset_y.get(),
-                                                preview_zoom.get()
-                                            )
-                                        }
-                                        src=preview_image_src
-                                        alt=panel.prompt.clone()
-                                    />
+                                    {if has_asset {
+                                        view! {
+                                            <img
+                                                class="preview-image"
+                                                class:is-zoomed=move || preview_fullscreen.get()
+                                                style=move || {
+                                                    format!(
+                                                        "transform: translate({:.1}px, {:.1}px) scale({:.3});",
+                                                        preview_offset_x.get(),
+                                                        preview_offset_y.get(),
+                                                        preview_zoom.get()
+                                                    )
+                                                }
+                                                src=preview_image_src
+                                                alt=panel.prompt.clone()
+                                            />
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div class="preview-waiting-stage">
+                                                <span class="gallery-running-spinner"></span>
+                                                <strong>"正在等待上游结果"</strong>
+                                                <span class="status">"任务完成后即可查看生成图片"</span>
+                                            </div>
+                                        }.into_any()
+                                    }}
                                 </button>
                             </section>
                             <aside class="preview-sidebar">
@@ -322,31 +346,37 @@ pub(crate) fn PreviewOverlay(
                                         continue_from_task(task.id.clone());
                                         close_preview();
                                     }>"复用配置"</button>
-                                    <button class="button secondary" on:click=move |_| edit_output_asset(edit_task_id.clone(), edit_asset_id.clone())>"编辑输出"</button>
-                                    <button class="button ghost danger" on:click=move |ev: MouseEvent| {
-                                        delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64);
-                                    }>"删除记录"</button>
-                                    <button class="button ghost" on:click=move |ev: MouseEvent| {
-                                        toggle_favorite_for_task(
-                                            favorite_task_id.clone(),
-                                            ev.client_x() as f64,
-                                            ev.client_y() as f64,
-                                        );
-                                    }>
-                                        {move || if preview_panel_state.get().map(|state| state.favorite).unwrap_or(false) { "取消收藏" } else { "收藏" }}
-                                    </button>
+                                    {has_asset.then(|| view! {
+                                        <>
+                                            <button class="button secondary" on:click=move |_| edit_output_asset(edit_task_id.clone(), edit_asset_id.clone())>"编辑输出"</button>
+                                            <button class="button ghost danger" on:click=move |ev: MouseEvent| {
+                                                delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64);
+                                            }>"删除记录"</button>
+                                            <button class="button ghost" on:click=move |ev: MouseEvent| {
+                                                toggle_favorite_for_task(
+                                                    favorite_task_id.clone(),
+                                                    ev.client_x() as f64,
+                                                    ev.client_y() as f64,
+                                                );
+                                            }>
+                                                {move || if preview_panel_state.get().map(|state| state.favorite).unwrap_or(false) { "取消收藏" } else { "收藏" }}
+                                            </button>
+                                        </>
+                                    })}
                                 </div>
-                                <div class="row preview-actions">
-                                    <button class="button ghost" on:click=move |_| {
-                                        let src = copy_src.clone();
-                                        spawn_local(async move {
-                                            let _ = copy_image_from_src(&src).await;
-                                        });
-                                    }>"复制"</button>
-                                    <button class="button ghost" on:click=move |_| {
-                                        let _ = download_image_from_src(&download_src, &download_name);
-                                    }>"下载"</button>
-                                </div>
+                                {has_asset.then(|| view! {
+                                    <div class="row preview-actions">
+                                        <button class="button ghost" on:click=move |_| {
+                                            let src = copy_src.clone();
+                                            spawn_local(async move {
+                                                let _ = copy_image_from_src(&src).await;
+                                            });
+                                        }>"复制"</button>
+                                        <button class="button ghost" on:click=move |_| {
+                                            let _ = download_image_from_src(&download_src, &download_name);
+                                        }>"下载"</button>
+                                    </div>
+                                })}
                             </aside>
                         </div>
                     </div>

@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+
 use leptos::prelude::*;
 use mew_image_shared::{EncryptedApiConfig, clamp_size, now_rfc3339};
 use web_sys::{DragEvent, FileList, MouseEvent};
+
+use crate::storage::save_generation_queue_mode;
 
 use crate::app::{
     asset_display_src, background_mode_label, cycle_background_mode,
@@ -46,6 +50,7 @@ pub(crate) fn WorkspaceMain(
     let current_thread_id = workspace.current_thread_id;
     let current_config_id = workspace.current_config_id;
     let selected_reference_ids = composer.selected_reference_ids;
+    let show_all_reference_assets = composer.show_all_reference_assets;
     let dragging_reference_id = composer.dragging_reference_id;
     let drag_over_reference_id = composer.drag_over_reference_id;
     let continuation_asset_id = composer.continuation_asset_id;
@@ -61,6 +66,9 @@ pub(crate) fn WorkspaceMain(
     let quality = composer.quality;
     let count = composer.count;
     let status_text = composer.status_text;
+    let queue_mode_enabled = composer.queue_mode_enabled;
+    let active_generation_ids = composer.active_generation_ids;
+    let foreground_generation_task_id = composer.foreground_generation_task_id;
     let generating = composer.generating;
     let show_thread_archive_menu = ui.show_thread_archive_menu;
     let data_management_busy = ui.data_management_busy;
@@ -79,6 +87,57 @@ pub(crate) fn WorkspaceMain(
                 <section class="panel composer-panel">
                     <div class="row composer-title-row">
                         <h2>"提示词与生成"</h2>
+                        <div class="composer-title-actions">
+                            <button
+                                type="button"
+                                class="button ghost compact-toggle"
+                                class:active-compact-toggle=move || queue_mode_enabled.get()
+                                aria-pressed=move || queue_mode_enabled.get()
+                                disabled=move || !queue_mode_enabled.get()
+                                    && foreground_generation_task_id.get().is_some()
+                                title="开启后可连续提交多个并发任务；与连续修改模式互斥"
+                                on:click=move |_| {
+                                    let next = !queue_mode_enabled.get_untracked();
+                                    if next && foreground_generation_task_id.get_untracked().is_some() {
+                                        status_text.set("请先等待当前普通任务完成或停止后再开启队列模式。".into());
+                                        return;
+                                    }
+                                    queue_mode_enabled.set(next);
+                                    if next {
+                                        continuation_asset_id.set(None);
+                                        status_text.set("已开启队列模式，可以继续编辑并并发提交任务。".into());
+                                    } else {
+                                        status_text.set("已关闭队列模式。后台任务会继续运行。".into());
+                                    }
+                                    let _ = save_generation_queue_mode(next);
+                                }
+                            >
+                                <MaterialSymbolIcon name="queue" filled=false />
+                                {move || if queue_mode_enabled.get() { "队列：开" } else { "队列：关" }}
+                            </button>
+                            {move || {
+                                let active_count = active_generation_ids.with(HashSet::len);
+                                (active_count > 0).then(|| view! {
+                                    <span class="tag generation-active-count">{format!("运行中 {active_count} 个")}</span>
+                                    <button
+                                        type="button"
+                                        class="button ghost compact-toggle"
+                                        on:click=move |ev: MouseEvent| {
+                                            confirm_popover.set(Some(ConfirmPopoverState {
+                                                kind: ConfirmPopoverKind::CancelAllGenerations,
+                                                title: "停止全部生成".into(),
+                                                message: "确定停止当前全部生成任务吗？已经发送到上游的请求可能仍会产生消耗。".into(),
+                                                x: ev.client_x() as f64,
+                                                y: ev.client_y() as f64,
+                                            }));
+                                        }
+                                    >
+                                        <MaterialSymbolIcon name="stop" filled=true />
+                                        "停止全部"
+                                    </button>
+                                })
+                            }}
+                        </div>
                         <div class="config-switcher">
                             <button
                                 class="tag config-switcher-button"
@@ -693,7 +752,7 @@ pub(crate) fn WorkspaceMain(
                         ().into_any()
                     }}
 
-                    {move || if generating.get() {
+                    {move || if let Some(task_id) = foreground_generation_task_id.get() {
                         view! {
                             <button
                                 type="button"
@@ -701,7 +760,7 @@ pub(crate) fn WorkspaceMain(
                                 title="停止当前生成任务"
                                 on:click=move |ev: MouseEvent| {
                                     confirm_popover.set(Some(ConfirmPopoverState {
-                                        kind: ConfirmPopoverKind::CancelGeneration,
+                                        kind: ConfirmPopoverKind::CancelGeneration(task_id.clone()),
                                         title: "停止生成".into(),
                                         message: "确定停止当前生成任务吗？已经发送到上游的请求可能仍会产生消耗。".into(),
                                         x: ev.client_x() as f64,
@@ -725,9 +784,22 @@ pub(crate) fn WorkspaceMain(
 
                 <section class="panel asset-panel">
                     <section class="stack">
-                        <div class="row">
+                        <div class="row reference-title-row">
                             <h2>"参考图"</h2>
-                            <span class="tag">{move || format!("已选参考图 {} 张", selected_reference_ids.get().len())}</span>
+                            <div class="reference-title-actions">
+                                <span class="tag">{move || format!("已选参考图 {} 张", selected_reference_ids.get().len())}</span>
+                                <button
+                                    type="button"
+                                    class="button ghost compact-toggle"
+                                    class:active-compact-toggle=move || show_all_reference_assets.get()
+                                    aria-pressed=move || show_all_reference_assets.get()
+                                    title="显示当前会话上传过或历史任务使用过的全部参考图"
+                                    on:click=move |_| show_all_reference_assets.update(|value| *value = !*value)
+                                >
+                                    <MaterialSymbolIcon name="collections" filled=false />
+                                    {move || if show_all_reference_assets.get() { "显示全部：开" } else { "显示全部：关" }}
+                                </button>
+                            </div>
                         </div>
                         <div class="preview-strip">
                             <For

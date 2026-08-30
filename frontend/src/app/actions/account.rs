@@ -372,7 +372,8 @@ pub(crate) fn build_account_actions(
                             if preview_state_signal
                                 .get_untracked()
                                 .as_ref()
-                                .map(|preview| removed_asset_ids.contains(&preview.asset_id))
+                                .and_then(|preview| preview.asset_id.as_ref())
+                                .map(|asset_id| removed_asset_ids.contains(asset_id))
                                 .unwrap_or(false)
                             {
                                 preview_state_signal.set(None);

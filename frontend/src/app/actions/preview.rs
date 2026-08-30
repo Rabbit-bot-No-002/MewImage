@@ -17,6 +17,8 @@ pub(crate) fn build_preview_actions(
     perform_clear_cloud_data: impl Fn(CloudDataClearScope) + Copy + Send + Sync + 'static,
     admin_user_action: impl Fn(&'static str, String) + Copy + Send + Sync + 'static,
     enter_continuation_context: impl Fn(String, String) + Copy + Send + Sync + 'static,
+    cancel_generation: impl Fn(String) + Copy + Send + Sync + 'static,
+    cancel_all_generations: impl Fn() + Copy + Send + Sync + 'static,
 ) -> (
     impl Fn(String) + Copy + Send + Sync + 'static,
     impl Fn(f64, f64) + Copy + Send + Sync + 'static,
@@ -43,8 +45,6 @@ pub(crate) fn build_preview_actions(
     let preferences = workspace.preferences;
     let current_thread_id = workspace.current_thread_id;
     let status_text = composer.status_text;
-    let generation_cancel_requested = composer.generation_cancel_requested;
-    let generation_abort_controller = composer.generation_abort_controller;
     let favorite_folder_picker = ui.favorite_folder_picker;
     let text_popover = ui.text_popover;
     let text_popover_value = ui.text_popover_value;
@@ -244,13 +244,8 @@ pub(crate) fn build_preview_actions(
         let (x, y) = (state.x, state.y);
         confirm_popover.set(None);
         match state.kind {
-            ConfirmPopoverKind::CancelGeneration => {
-                generation_cancel_requested.set(true);
-                if let Some(controller) = generation_abort_controller.get_untracked() {
-                    controller.abort();
-                }
-                status_text.set("正在停止当前生成任务……".into());
-            }
+            ConfirmPopoverKind::CancelGeneration(task_id) => cancel_generation(task_id),
+            ConfirmPopoverKind::CancelAllGenerations => cancel_all_generations(),
             ConfirmPopoverKind::DeleteAsset(asset_id) => perform_delete_asset(asset_id),
             ConfirmPopoverKind::DeleteConfig(config_id) => perform_delete_config(config_id),
             ConfirmPopoverKind::DeleteThread(thread_id) => perform_delete_thread(thread_id),

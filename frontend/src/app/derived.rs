@@ -11,7 +11,7 @@ use super::{
     state::{ComposerState, UiState, WorkspaceState},
     utils::workspace::{
         GalleryItem, gallery_items, normalized_favorite_folders, paged_items,
-        selected_reference_assets, visible_thread_items,
+        selected_reference_assets, thread_reference_assets, visible_thread_items,
     },
 };
 
@@ -24,7 +24,7 @@ pub(crate) struct AppDerived {
     pub(crate) continuation_asset: Memo<Option<ImageAssetRef>>,
     pub(crate) dimension_reference_assets: Memo<Vec<ImageAssetRef>>,
     pub(crate) current_reference_menu_asset: Memo<Option<ImageAssetRef>>,
-    pub(crate) current_preview: Memo<Option<(LocalTaskRecord, ImageAssetRef)>>,
+    pub(crate) current_preview: Memo<Option<(LocalTaskRecord, Option<ImageAssetRef>)>>,
     pub(crate) gallery_entries: Memo<Vec<GalleryItem>>,
     pub(crate) favorite_folders: Memo<Vec<FavoriteFolder>>,
     pub(crate) active_favorite_folder_id: Memo<String>,
@@ -78,9 +78,17 @@ impl AppDerived {
         });
         let reference_assets = Memo::new(move |_| {
             let selected_ids = composer.selected_reference_ids.get();
-            workspace
-                .assets
-                .with(|assets| selected_reference_assets(assets, &selected_ids))
+            if !composer.show_all_reference_assets.get() {
+                return workspace
+                    .assets
+                    .with(|assets| selected_reference_assets(assets, &selected_ids));
+            }
+            let thread_id = workspace.current_thread_id.get();
+            workspace.assets.with(|assets| {
+                workspace
+                    .tasks
+                    .with(|tasks| thread_reference_assets(assets, tasks, &thread_id, &selected_ids))
+            })
         });
         let continuation_asset = Memo::new(move |_| {
             let asset_id = composer.continuation_asset_id.get()?;
@@ -128,11 +136,17 @@ impl AppDerived {
                     .cloned()
             })?;
             let asset = workspace.assets.with(|assets| {
-                assets
-                    .iter()
-                    .find(|asset| asset.id == preview.asset_id)
+                preview
+                    .asset_id
+                    .as_ref()
+                    .and_then(|asset_id| assets.iter().find(|asset| asset.id == *asset_id))
+                    .or_else(|| {
+                        assets
+                            .iter()
+                            .find(|asset| asset.source_task_id.as_deref() == Some(task.id.as_str()))
+                    })
                     .cloned()
-            })?;
+            });
             Some((task, asset))
         });
         let gallery_entries = Memo::new(move |_| {

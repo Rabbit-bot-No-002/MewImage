@@ -200,7 +200,6 @@ pub struct AppState {
     pub s3: Option<S3Client>,
     pub http: reqwest::Client,
     pub provider_builtins: Vec<ProviderTemplate>,
-    pub generation_semaphore: Arc<Semaphore>,
     pub generation_job_slots: Arc<Semaphore>,
     pub generation_jobs: Arc<Mutex<HashMap<String, ProxyGenerationJob>>>,
     pub auth_hash_semaphore: Arc<Semaphore>,

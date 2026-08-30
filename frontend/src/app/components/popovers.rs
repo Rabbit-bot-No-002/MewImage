@@ -64,7 +64,8 @@ pub(crate) fn GlobalPopovers(
             {move || confirm_popover.get().map(|state| {
                 let style = confirm_popover_style(state.x, state.y);
                 let confirm_label = match state.kind {
-                    ConfirmPopoverKind::CancelGeneration => "确认停止",
+                    ConfirmPopoverKind::CancelGeneration(_)
+                    | ConfirmPopoverKind::CancelAllGenerations => "确认停止",
                     ConfirmPopoverKind::ClearLocalData(_)
                     | ConfirmPopoverKind::ClearCloudData(_) => "继续确认",
                     ConfirmPopoverKind::ClearLocalDataFinal(_)

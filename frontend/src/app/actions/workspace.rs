@@ -6,7 +6,7 @@ pub(crate) fn build_workspace_actions(
     enqueue_payload_writes: impl Fn(Vec<(String, String)>) + Copy + Send + Sync + 'static,
     enqueue_payload_deletes: impl Fn(Vec<String>) + Copy + Send + Sync + 'static,
     commit_current_thread_draft: impl Fn() + Copy + Send + Sync + 'static,
-    build_preview_panel_state: impl Fn(&str, &str) -> Option<PreviewPanelState>
+    build_preview_panel_state: impl Fn(&str, Option<&str>) -> Option<PreviewPanelState>
     + Copy
     + Send
     + Sync
@@ -26,7 +26,7 @@ pub(crate) fn build_workspace_actions(
     impl Fn(String, String) + Copy + Send + Sync + 'static,
     impl Fn(String) + Copy + Send + Sync + 'static,
     impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
-    impl Fn(String, String) + Copy + Send + Sync + 'static,
+    impl Fn(String, Option<String>) + Copy + Send + Sync + 'static,
     impl Fn(TextPopoverKind, &'static str, String, f64, f64) + Copy + Send + Sync + 'static,
 ) {
     let workspace = expect_context::<WorkspaceState>();
@@ -41,6 +41,8 @@ pub(crate) fn build_workspace_actions(
     let dragging_reference_id = composer.dragging_reference_id;
     let reference_menu_asset_id = composer.reference_menu_asset_id;
     let continuation_asset_id = composer.continuation_asset_id;
+    let queue_mode_enabled = composer.queue_mode_enabled;
+    let generation_runtimes = composer.generation_runtimes;
     let draft_prompt = composer.draft_prompt;
     let status_text = composer.status_text;
     let text_popover = ui.text_popover;
@@ -97,6 +99,13 @@ pub(crate) fn build_workspace_actions(
     };
 
     let perform_delete_thread = move |thread_id: String| {
+        // 确认框可能在任务提交前已经打开，因此执行删除时必须再次校验。
+        if generation_runtimes
+            .with_untracked(|items| items.values().any(|runtime| runtime.thread_id == thread_id))
+        {
+            status_text.set("该会话仍有生成任务运行，请先停止或等待任务完成。".into());
+            return;
+        }
         let result = delete_thread_preserving_favorites(
             tasks.get_untracked(),
             assets.get_untracked(),
@@ -164,6 +173,12 @@ pub(crate) fn build_workspace_actions(
     };
 
     let delete_thread = move |thread_id: String, x: f64, y: f64| {
+        if generation_runtimes
+            .with_untracked(|items| items.values().any(|runtime| runtime.thread_id == thread_id))
+        {
+            status_text.set("该会话仍有生成任务运行，请先停止或等待任务完成。".into());
+            return;
+        }
         confirm_popover.set(Some(ConfirmPopoverState {
             kind: ConfirmPopoverKind::DeleteThread(thread_id),
             title: "删除会话".into(),
@@ -301,6 +316,15 @@ pub(crate) fn build_workspace_actions(
     };
 
     let perform_delete_asset = move |asset_id: String| {
+        // 防止旧确认框在图片成为运行任务依赖后继续执行物理删除。
+        if generation_runtimes.with_untracked(|items| {
+            items
+                .values()
+                .any(|runtime| runtime.dependency_asset_ids.contains(&asset_id))
+        }) {
+            status_text.set("这张图片正被生成任务使用，请先停止或等待任务完成。".into());
+            return;
+        }
         assets.update(|items| items.retain(|asset| asset.id != asset_id));
         selected_reference_ids.update(|ids| ids.retain(|id| id != &asset_id));
         if dragging_reference_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
@@ -320,6 +344,14 @@ pub(crate) fn build_workspace_actions(
     };
 
     let delete_asset = move |asset_id: String, x: f64, y: f64| {
+        if generation_runtimes.with_untracked(|items| {
+            items
+                .values()
+                .any(|runtime| runtime.dependency_asset_ids.contains(&asset_id))
+        }) {
+            status_text.set("这张图片正被生成任务使用，请先停止或等待任务完成。".into());
+            return;
+        }
         confirm_popover.set(Some(ConfirmPopoverState {
             kind: ConfirmPopoverKind::DeleteAsset(asset_id),
             title: "删除参考图".into(),
@@ -368,6 +400,8 @@ pub(crate) fn build_workspace_actions(
         draft_prompt.set(task.prompt.clone());
         selected_reference_ids.set(task.reference_asset_ids.clone());
         continuation_asset_id.set(Some(asset_id.clone()));
+        queue_mode_enabled.set(false);
+        let _ = save_generation_queue_mode(false);
         reference_menu_asset_id.set(None);
         threads.update(|items| {
             if let Some(thread) = items
@@ -487,13 +521,14 @@ pub(crate) fn build_workspace_actions(
         }));
     };
 
-    let open_preview = move |task_id: String, asset_id: String| {
-        let preview_asset_id = asset_id.clone();
-        let assets_signal = assets;
-        spawn_local(async move {
-            let _ = ensure_asset_payloads_loaded(assets_signal, &[preview_asset_id]).await;
-        });
-        preview_panel_state.set(build_preview_panel_state(&task_id, &asset_id));
+    let open_preview = move |task_id: String, asset_id: Option<String>| {
+        if let Some(preview_asset_id) = asset_id.clone() {
+            let assets_signal = assets;
+            spawn_local(async move {
+                let _ = ensure_asset_payloads_loaded(assets_signal, &[preview_asset_id]).await;
+            });
+        }
+        preview_panel_state.set(build_preview_panel_state(&task_id, asset_id.as_deref()));
         preview_state.set(Some(PreviewState { task_id, asset_id }));
         preview_fullscreen.set(false);
         preview_zoom.set(1.0);

@@ -37,6 +37,7 @@ pub(crate) fn build_data_actions(
     let selected_reference_ids = composer.selected_reference_ids;
     let reference_menu_asset_id = composer.reference_menu_asset_id;
     let continuation_asset_id = composer.continuation_asset_id;
+    let queue_mode_enabled = composer.queue_mode_enabled;
     let draft_prompt = composer.draft_prompt;
     let status_text = composer.status_text;
     let generating = composer.generating;
@@ -353,6 +354,8 @@ pub(crate) fn build_data_actions(
         }
         if clear_preferences {
             preferences.set(AppPreferences::default());
+            queue_mode_enabled.set(false);
+            let _ = clear_generation_queue_mode();
             tasks.update(|items| {
                 for task in items.iter_mut().filter(|task| task.favorite) {
                     task.favorite_folder_id = Some(DEFAULT_FAVORITE_FOLDER_ID.into());

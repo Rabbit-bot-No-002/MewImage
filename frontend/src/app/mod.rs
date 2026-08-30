@@ -19,9 +19,10 @@ use crate::providers::{
     prepare_sync_envelope,
 };
 use crate::storage::{
-    apply_asset_payload_changes, clear_asset_payloads, clear_trusted_sync_secret,
-    load_api_key_sync_enabled, load_asset_payloads, load_snapshot, load_trusted_sync_secret,
-    save_api_key_sync_enabled, save_trusted_sync_secret, save_ui_state, save_workspace_snapshot,
+    apply_asset_payload_changes, clear_asset_payloads, clear_generation_queue_mode,
+    clear_trusted_sync_secret, load_api_key_sync_enabled, load_asset_payloads, load_snapshot,
+    load_trusted_sync_secret, save_api_key_sync_enabled, save_generation_queue_mode,
+    save_trusted_sync_secret, save_ui_state, save_workspace_snapshot,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gloo_file::{File, futures::read_as_bytes, futures::read_as_data_url};

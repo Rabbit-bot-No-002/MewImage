@@ -16,7 +16,7 @@ pub(crate) fn FavoritesOverlay(
     add_favorite_folder: impl Fn(f64, f64) + Copy + Send + Sync + 'static,
     rename_favorite_folder: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
     delete_favorite_folder: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
-    open_preview: impl Fn(String, String) + Copy + Send + Sync + 'static,
+    open_preview: impl Fn(String, Option<String>) + Copy + Send + Sync + 'static,
     enter_continuation_context: impl Fn(String, String) + Copy + Send + Sync + 'static,
     rerun_task: impl Fn(String) + Copy + Send + Sync + 'static,
     toggle_favorite_for_task: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
@@ -132,7 +132,7 @@ pub(crate) fn FavoritesOverlay(
                                                         view! {
                                                             <button class="image-button compact-preview-button" on:click=move |_| {
                                                                 if let Some(asset_id) = open_asset_id.clone() {
-                                                                    open_preview(open_task_id.clone(), asset_id);
+                                                                    open_preview(open_task_id.clone(), Some(asset_id));
                                                                 }
                                                             }>
                                                                 <div class="gallery-image-overlay">

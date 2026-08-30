@@ -22,6 +22,8 @@ pub(crate) struct GalleryItem {
     pub(crate) size_label: String,
     pub(crate) ratio_label: String,
     pub(crate) favorite: bool,
+    pub(crate) status: TaskStatus,
+    pub(crate) error_message: Option<String>,
 }
 
 pub(crate) fn gallery_items(
@@ -65,14 +67,37 @@ pub(crate) fn gallery_items(
                         asset.height.unwrap_or(0),
                     ),
                     favorite: task.favorite,
+                    status: task.status,
+                    error_message: (task.status == TaskStatus::Failed)
+                        .then(|| task.error_message.clone())
+                        .flatten(),
                 });
             }
+        } else if task.status == TaskStatus::Running {
+            items.push(GalleryItem {
+                key: format!("{}-running", task.id),
+                task_id: task.id.clone(),
+                asset_id: None,
+                prompt: task.prompt.clone(),
+                src: None,
+                config_name: config_names
+                    .get(task.config_id.as_str())
+                    .copied()
+                    .unwrap_or("默认配置")
+                    .to_string(),
+                model: task.requested_model.clone(),
+                size_label: "等待".into(),
+                ratio_label: "生成中".into(),
+                favorite: false,
+                status: TaskStatus::Running,
+                error_message: None,
+            });
         } else if let Some(error) = &task.error_message {
             items.push(GalleryItem {
                 key: format!("{}-error", task.id),
                 task_id: task.id.clone(),
                 asset_id: None,
-                prompt: format!("失败：{error}"),
+                prompt: task.prompt.clone(),
                 src: None,
                 config_name: config_names
                     .get(task.config_id.as_str())
@@ -83,6 +108,8 @@ pub(crate) fn gallery_items(
                 size_label: "-".into(),
                 ratio_label: "失败".into(),
                 favorite: task.favorite,
+                status: task.status,
+                error_message: Some(error.clone()),
             });
         }
     }
@@ -409,6 +436,52 @@ pub(crate) fn selected_reference_assets(
     selected_assets
 }
 
+pub(crate) fn thread_reference_assets(
+    assets: &[ImageAssetRef],
+    tasks: &[LocalTaskRecord],
+    thread_id: &str,
+    selected_reference_ids: &[String],
+) -> Vec<ImageAssetRef> {
+    let mut references = selected_reference_assets(assets, selected_reference_ids);
+    let mut included_ids = references
+        .iter()
+        .map(|asset| asset.id.clone())
+        .collect::<HashSet<_>>();
+    let assets_by_id = assets
+        .iter()
+        .filter(|asset| !asset.metadata.contains_key("mask_base_asset_id"))
+        .map(|asset| (asset.id.as_str(), asset))
+        .collect::<HashMap<_, _>>();
+
+    // 历史任务可能引用其他会话生成的图片，因此按实际引用关系收集，而不是按图片来源过滤。
+    for reference_id in tasks
+        .iter()
+        .filter(|task| task.thread_id == thread_id && !task.detached_from_thread)
+        .flat_map(|task| task.reference_asset_ids.iter())
+    {
+        let Some(asset) = assets_by_id.get(reference_id.as_str()).copied() else {
+            continue;
+        };
+        if !included_ids.insert(asset.id.clone()) {
+            continue;
+        }
+        references.push(asset.clone());
+    }
+
+    // 仅补充本会话独立上传的资源，避免把从未用作参考的生成结果混入列表。
+    for asset in assets.iter().filter(|asset| {
+        asset.source_task_id.is_none()
+            && asset.metadata.get("thread_id").map(String::as_str) == Some(thread_id)
+            && !asset.metadata.contains_key("mask_base_asset_id")
+    }) {
+        if included_ids.insert(asset.id.clone()) {
+            references.push(asset.clone());
+        }
+    }
+
+    references
+}
+
 pub(crate) fn prioritized_asset_indexes_for_thread(
     assets: &[ImageAssetRef],
     tasks: &[LocalTaskRecord],
@@ -600,6 +673,65 @@ mod tests {
     }
 
     #[test]
+    fn thread_references_include_selected_history_and_thread_uploads_without_leaking() {
+        let tasks = vec![
+            test_task(
+                "current",
+                "thread-1",
+                false,
+                &["cross-thread", "historical"],
+            ),
+            test_task("other", "thread-2", false, &["other-reference"]),
+        ];
+        let assets = vec![
+            test_asset("selected", None, Some("thread-1")),
+            test_asset("historical", None, None),
+            test_asset("cross-thread", Some("external-task"), None),
+            test_asset("unused-upload", None, Some("thread-1")),
+            test_asset("unused-result", Some("current"), None),
+            test_asset("other-reference", None, Some("thread-2")),
+            test_asset("other-upload", None, Some("thread-2")),
+        ];
+
+        let references = thread_reference_assets(&assets, &tasks, "thread-1", &["selected".into()]);
+
+        assert_eq!(
+            references
+                .iter()
+                .map(|asset| asset.id.as_str())
+                .collect::<Vec<_>>(),
+            ["selected", "cross-thread", "historical", "unused-upload"]
+        );
+    }
+
+    #[test]
+    fn thread_references_keep_selected_order_and_exclude_masks() {
+        let mut mask = test_asset("mask", None, Some("thread-1"));
+        mask.metadata
+            .insert("mask_base_asset_id".into(), "base".into());
+        let assets = vec![
+            test_asset("first", None, Some("thread-1")),
+            test_asset("second", None, Some("thread-1")),
+            mask,
+        ];
+
+        let references = thread_reference_assets(
+            &assets,
+            &[],
+            "thread-1",
+            &["second".into(), "first".into(), "mask".into()],
+        );
+
+        assert_eq!(
+            references
+                .iter()
+                .map(|asset| asset.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+    }
+
+    #[test]
     fn favorite_pagination_uses_nine_items_per_page() {
         let items = (1..=20).collect::<Vec<_>>();
         assert_eq!(
@@ -639,5 +771,51 @@ mod tests {
         let mut tasks = vec![task];
         assert!(!reconcile_task_integrity(&mut tasks, &assets, false));
         assert_eq!(tasks[0].status, TaskStatus::Succeeded);
+    }
+
+    #[test]
+    fn running_task_without_assets_creates_one_waiting_card() {
+        let mut task = test_task("running", "thread", false, &[]);
+        task.status = TaskStatus::Running;
+
+        let gallery = gallery_items(&[task], &[], &[]);
+
+        assert_eq!(gallery.len(), 1);
+        assert_eq!(gallery[0].task_id, "running");
+        assert_eq!(gallery[0].asset_id, None);
+        assert_eq!(gallery[0].status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn succeeded_task_replaces_waiting_card_with_all_results() {
+        let task = test_task("finished", "thread", false, &[]);
+        let assets = vec![
+            test_asset("result-1", Some("finished"), None),
+            test_asset("result-2", Some("finished"), None),
+        ];
+
+        let gallery = gallery_items(&[task], &[], &assets);
+
+        assert_eq!(gallery.len(), 2);
+        assert!(
+            gallery
+                .iter()
+                .all(|item| item.status == TaskStatus::Succeeded)
+        );
+        assert!(gallery.iter().all(|item| item.asset_id.is_some()));
+    }
+
+    #[test]
+    fn failed_task_without_assets_creates_failure_card() {
+        let mut task = test_task("failed", "thread", false, &[]);
+        task.status = TaskStatus::Failed;
+        task.error_message = Some("上游容量已满".into());
+
+        let gallery = gallery_items(&[task], &[], &[]);
+
+        assert_eq!(gallery.len(), 1);
+        assert_eq!(gallery[0].status, TaskStatus::Failed);
+        assert_eq!(gallery[0].prompt, "prompt-failed");
+        assert_eq!(gallery[0].error_message.as_deref(), Some("上游容量已满"));
     }
 }

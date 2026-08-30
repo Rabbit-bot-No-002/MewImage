@@ -12,6 +12,30 @@ const CONFIGS_KEY: &str = "configs_state";
 const PREFERENCES_KEY: &str = "preferences_state";
 const TRUSTED_SYNC_KEY_PREFIX: &str = "mew-image-trusted-sync-key:";
 const API_KEY_SYNC_ENABLED_PREFIX: &str = "mew-image-api-key-sync-enabled:";
+const GENERATION_QUEUE_MODE_KEY: &str = "mew-image-generation-queue-mode";
+
+pub fn load_generation_queue_mode() -> bool {
+    local_storage_value(GENERATION_QUEUE_MODE_KEY).as_deref() == Some("true")
+}
+
+pub fn save_generation_queue_mode(enabled: bool) -> Result<(), String> {
+    set_local_storage_value(
+        GENERATION_QUEUE_MODE_KEY,
+        if enabled { "true" } else { "false" },
+    )
+}
+
+pub fn clear_generation_queue_mode() -> Result<(), String> {
+    let Some(storage) = web_sys::window()
+        .and_then(|window| window.local_storage().ok())
+        .flatten()
+    else {
+        return Err("浏览器本地存储不可用".into());
+    };
+    storage
+        .remove_item(GENERATION_QUEUE_MODE_KEY)
+        .map_err(|error| format!("{error:?}"))
+}
 
 pub fn load_trusted_sync_secret(user_id: &str) -> Option<String> {
     local_storage_value(&format!("{TRUSTED_SYNC_KEY_PREFIX}{user_id}"))

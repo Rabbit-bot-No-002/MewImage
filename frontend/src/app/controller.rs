@@ -120,11 +120,15 @@ pub(super) fn AppController() -> impl IntoView {
     provide_context(derived);
     super::effects::install_app_effects();
 
-    let build_preview_panel_state = move |task_id: &str, asset_id: &str| {
+    let build_preview_panel_state = move |task_id: &str, asset_id: Option<&str>| {
         let task =
             tasks.with_untracked(|items| items.iter().find(|task| task.id == task_id).cloned())?;
-        let asset = assets
-            .with_untracked(|items| items.iter().find(|asset| asset.id == asset_id).cloned())?;
+        let asset = asset_id.and_then(|asset_id| {
+            assets.with_untracked(|items| items.iter().find(|asset| asset.id == asset_id).cloned())
+        });
+        if asset_id.is_some() && asset.is_none() {
+            return None;
+        }
         let preview_config = configs.with_untracked(|items| {
             items
                 .iter()
@@ -165,18 +169,35 @@ pub(super) fn AppController() -> impl IntoView {
             .result
             .as_ref()
             .and_then(|result| result.parameter_snapshot.requested_quality.clone())
+            .or_else(|| {
+                task.generation_settings
+                    .as_ref()
+                    .and_then(|settings| settings.quality.clone())
+            })
             .unwrap_or_else(|| "未设置".into());
         let actual_quality_label = task
             .result
             .as_ref()
             .and_then(|result| result.parameter_snapshot.actual_quality.clone())
-            .unwrap_or_else(|| "medium".into());
+            .unwrap_or_else(|| {
+                if task.status == TaskStatus::Running {
+                    "等待结果".into()
+                } else {
+                    "未记录".into()
+                }
+            });
         let duration_label = task
             .result
             .as_ref()
             .and_then(|result| result.parameter_snapshot.duration_ms)
             .map(format_duration_ms)
-            .unwrap_or_else(|| "未记录".into());
+            .unwrap_or_else(|| {
+                if task.status == TaskStatus::Running {
+                    "进行中".into()
+                } else {
+                    "未记录".into()
+                }
+            });
         let reference_thumbs = assets.with_untracked(|items| {
             task.reference_asset_ids
                 .iter()
@@ -193,18 +214,42 @@ pub(super) fn AppController() -> impl IntoView {
         });
         Some(PreviewPanelState {
             task_id: task.id.clone(),
-            asset_id: asset.id.clone(),
+            asset_id: asset.as_ref().map(|asset| asset.id.clone()),
             prompt: task.prompt.clone(),
-            display_src: asset_display_src(&asset),
-            width: asset.width.unwrap_or(0),
-            height: asset.height.unwrap_or(0),
+            display_src: asset.as_ref().map(asset_display_src),
+            width: asset
+                .as_ref()
+                .and_then(|asset| asset.width)
+                .or_else(|| {
+                    task.generation_settings
+                        .as_ref()
+                        .map(|settings| settings.width)
+                })
+                .unwrap_or(0),
+            height: asset
+                .as_ref()
+                .and_then(|asset| asset.height)
+                .or_else(|| {
+                    task.generation_settings
+                        .as_ref()
+                        .map(|settings| settings.height)
+                })
+                .unwrap_or(0),
             source_label,
             requested_model: task.requested_model.clone(),
             moderation_label,
             background_label,
             requested_quality_label,
             actual_quality_label,
-            format_label: asset.mime_type.replace("image/", ""),
+            format_label: asset
+                .as_ref()
+                .map(|asset| asset.mime_type.replace("image/", ""))
+                .or_else(|| {
+                    task.generation_settings
+                        .as_ref()
+                        .and_then(|settings| settings.output_format.clone())
+                })
+                .unwrap_or_else(|| "未设置".into()),
             image_count: task
                 .generation_settings
                 .as_ref()
@@ -308,6 +353,14 @@ pub(super) fn AppController() -> impl IntoView {
         build_preview_panel_state,
     );
 
+    let (run_generation, rerun_task, cancel_generation, cancel_all_generations) =
+        build_generation_actions(
+            persist_state,
+            enqueue_payload_writes,
+            commit_current_thread_draft,
+        );
+    let generate = move |_| run_generation();
+
     let (
         select_favorite_folder,
         add_favorite_folder,
@@ -336,14 +389,9 @@ pub(super) fn AppController() -> impl IntoView {
         perform_clear_cloud_data,
         admin_user_action,
         enter_continuation_context,
+        cancel_generation,
+        cancel_all_generations,
     );
-
-    let (run_generation, rerun_task) = build_generation_actions(
-        persist_state,
-        enqueue_payload_writes,
-        commit_current_thread_draft,
-    );
-    let generate = move |_| run_generation();
 
     view! {
         <div class="shell shell-single">

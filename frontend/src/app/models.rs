@@ -3,7 +3,7 @@ use mew_image_shared::CloudDataClearScope;
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PreviewState {
     pub(crate) task_id: String,
-    pub(crate) asset_id: String,
+    pub(crate) asset_id: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -23,9 +23,9 @@ pub(crate) struct FailureLogState {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PreviewPanelState {
     pub(crate) task_id: String,
-    pub(crate) asset_id: String,
+    pub(crate) asset_id: Option<String>,
     pub(crate) prompt: String,
-    pub(crate) display_src: String,
+    pub(crate) display_src: Option<String>,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) source_label: String,
@@ -84,7 +84,8 @@ pub(crate) struct TextPopoverState {
 
 #[derive(Clone, PartialEq)]
 pub(crate) enum ConfirmPopoverKind {
-    CancelGeneration,
+    CancelGeneration(String),
+    CancelAllGenerations,
     DeleteAsset(String),
     DeleteConfig(String),
     DeleteThread(String),

@@ -150,6 +150,8 @@ pub(crate) fn build_generation_actions(
 ) -> (
     impl Fn() + Copy + Send + Sync + 'static,
     impl Fn(String) + Copy + Send + Sync + 'static,
+    impl Fn(String) + Copy + Send + Sync + 'static,
+    impl Fn() + Copy + Send + Sync + 'static,
 ) {
     let workspace = expect_context::<WorkspaceState>();
     let composer = expect_context::<ComposerState>();
@@ -177,14 +179,20 @@ pub(crate) fn build_generation_actions(
     let quality = composer.quality;
     let count = composer.count;
     let status_text = composer.status_text;
+    let queue_mode_enabled = composer.queue_mode_enabled;
+    let active_generation_ids = composer.active_generation_ids;
+    let cancelled_generation_ids = composer.cancelled_generation_ids;
+    let generation_runtimes = composer.generation_runtimes;
+    let foreground_generation_task_id = composer.foreground_generation_task_id;
     let generating = composer.generating;
-    let generation_cancel_requested = composer.generation_cancel_requested;
-    let generation_abort_controller = composer.generation_abort_controller;
     let show_settings = ui.show_settings;
+    let gallery_page = ui.gallery_page;
     let current_config = derived.current_config;
 
     let run_generation = move || {
-        if generating.get_untracked() {
+        let queued_submission = queue_mode_enabled.get_untracked();
+        if !queued_submission && foreground_generation_task_id.get_untracked().is_some() {
+            status_text.set("当前普通生成任务尚未结束，请等待完成或先停止任务。".into());
             return;
         }
         let Some(config) = current_config.get_untracked() else {
@@ -263,10 +271,35 @@ pub(crate) fn build_generation_actions(
         let abort_signal = abort_controller.signal();
 
         let task_id = new_id();
-        generation_cancel_requested.set(false);
-        generation_abort_controller.set(Some(abort_controller));
+        let mut dependency_asset_ids = selected_ids.iter().cloned().collect::<HashSet<_>>();
+        if let Some(asset_id) = continuation_asset_id.get_untracked() {
+            dependency_asset_ids.insert(asset_id);
+        }
+        generation_runtimes.update(|items| {
+            items.insert(
+                task_id.clone(),
+                ActiveGenerationRuntime {
+                    abort_controller,
+                    dependency_asset_ids,
+                    thread_id: thread_id.clone(),
+                    progress_label: "正在加载参考图".into(),
+                },
+            );
+        });
+        active_generation_ids.update(|items| {
+            items.insert(task_id.clone());
+        });
+        if !queued_submission {
+            foreground_generation_task_id.set(Some(task_id.clone()));
+        }
         generating.set(true);
-        status_text.set("正在提交后台生成任务，长耗时请求会自动轮询结果……".into());
+        gallery_page.set(1);
+        let active_count = active_generation_ids.with_untracked(HashSet::len);
+        status_text.set(if queued_submission {
+            format!("任务已提交，当前有 {active_count} 个任务等待结果。")
+        } else {
+            "正在提交后台生成任务，长耗时请求会自动轮询结果……".into()
+        });
 
         threads.update(|items| {
             if let Some(thread) = items.iter_mut().find(|thread| thread.id == thread_id) {
@@ -316,8 +349,10 @@ pub(crate) fn build_generation_actions(
         let assets_signal = assets;
         let status_signal = status_text;
         let generating_signal = generating;
-        let cancel_requested_signal = generation_cancel_requested;
-        let abort_controller_signal = generation_abort_controller;
+        let active_generation_ids_signal = active_generation_ids;
+        let cancelled_generation_ids_signal = cancelled_generation_ids;
+        let generation_runtimes_signal = generation_runtimes;
+        let foreground_generation_task_id_signal = foreground_generation_task_id;
         let continuation_signal = continuation_asset_id;
         let threads_signal = threads;
         let tombstones_signal = tombstones;
@@ -325,8 +360,28 @@ pub(crate) fn build_generation_actions(
         let selected_ids_for_request = selected_ids.clone();
         let continuation_asset_id_for_request = continuation_asset_id.get_untracked();
         spawn_local(async move {
+            let finish_runtime = || {
+                generation_runtimes_signal.update(|items| {
+                    items.remove(&task_id);
+                });
+                cancelled_generation_ids_signal.update(|items| {
+                    items.remove(&task_id);
+                });
+                active_generation_ids_signal.update(|items| {
+                    items.remove(&task_id);
+                });
+                foreground_generation_task_id_signal.update(|current| {
+                    if current.as_deref() == Some(task_id.as_str()) {
+                        *current = None;
+                    }
+                });
+                let remaining = active_generation_ids_signal.with_untracked(HashSet::len);
+                generating_signal.set(remaining > 0);
+                remaining
+            };
             let finish_cancelled = || {
-                if !cancel_requested_signal.get_untracked() {
+                if !cancelled_generation_ids_signal.with_untracked(|items| items.contains(&task_id))
+                {
                     return false;
                 }
                 tasks_signal.update(|items| items.retain(|task| task.id != task_id));
@@ -341,10 +396,12 @@ pub(crate) fn build_generation_actions(
                     [(SyncEntityKind::Task, task_id.clone())],
                 );
                 persist();
-                status_signal.set("当前生成任务已停止。".into());
-                abort_controller_signal.set(None);
-                cancel_requested_signal.set(false);
-                generating_signal.set(false);
+                let remaining = finish_runtime();
+                status_signal.set(if remaining == 0 {
+                    "生成任务已停止。".into()
+                } else {
+                    format!("生成任务已停止，仍有 {remaining} 个任务等待结果。")
+                });
                 true
             };
 
@@ -366,9 +423,12 @@ pub(crate) fn build_generation_actions(
                     }
                 });
                 persist();
-                status_signal.set(format!("生成失败：{error}"));
-                abort_controller_signal.set(None);
-                generating_signal.set(false);
+                let remaining = finish_runtime();
+                status_signal.set(if remaining == 0 {
+                    format!("生成失败：{error}")
+                } else {
+                    format!("生成失败：{error}；仍有 {remaining} 个任务等待结果。")
+                });
                 play_generation_notification(false);
                 return;
             }
@@ -390,6 +450,11 @@ pub(crate) fn build_generation_actions(
                     }
                 }
                 references
+            });
+            generation_runtimes_signal.update(|items| {
+                if let Some(runtime) = items.get_mut(&task_id) {
+                    runtime.progress_label = "等待上游结果".into();
+                }
             });
             let request = mew_image_shared::GenerationRequest {
                 prompt: effective_prompt,
@@ -415,15 +480,22 @@ pub(crate) fn build_generation_actions(
                     let mut asset_build_errors = Vec::new();
                     let mut local_background_errors = Vec::new();
                     for (index, image) in result.images.iter().enumerate() {
-                        if cancel_requested_signal.get_untracked() {
+                        if cancelled_generation_ids_signal
+                            .with_untracked(|items| items.contains(&task_id))
+                        {
                             break;
                         }
                         if local_background {
-                            status_signal.set(format!(
-                                "正在本地去除背景（{}/{}）……",
-                                index + 1,
-                                upstream_result_count
-                            ));
+                            let progress_label =
+                                format!("本地去背 {}/{}", index + 1, upstream_result_count);
+                            generation_runtimes_signal.update(|items| {
+                                if let Some(runtime) = items.get_mut(&task_id) {
+                                    runtime.progress_label = progress_label.clone();
+                                }
+                            });
+                            if !queued_submission {
+                                status_signal.set(format!("{progress_label}……"));
+                            }
                             gloo_timers::future::TimeoutFuture::new(0).await;
                         }
                         match prepare_generated_image(
@@ -499,9 +571,12 @@ pub(crate) fn build_generation_actions(
                             }
                         });
                         persist();
-                        status_signal.set(format!("生成失败：{error}"));
-                        abort_controller_signal.set(None);
-                        generating_signal.set(false);
+                        let remaining = finish_runtime();
+                        status_signal.set(if remaining == 0 {
+                            format!("生成失败：{error}")
+                        } else {
+                            format!("生成失败：{error}；仍有 {remaining} 个任务等待结果。")
+                        });
                         play_generation_notification(false);
                         return;
                     }
@@ -535,37 +610,52 @@ pub(crate) fn build_generation_actions(
                             strip_successful_task_payloads(std::slice::from_mut(task));
                         }
                     });
-                    continuation_signal.set(first_generated_id);
+                    if !queued_submission {
+                        continuation_signal.set(first_generated_id);
+                    }
                     persist();
-                    status_signal.set(if local_background && !local_background_errors.is_empty() {
-                        let mut detail = local_background_errors.join("；");
-                        if !asset_build_errors.is_empty() {
-                            detail = format!("{detail}；{}", asset_build_errors.join("；"));
-                        }
-                        format!(
-                            "生成完成，其中 {}/{} 张本地去背景失败，已保留原图。{}",
-                            local_background_errors.len(),
-                            upstream_result_count,
-                            detail
-                        )
-                    } else if local_background && !asset_build_errors.is_empty() {
-                        format!(
-                            "本地去背景完成，但有 {} 张上游结果未能保存。{}",
-                            asset_build_errors.len(),
-                            asset_build_errors.join("；")
-                        )
-                    } else if local_background {
-                        "生成完成，已在浏览器本地去除背景，并自动进入连续修改模式。".into()
-                    } else if !asset_build_errors.is_empty() {
-                        format!(
-                            "生成完成，但有 {} 张结果未能保存到本地。{}",
-                            asset_build_errors.len(),
-                            asset_build_errors.join("；")
-                        )
-                    } else if used_proxy {
-                        "生成完成，已自动进入连续修改模式。".into()
+                    let completion_message =
+                        if local_background && !local_background_errors.is_empty() {
+                            let mut detail = local_background_errors.join("；");
+                            if !asset_build_errors.is_empty() {
+                                detail = format!("{detail}；{}", asset_build_errors.join("；"));
+                            }
+                            format!(
+                                "生成完成，其中 {}/{} 张本地去背景失败，已保留原图。{}",
+                                local_background_errors.len(),
+                                upstream_result_count,
+                                detail
+                            )
+                        } else if local_background && !asset_build_errors.is_empty() {
+                            format!(
+                                "本地去背景完成，但有 {} 张上游结果未能保存。{}",
+                                asset_build_errors.len(),
+                                asset_build_errors.join("；")
+                            )
+                        } else if local_background {
+                            if queued_submission {
+                                "队列任务完成，已在浏览器本地去除背景。".into()
+                            } else {
+                                "生成完成，已在浏览器本地去除背景，并自动进入连续修改模式。".into()
+                            }
+                        } else if !asset_build_errors.is_empty() {
+                            format!(
+                                "生成完成，但有 {} 张结果未能保存到本地。{}",
+                                asset_build_errors.len(),
+                                asset_build_errors.join("；")
+                            )
+                        } else if queued_submission {
+                            "队列任务生成完成。".into()
+                        } else if used_proxy {
+                            "生成完成，已自动进入连续修改模式。".into()
+                        } else {
+                            "生成完成，已自动进入连续修改模式，结果已写入当前会话。".into()
+                        };
+                    let remaining = finish_runtime();
+                    status_signal.set(if remaining == 0 {
+                        completion_message
                     } else {
-                        "生成完成，已自动进入连续修改模式，结果已写入当前会话。".into()
+                        format!("{completion_message}仍有 {remaining} 个任务等待结果。")
                     });
                     play_generation_notification(true);
                 }
@@ -578,13 +668,15 @@ pub(crate) fn build_generation_actions(
                         }
                     });
                     persist();
-                    status_signal.set(format!("生成失败：{error}"));
+                    let remaining = finish_runtime();
+                    status_signal.set(if remaining == 0 {
+                        format!("生成失败：{error}")
+                    } else {
+                        format!("生成失败：{error}；仍有 {remaining} 个任务等待结果。")
+                    });
                     play_generation_notification(false);
                 }
             }
-            abort_controller_signal.set(None);
-            cancel_requested_signal.set(false);
-            generating_signal.set(false);
         });
     };
 
@@ -642,5 +734,70 @@ pub(crate) fn build_generation_actions(
         });
     };
 
-    (run_generation, rerun_task)
+    let cancel_generation = move |task_id: String| {
+        if !active_generation_ids.with_untracked(|items| items.contains(&task_id)) {
+            return;
+        }
+        cancelled_generation_ids.update(|items| {
+            items.insert(task_id.clone());
+        });
+        // 先移除等待卡；取消标记会一直保留到异步任务收尾，阻止迟到响应重新写回。
+        tasks.update(|items| items.retain(|task| task.id != task_id));
+        threads.update(|items| {
+            for thread in items {
+                thread.task_ids.retain(|id| id != &task_id);
+            }
+        });
+        record_sync_tombstones(tombstones, [(SyncEntityKind::Task, task_id.clone())]);
+        persist_state();
+        let controller = generation_runtimes.with_untracked(|items| {
+            items
+                .get(&task_id)
+                .map(|runtime| runtime.abort_controller.clone())
+        });
+        if let Some(controller) = controller {
+            controller.abort();
+        }
+        status_text.set("正在停止所选生成任务……".into());
+    };
+
+    let cancel_all_generations = move || {
+        let task_ids = active_generation_ids.get_untracked();
+        if task_ids.is_empty() {
+            return;
+        }
+        cancelled_generation_ids.update(|items| {
+            items.extend(task_ids.iter().cloned());
+        });
+        // 批量移除任务记录，使画廊立即清掉所有等待卡。
+        tasks.update(|items| items.retain(|task| !task_ids.contains(&task.id)));
+        threads.update(|items| {
+            for thread in items {
+                thread.task_ids.retain(|id| !task_ids.contains(id));
+            }
+        });
+        record_sync_tombstones(
+            tombstones,
+            task_ids
+                .iter()
+                .cloned()
+                .map(|task_id| (SyncEntityKind::Task, task_id)),
+        );
+        persist_state();
+        generation_runtimes.with_untracked(|items| {
+            for task_id in &task_ids {
+                if let Some(runtime) = items.get(task_id) {
+                    runtime.abort_controller.abort();
+                }
+            }
+        });
+        status_text.set(format!("正在停止 {} 个生成任务……", task_ids.len()));
+    };
+
+    (
+        run_generation,
+        rerun_task,
+        cancel_generation,
+        cancel_all_generations,
+    )
 }
