@@ -13,6 +13,7 @@ pub(crate) fn build_preview_actions(
     perform_delete_config: impl Fn(String) + Copy + Send + Sync + 'static,
     perform_delete_thread: impl Fn(String) + Copy + Send + Sync + 'static,
     perform_delete_task: impl Fn(String) + Copy + Send + Sync + 'static,
+    perform_delete_theme_background: impl Fn() + Copy + Send + Sync + 'static,
     perform_clear_local_data: impl Fn(LocalDataClearScope) + Copy + Send + Sync + 'static,
     perform_clear_cloud_data: impl Fn(CloudDataClearScope) + Copy + Send + Sync + 'static,
     admin_user_action: impl Fn(&'static str, String) + Copy + Send + Sync + 'static,
@@ -253,6 +254,7 @@ pub(crate) fn build_preview_actions(
                 perform_delete_favorite_folder(folder_id)
             }
             ConfirmPopoverKind::DeleteTask(task_id) => perform_delete_task(task_id),
+            ConfirmPopoverKind::DeleteThemeBackground => perform_delete_theme_background(),
             ConfirmPopoverKind::DeleteUser(user_id) => {
                 admin_user_action("/api/admin/users/delete", user_id)
             }

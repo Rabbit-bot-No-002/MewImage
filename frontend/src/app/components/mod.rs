@@ -1,3 +1,4 @@
+pub(crate) mod appearance;
 pub(crate) mod asset_drop_zone;
 pub(crate) mod common;
 pub(crate) mod config_editor;

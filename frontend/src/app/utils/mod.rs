@@ -1,3 +1,4 @@
+pub(crate) mod appearance;
 pub(crate) mod audio;
 pub(crate) mod formatting;
 pub(crate) mod image;

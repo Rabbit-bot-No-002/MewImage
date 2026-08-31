@@ -19,6 +19,8 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_UNPACKED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const LOCAL_BACKGROUND_ROLE_KEY: &str = "local_background_role";
 const LOCAL_BACKGROUND_ROLE_SOURCE: &str = "source";
+const THEME_BACKGROUND_ROLE_KEY: &str = "asset_role";
+const THEME_BACKGROUND_ROLE: &str = "theme_background";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackupAssetFile {
@@ -88,6 +90,14 @@ fn is_legacy_local_background_source(asset: &ImageAssetRef) -> bool {
         == Some(LOCAL_BACKGROUND_ROLE_SOURCE)
 }
 
+fn is_theme_background(asset: &ImageAssetRef) -> bool {
+    asset
+        .metadata
+        .get(THEME_BACKGROUND_ROLE_KEY)
+        .map(String::as_str)
+        == Some(THEME_BACKGROUND_ROLE)
+}
+
 fn record_removed_asset_tombstones(state: &mut LocalAppState, asset_ids: &[String]) {
     let deleted_at = now_rfc3339();
     for asset_id in asset_ids {
@@ -145,9 +155,17 @@ pub fn prepare_session_backup(
         .filter(|asset| is_legacy_local_background_source(asset))
         .map(|asset| asset.id.as_str())
         .collect::<HashSet<_>>();
+    let theme_background_ids = state
+        .assets
+        .iter()
+        .filter(|asset| is_theme_background(asset))
+        .map(|asset| asset.id.as_str())
+        .collect::<HashSet<_>>();
     for task in &mut tasks {
-        task.reference_asset_ids
-            .retain(|asset_id| !legacy_source_ids.contains(asset_id.as_str()));
+        task.reference_asset_ids.retain(|asset_id| {
+            !legacy_source_ids.contains(asset_id.as_str())
+                && !theme_background_ids.contains(asset_id.as_str())
+        });
     }
     let task_ids = tasks
         .iter()
@@ -187,7 +205,11 @@ pub fn prepare_session_backup(
     let mut assets = state
         .assets
         .iter()
-        .filter(|asset| asset_ids.contains(&asset.id) && !is_legacy_local_background_source(asset))
+        .filter(|asset| {
+            asset_ids.contains(&asset.id)
+                && !is_legacy_local_background_source(asset)
+                && !is_theme_background(asset)
+        })
         .cloned()
         .collect::<Vec<_>>();
     for asset in &mut assets {
@@ -423,7 +445,11 @@ fn merge_backup(
     let local_reference_by_sha = local
         .assets
         .iter()
-        .filter(|asset| asset.source_task_id.is_none() && !asset.sha256.is_empty())
+        .filter(|asset| {
+            asset.source_task_id.is_none()
+                && !asset.sha256.is_empty()
+                && !is_theme_background(asset)
+        })
         .map(|asset| (asset.sha256.to_ascii_lowercase(), asset.id.clone()))
         .collect::<HashMap<_, _>>();
     let local_by_id = local
@@ -438,7 +464,8 @@ fn merge_backup(
     for asset in &mut imported.assets {
         let original_id = asset.id.clone();
         let sha = asset.sha256.to_ascii_lowercase();
-        if asset.source_task_id.is_none()
+        if !is_theme_background(asset)
+            && asset.source_task_id.is_none()
             && let Some(existing_id) = local_reference_by_sha.get(&sha)
         {
             deduplicated_asset_ids.insert(original_id.clone());
@@ -455,7 +482,7 @@ fn merge_backup(
     }
     remap_asset_references(&mut imported, &id_remap);
 
-    let tombstones = merge_tombstones(&local.tombstones, &imported.tombstones);
+    let mut tombstones = merge_tombstones(&local.tombstones, &imported.tombstones);
     let mut configs = apply_tombstones(
         merge_records(&local.configs, &imported.configs),
         &tombstones,
@@ -470,11 +497,53 @@ fn merge_backup(
         .into_iter()
         .filter(|asset| !deduplicated_asset_ids.contains(&asset.id))
         .collect::<Vec<_>>();
-    let assets = apply_tombstones(
+    let mut assets = apply_tombstones(
         merge_asset_records(&local.assets, &imported_assets),
         &tombstones,
         SyncEntityKind::Asset,
     );
+    let imported_is_newer = imported
+        .threads
+        .iter()
+        .map(|thread| thread.updated_at.as_str())
+        .max()
+        > local
+            .threads
+            .iter()
+            .map(|thread| thread.updated_at.as_str())
+            .max();
+    let mut preferences = if imported_is_newer {
+        imported.preferences.clone()
+    } else {
+        local.preferences.clone()
+    };
+    preferences.appearance.normalize();
+    let active_background_id = preferences.appearance.custom_background.asset_id.as_deref();
+    let orphan_background_ids = assets
+        .iter()
+        .filter(|asset| {
+            is_theme_background(asset) && active_background_id != Some(asset.id.as_str())
+        })
+        .map(|asset| asset.id.clone())
+        .collect::<Vec<_>>();
+    assets.retain(|asset| !orphan_background_ids.contains(&asset.id));
+    let deleted_at = now_rfc3339();
+    for asset_id in orphan_background_ids {
+        tombstones.push(SyncTombstone {
+            entity_kind: SyncEntityKind::Asset,
+            entity_id: asset_id,
+            deleted_at: deleted_at.clone(),
+        });
+    }
+    if preferences
+        .appearance
+        .custom_background
+        .asset_id
+        .as_deref()
+        .is_some_and(|active_id| !assets.iter().any(|asset| asset.id == active_id))
+    {
+        preferences.appearance.custom_background = Default::default();
+    }
     let active_asset_ids = assets
         .iter()
         .map(|asset| asset.id.as_str())
@@ -488,17 +557,6 @@ fn merge_backup(
             .then_some((mapped, payload))
         })
         .collect();
-    let imported_is_newer = imported
-        .threads
-        .iter()
-        .map(|thread| thread.updated_at.as_str())
-        .max()
-        > local
-            .threads
-            .iter()
-            .map(|thread| thread.updated_at.as_str())
-            .max();
-
     (
         LocalAppState {
             configs,
@@ -513,11 +571,7 @@ fn merge_backup(
                 SyncEntityKind::Thread,
             ),
             assets,
-            preferences: if imported_is_newer {
-                imported.preferences
-            } else {
-                local.preferences.clone()
-            },
+            preferences,
             checkpoint: local.checkpoint.clone(),
             tombstones,
         },
@@ -714,6 +768,16 @@ fn remap_asset_references(state: &mut LocalAppState, remap: &HashMap<String, Str
             }
         }
     }
+    if let Some(asset_id) = state
+        .preferences
+        .appearance
+        .custom_background
+        .asset_id
+        .as_mut()
+        && let Some(mapped) = remap.get(asset_id)
+    {
+        *asset_id = mapped.clone();
+    }
 }
 
 fn preserve_local_plaintext_keys(
@@ -780,6 +844,7 @@ mod tests {
     use super::*;
     use mew_image_shared::{
         ConversationThread, ImageAssetRef, LocalTaskRecord, SyncTombstone, TaskStatus,
+        ThemePreference,
     };
 
     #[test]
@@ -854,7 +919,7 @@ mod tests {
             test_task(
                 "project-task",
                 "project",
-                &["cross-reference", "project-source"],
+                &["cross-reference", "project-source", "theme-background"],
                 true,
             ),
             test_task("other-task", "other", &[], false),
@@ -883,6 +948,14 @@ mod tests {
             test_scoped_asset("cross-reference", b"cross", Some("other-task"), None),
             test_scoped_asset("other-output", b"other", Some("other-task"), None),
         ];
+        let mut theme_background = test_scoped_asset("theme-background", b"theme", None, None);
+        theme_background.metadata.insert(
+            THEME_BACKGROUND_ROLE_KEY.into(),
+            THEME_BACKGROUND_ROLE.into(),
+        );
+        source.assets.push(theme_background);
+        source.preferences.appearance.custom_background.asset_id = Some("theme-background".into());
+        source.preferences.appearance.custom_background.enabled = true;
         source.configs.push(EncryptedApiConfig {
             api_key_plaintext: Some("secret".into()),
             ..crate::providers::default_config(mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID)
@@ -903,6 +976,11 @@ mod tests {
         assert_eq!(prepared.tasks.len(), 1);
         assert!(prepared.configs.is_empty());
         assert!(prepared.tombstones.is_empty());
+        assert_eq!(prepared.preferences.theme, ThemePreference::Day);
+        assert_eq!(
+            prepared.preferences.appearance.custom_background.asset_id,
+            None
+        );
         assert_eq!(prepared.tasks[0].reference_asset_ids, ["cross-reference"]);
         assert_eq!(
             asset_ids,
@@ -921,6 +999,39 @@ mod tests {
                 .and_then(|asset| asset.source_task_id.as_deref()),
             None
         );
+    }
+
+    #[test]
+    fn workspace_backup_restores_theme_background_reference_and_payload() {
+        let mut source = LocalAppState::default();
+        source.threads[0].updated_at = "2026-08-30T00:00:00+00:00".into();
+        let mut background = test_asset("theme-background", "", b"webp-background");
+        background.mime_type = "image/webp".into();
+        background.metadata.insert(
+            THEME_BACKGROUND_ROLE_KEY.into(),
+            THEME_BACKGROUND_ROLE.into(),
+        );
+        source.preferences.appearance.custom_background.asset_id = Some(background.id.clone());
+        source.preferences.appearance.custom_background.enabled = true;
+        source.assets.push(background);
+
+        let bytes = build_backup(source, &HashMap::new()).unwrap();
+        let mut local = LocalAppState::default();
+        local.threads[0].updated_at = "2026-01-01T00:00:00+00:00".into();
+        let imported = import_backup(&bytes, &local).unwrap();
+
+        assert_eq!(
+            imported
+                .state
+                .preferences
+                .appearance
+                .custom_background
+                .asset_id
+                .as_deref(),
+            Some("theme-background")
+        );
+        assert!(imported.state.assets.iter().any(is_theme_background));
+        assert_eq!(imported.payloads.len(), 1);
     }
 
     #[test]

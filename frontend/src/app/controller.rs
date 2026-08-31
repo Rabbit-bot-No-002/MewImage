@@ -325,6 +325,7 @@ pub(super) fn AppController() -> impl IntoView {
         persist_state,
         persist_ui_state,
         enqueue_payload_writes,
+        enqueue_payload_deletes,
         commit_current_thread_draft,
     );
 
@@ -352,6 +353,9 @@ pub(super) fn AppController() -> impl IntoView {
         commit_current_thread_draft,
         build_preview_panel_state,
     );
+
+    let (import_theme_background, perform_delete_theme_background, request_delete_theme_background) =
+        build_appearance_actions(persist_state, persist_ui_state, enqueue_payload_deletes);
 
     let (run_generation, rerun_task, cancel_generation, cancel_all_generations) =
         build_generation_actions(
@@ -385,6 +389,7 @@ pub(super) fn AppController() -> impl IntoView {
         perform_delete_config,
         perform_delete_thread,
         perform_delete_task,
+        perform_delete_theme_background,
         perform_clear_local_data,
         perform_clear_cloud_data,
         admin_user_action,
@@ -394,6 +399,7 @@ pub(super) fn AppController() -> impl IntoView {
     );
 
     view! {
+        <ThemeBackdrop />
         <div class="shell shell-single">
             <TopBar persist_ui_state=persist_ui_state />
             <SettingsOverlay
@@ -409,9 +415,11 @@ pub(super) fn AppController() -> impl IntoView {
                 export_local_backup=export_local_backup
                 export_session_backup=export_session_backup
                 import_local_backup=import_local_backup
+                import_theme_background=import_theme_background
                 persist_ui_state=persist_ui_state
                 refresh_admin_users=refresh_admin_users
                 refresh_cloud_data_stats=refresh_cloud_data_stats
+                request_delete_theme_background=request_delete_theme_background
                 submit_auth=submit_auth
                 sync_action=sync_action
                 toggle_api_key_sync=toggle_api_key_sync

@@ -15,6 +15,7 @@ use super::{
         ConfirmPopoverState, ContextMenuState, FailureLogState, FavoriteFolderPickerState,
         FloatingTipState, PreviewPanelState, PreviewState, TextPopoverState,
     },
+    system_prefers_dark,
 };
 
 #[derive(Clone, Copy)]
@@ -113,6 +114,12 @@ pub(crate) struct UiState {
     pub(crate) session_export_thread_id: RwSignal<String>,
     pub(crate) cloud_data_stats: RwSignal<Option<CloudDataStatsResponse>>,
     pub(crate) backup_file_input: NodeRef<html::Input>,
+    pub(crate) background_file_input: NodeRef<html::Input>,
+    pub(crate) background_processing: RwSignal<bool>,
+    pub(crate) appearance_message: RwSignal<Option<String>>,
+    pub(crate) background_display_src: RwSignal<Option<String>>,
+    pub(crate) background_display_asset_id: RwSignal<Option<String>>,
+    pub(crate) system_dark: RwSignal<bool>,
     pub(crate) show_resolution_menu: RwSignal<bool>,
     pub(crate) show_config_switcher: RwSignal<bool>,
     pub(crate) preview_state: RwSignal<Option<PreviewState>>,
@@ -245,6 +252,12 @@ impl AppState {
             session_export_thread_id: RwSignal::new(String::new()),
             cloud_data_stats: RwSignal::new(None),
             backup_file_input: NodeRef::new(),
+            background_file_input: NodeRef::new(),
+            background_processing: RwSignal::new(false),
+            appearance_message: RwSignal::new(None),
+            background_display_src: RwSignal::new(None),
+            background_display_asset_id: RwSignal::new(None),
+            system_dark: RwSignal::new(system_prefers_dark()),
             show_resolution_menu: RwSignal::new(false),
             show_config_switcher: RwSignal::new(false),
             preview_state: RwSignal::new(None),

@@ -1,24 +1,5 @@
 use super::super::*;
 
-pub(crate) fn apply_theme(theme: ThemePreference) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let Some(document) = window.document() else {
-        return;
-    };
-    if let Some(body) = document.body() {
-        let _ = body.set_attribute(
-            "data-theme",
-            if theme == ThemePreference::Night {
-                "night"
-            } else {
-                "day"
-            },
-        );
-    }
-}
-
 pub(crate) fn default_thread() -> ConversationThread {
     ConversationThread {
         id: new_id(),

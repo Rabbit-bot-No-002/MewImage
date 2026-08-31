@@ -776,7 +776,9 @@ pub(crate) fn WorkspaceMain(
                         }.into_any()
                     } else {
                         view! {
-                            <button class="button" on:click=generate>"开始生成"</button>
+                            <button class="button generation-submit-button" on:click=generate>
+                                <span class="generation-submit-label">"开始生成"</span>
+                            </button>
                         }.into_any()
                     }}
                     <span class="status">{move || status_text.get()}</span>

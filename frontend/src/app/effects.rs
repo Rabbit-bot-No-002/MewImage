@@ -10,7 +10,110 @@ pub(crate) fn install_app_effects() {
     let derived = expect_context::<AppDerived>();
 
     Effect::new(move |_| {
-        apply_theme(workspace.preferences.get().theme);
+        apply_appearance(&workspace.preferences.get(), ui.system_dark.get());
+    });
+
+    Effect::new(move |_| {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let Ok(Some(query)) = window.match_media("(prefers-color-scheme: dark)") else {
+            return;
+        };
+        ui.system_dark.set(query.matches());
+        let on_change = Closure::<dyn FnMut(web_sys::MediaQueryListEvent)>::new(
+            move |event: web_sys::MediaQueryListEvent| {
+                ui.system_dark.set(event.matches());
+            },
+        );
+        let _ =
+            query.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+        on_change.forget();
+    });
+
+    Effect::new(move |_| {
+        let preferences = workspace.preferences.get();
+        let background = preferences.appearance.custom_background;
+        let Some(asset_id) = background.asset_id.filter(|_| background.enabled) else {
+            clear_background_display(ui);
+            return;
+        };
+        if ui.background_display_asset_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
+            return;
+        }
+        let asset_sources = workspace.assets.with(|items| {
+            items
+                .iter()
+                .find(|asset| asset.id == asset_id && is_theme_background(asset))
+                .map(|asset| (asset.data_url.clone(), asset.remote_url.clone()))
+        });
+        let Some((data_url, remote_url)) = asset_sources else {
+            clear_background_display(ui);
+            return;
+        };
+        ui.background_display_asset_id.set(Some(asset_id.clone()));
+        if let Some(data_url) = data_url {
+            if let Err(error) = set_background_display_from_data_url(ui, &data_url) {
+                clear_background_display(ui);
+                ui.appearance_message.set(Some(error));
+            }
+            return;
+        }
+        spawn_local(async move {
+            let local_payload = load_asset_payloads(std::slice::from_ref(&asset_id))
+                .await
+                .ok()
+                .and_then(|mut payloads| payloads.remove(&asset_id));
+            let data_url = if let Some(data_url) = local_payload {
+                data_url
+            } else {
+                let Some(remote_url) = remote_url else {
+                    clear_background_display(ui);
+                    ui.appearance_message
+                        .set(Some("主题背景原文件不可用，可尝试重新同步或上传。".into()));
+                    return;
+                };
+                let source = if remote_url.starts_with('/') {
+                    api_url(&remote_url)
+                } else {
+                    remote_url
+                };
+                let (bytes, mime_type) = match fetch_authenticated_image_bytes(&source).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        clear_background_display(ui);
+                        ui.appearance_message
+                            .set(Some(format!("下载云端主题背景失败：{error}")));
+                        return;
+                    }
+                };
+                let data_url = bytes_to_data_url(&bytes, &mime_type);
+                let _ =
+                    apply_asset_payload_changes(&[(asset_id.clone(), data_url.clone())], &[]).await;
+                data_url
+            };
+            if workspace
+                .preferences
+                .get_untracked()
+                .appearance
+                .custom_background
+                .asset_id
+                .as_deref()
+                != Some(asset_id.as_str())
+            {
+                return;
+            }
+            if let Err(error) = set_background_display_from_data_url(ui, &data_url) {
+                clear_background_display(ui);
+                ui.appearance_message.set(Some(error));
+                return;
+            }
+            workspace.assets.update(|items| {
+                if let Some(asset) = items.iter_mut().find(|asset| asset.id == asset_id) {
+                    asset.data_url = Some(data_url.clone());
+                }
+            });
+        });
     });
 
     Effect::new(move |_| {
@@ -101,6 +204,30 @@ pub(crate) fn install_app_effects() {
     });
 }
 
+fn set_background_display_from_data_url(ui: UiState, data_url: &str) -> Result<(), String> {
+    let (mime_type, bytes) = decode_browser_data_url(data_url)?;
+    let blob = blob_from_bytes(&bytes, &mime_type)?;
+    let object_url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|error| format!("创建主题背景地址失败：{error:?}"))?;
+    if let Some(previous) = ui.background_display_src.get_untracked()
+        && previous.starts_with("blob:")
+    {
+        let _ = web_sys::Url::revoke_object_url(&previous);
+    }
+    ui.background_display_src.set(Some(object_url));
+    Ok(())
+}
+
+fn clear_background_display(ui: UiState) {
+    if let Some(previous) = ui.background_display_src.get_untracked()
+        && previous.starts_with("blob:")
+    {
+        let _ = web_sys::Url::revoke_object_url(&previous);
+    }
+    ui.background_display_src.set(None);
+    ui.background_display_asset_id.set(None);
+}
+
 async fn initialize_app_state(
     workspace: WorkspaceState,
     composer: ComposerState,
@@ -125,6 +252,7 @@ async fn initialize_app_state(
     for config in &mut state.configs {
         normalize_api_config(config);
     }
+    state.preferences.appearance.normalize();
     let stripped_task_payloads = strip_successful_task_payloads(&mut state.tasks);
     state
         .assets
@@ -216,6 +344,9 @@ async fn initialize_app_state(
                 continue;
             };
             if asset.metadata.contains_key(THUMBNAIL_DATA_URL_KEY) {
+                continue;
+            }
+            if is_theme_background(asset) {
                 continue;
             }
             if let Ok(thumbnail) = thumbnail_data_url_from_asset(asset, THUMBNAIL_MAX_EDGE).await {

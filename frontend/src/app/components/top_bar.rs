@@ -1,7 +1,10 @@
 use leptos::prelude::*;
 use mew_image_shared::ThemePreference;
 
-use crate::app::state::{UiState, WorkspaceState};
+use crate::app::{
+    resolved_night_mode,
+    state::{UiState, WorkspaceState},
+};
 
 use super::common::MaterialSymbolIcon;
 
@@ -29,16 +32,16 @@ pub(crate) fn TopBar(persist_ui_state: impl Fn() + Copy + Send + Sync + 'static)
                 </div>
                 <div class="row topbar-actions">
                     <button class="button ghost" on:click=move |_| {
+                        let night = resolved_night_mode(
+                            preferences.get_untracked().theme,
+                            ui.system_dark.get_untracked(),
+                        );
                         preferences.update(|value| {
-                            value.theme = if value.theme == ThemePreference::Day {
-                                ThemePreference::Night
-                            } else {
-                                ThemePreference::Day
-                            };
+                            value.theme = if night { ThemePreference::Day } else { ThemePreference::Night };
                         });
                         persist_ui_state();
                     }>
-                        {move || if preferences.get().theme == ThemePreference::Day { "夜间模式" } else { "白天模式" }}
+                        {move || if resolved_night_mode(preferences.get().theme, ui.system_dark.get()) { "白天模式" } else { "夜间模式" }}
                     </button>
                     <button class="button secondary" on:click=move |_| show_settings_menu.update(|value| *value = !*value)>
                         {move || if show_settings_menu.get() { "收起设置" } else { "打开设置" }}

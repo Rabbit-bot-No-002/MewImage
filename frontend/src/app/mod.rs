@@ -32,13 +32,14 @@ use leptos::{prelude::*, task::spawn_local};
 use mew_image_shared::{
     AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUsersResponse,
     AppPreferences, AssetPresenceRequest, AssetPresenceResponse, AuthRequest, AuthResponse,
-    BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, ChangePasswordRequest, CloudDataClearRequest,
-    CloudDataClearScope, CloudDataStatsResponse, ConversationThread, DEFAULT_FAVORITE_FOLDER_ID,
-    EncryptedApiConfig, FavoriteFolder, FavoriteFolderTombstone, GenerationSettingsSnapshot,
-    ImageAssetRef, LocalAppState, LocalTaskRecord, MeResponse, ProviderKind, ProviderTemplate,
-    RegisterRequest, SyncCheckpoint, SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus,
-    ThemePreference, UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest,
-    UploadInitResponse, UserSummary, UsernameAvailabilityResponse, new_id, normalize_api_config,
+    BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, BackgroundLayer, BackgroundPosition, ChangePasswordRequest,
+    CloudDataClearRequest, CloudDataClearScope, CloudDataStatsResponse, ConversationThread,
+    DEFAULT_FAVORITE_FOLDER_ID, DecorationLevel, EncryptedApiConfig, FavoriteFolder,
+    FavoriteFolderTombstone, GenerationSettingsSnapshot, ImageAssetRef, LocalAppState,
+    LocalTaskRecord, MeResponse, ProviderKind, ProviderTemplate, RegisterRequest, SyncCheckpoint,
+    SyncEntityKind, SyncPullResponse, SyncTombstone, TaskStatus, ThemePreference,
+    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
+    UserSummary, UsernameAvailabilityResponse, VisualTheme, new_id, normalize_api_config,
     normalized_background_mode, normalized_image_output_format, now_rfc3339,
     strip_successful_task_payloads,
 };
@@ -53,10 +54,12 @@ use web_sys::{
 
 use crate::{api::api_url, data_management};
 use actions::account::build_account_actions;
+use actions::appearance::build_appearance_actions;
 use actions::data::build_data_actions;
 use actions::generation::build_generation_actions;
 use actions::preview::build_preview_actions;
 use actions::workspace::build_workspace_actions;
+use components::appearance::ThemeBackdrop;
 use components::favorites::FavoritesOverlay;
 use components::gallery::GallerySidebar;
 use components::overlays::{
@@ -71,6 +74,7 @@ use controller::AppController;
 use derived::*;
 use models::*;
 use state::*;
+use utils::appearance::*;
 use utils::audio::*;
 use utils::formatting::*;
 pub(crate) use utils::image::*;
@@ -88,6 +92,8 @@ const FAVORITE_PAGE_SIZE: usize = 9;
 const VISIBLE_THREAD_LIMIT: usize = 5;
 const ASSET_PAYLOAD_CACHE_MAX_ITEMS: usize = 6;
 const ASSET_PAYLOAD_CACHE_MAX_BYTES: u64 = 48 * 1024 * 1024;
+const THEME_BACKGROUND_ROLE_KEY: &str = "asset_role";
+const THEME_BACKGROUND_ROLE: &str = "theme_background";
 
 thread_local! {
     static ASSET_PAYLOAD_LRU: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };

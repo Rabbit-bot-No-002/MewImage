@@ -1,9 +1,10 @@
 use leptos::prelude::*;
 use mew_image_shared::CloudDataClearScope;
-use web_sys::{Event, MouseEvent};
+use web_sys::{Event, FileList, MouseEvent};
 
 use crate::app::{
     components::{
+        appearance::AppearanceSettings,
         common::{GitHubIcon, MaterialSymbolIcon},
         config_editor::ConfigEditor,
     },
@@ -28,9 +29,11 @@ pub(crate) fn SettingsOverlay(
     export_local_backup: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     export_session_backup: impl Fn(String) + Copy + Send + Sync + 'static,
     import_local_backup: impl Fn(Event) + Copy + Send + Sync + 'static,
+    import_theme_background: impl Fn(FileList) + Copy + Send + Sync + 'static,
     persist_ui_state: impl Fn() + Copy + Send + Sync + 'static,
     refresh_admin_users: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     refresh_cloud_data_stats: impl Fn() + Copy + Send + Sync + 'static,
+    request_delete_theme_background: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     submit_auth: impl Fn(&'static str) + Copy + Send + Sync + 'static,
     sync_action: impl Fn() + Copy + Send + Sync + 'static,
     toggle_api_key_sync: impl Fn(Event) + Copy + Send + Sync + 'static,
@@ -89,6 +92,14 @@ pub(crate) fn SettingsOverlay(
                             <div class="settings-shell">
                                 <aside class="settings-sidebar">
                                     <div class="settings-sidebar-main">
+                                        <button
+                                            class="settings-nav-button"
+                                            class:is-active=move || settings_tab.get() == "appearance"
+                                            on:click=move |_| settings_tab.set("appearance".into())
+                                        >
+                                            <MaterialSymbolIcon name="palette" filled=false />
+                                            <span>"外观"</span>
+                                        </button>
                                         <button
                                             class="settings-nav-button"
                                             class:is-active=move || settings_tab.get() == "providers"
@@ -157,13 +168,20 @@ pub(crate) fn SettingsOverlay(
                                 </aside>
                                 <div class="settings-content">
                                     {move || match settings_tab.get().as_str() {
+                                        "appearance" => view! {
+                                            <AppearanceSettings
+                                                import_theme_background=import_theme_background
+                                                persist_ui_state=persist_ui_state
+                                                request_delete_theme_background=request_delete_theme_background
+                                            />
+                                        }.into_any(),
                                         "account" => view! {
                                             <section class="stack">
                                                 <div class="row">
                                                     <h2>"账号与同步"</h2>
                                                     <span class="tag">{move || auth_user
                                                         .get()
-                                                        .map(|user| format!("{} · {} · 服务器图片 {} 张", user.username, user.status, user.image_count))
+                                                        .map(|user| format!("{} · {} · 服务器图片资源 {} 个", user.username, user.status, user.image_count))
                                                         .unwrap_or_else(|| "游客本地 + 受限代理模式".into())}</span>
                                                 </div>
                                                 <p class="status">
@@ -470,7 +488,7 @@ pub(crate) fn SettingsOverlay(
                                                                         <strong>{user.username}</strong>
                                                                         <span class="muted">{format!("{} · {}", user.role, user.status)}</span>
                                                                     </div>
-                                                                    <span class="tag">{format!("服务器图片 {} 张", user.image_count)}</span>
+                                                                    <span class="tag">{format!("服务器图片资源 {} 个", user.image_count)}</span>
                                                                     <span class="muted admin-user-date">{format!("注册 {}", user.created_at)}</span>
                                                                     <div class="row admin-user-actions">
                                                                         {if user.status == "pending" {
@@ -660,7 +678,7 @@ pub(crate) fn SettingsOverlay(
                                                             <div class="stack data-scope-content">
                                                                 <div class="row cloud-stat-toolbar">
                                                                     <div class="data-stat-grid cloud-stat-grid">
-                                                                        <div class="data-stat-card"><span>"云端图片"</span><strong>{stats.image_count}</strong></div>
+                                                                        <div class="data-stat-card"><span>"云端图片资源（含主题背景）"</span><strong>{stats.image_count}</strong></div>
                                                                         <div class="data-stat-card"><span>"占用空间"</span><strong>{format_byte_size(stats.image_bytes)}</strong></div>
                                                                         <div class="data-stat-card"><span>"服务商模板"</span><strong>{stats.provider_template_count}</strong></div>
                                                                         <div class="data-stat-card"><span>"同步快照"</span><strong>{if stats.has_sync_snapshot { "有" } else { "无" }}</strong></div>

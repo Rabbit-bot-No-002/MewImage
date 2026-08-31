@@ -5,6 +5,7 @@ pub(crate) fn build_data_actions(
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
     persist_ui_state: impl Fn() + Copy + Send + Sync + 'static,
     enqueue_payload_writes: impl Fn(Vec<(String, String)>) + Copy + Send + Sync + 'static,
+    enqueue_payload_deletes: impl Fn(Vec<String>) + Copy + Send + Sync + 'static,
     commit_current_thread_draft: impl Fn() + Copy + Send + Sync + 'static,
 ) -> (
     impl Fn() + Copy + Send + Sync + 'static,
@@ -228,6 +229,9 @@ pub(crate) fn build_data_actions(
                 .and_then(|bytes| data_management::import_backup(&bytes, &local));
             match result {
                 Ok(mut imported) => {
+                    let imported_payload_map =
+                        imported.payloads.iter().cloned().collect::<HashMap<_, _>>();
+                    merge_asset_payloads(&mut imported.state.assets, &imported_payload_map);
                     reconcile_task_integrity(
                         &mut imported.state.tasks,
                         &imported.state.assets,
@@ -338,6 +342,10 @@ pub(crate) fn build_data_actions(
             preview_state.set(None);
             preview_panel_state.set(None);
             gallery_page.set(1);
+            preferences.update(|value| {
+                value.appearance.custom_background = Default::default();
+            });
+            ui.appearance_message.set(None);
         }
         if clear_configs {
             let config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
@@ -353,7 +361,26 @@ pub(crate) fn build_data_actions(
             }
         }
         if clear_preferences {
+            let theme_background_ids = assets.with_untracked(|items| {
+                items
+                    .iter()
+                    .filter(|asset| is_theme_background(asset))
+                    .map(|asset| asset.id.clone())
+                    .collect::<Vec<_>>()
+            });
+            if !theme_background_ids.is_empty() {
+                assets.update(|items| items.retain(|asset| !is_theme_background(asset)));
+                record_sync_tombstones(
+                    tombstones,
+                    theme_background_ids
+                        .iter()
+                        .cloned()
+                        .map(|id| (SyncEntityKind::Asset, id)),
+                );
+                enqueue_payload_deletes(theme_background_ids);
+            }
             preferences.set(AppPreferences::default());
+            ui.appearance_message.set(None);
             queue_mode_enabled.set(false);
             let _ = clear_generation_queue_mode();
             tasks.update(|items| {
@@ -367,7 +394,7 @@ pub(crate) fn build_data_actions(
         if clear_workspace || clear_preferences {
             persist_state();
         }
-        if clear_configs || clear_preferences {
+        if clear_configs || clear_preferences || clear_workspace {
             persist_ui_state();
         }
         spawn_local(async move {

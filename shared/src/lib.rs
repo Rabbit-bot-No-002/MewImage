@@ -66,6 +66,145 @@ pub enum ThemePreference {
     #[default]
     Day,
     Night,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualTheme {
+    Classic,
+    #[default]
+    Aurora,
+    LiquidGlass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DecorationLevel {
+    Off,
+    Subtle,
+    #[default]
+    Standard,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundFit {
+    #[default]
+    Cover,
+    Contain,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundLayer {
+    #[default]
+    BelowDecorations,
+    AboveDecorations,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundPosition {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    #[default]
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomBackgroundSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    #[serde(default)]
+    pub fit: BackgroundFit,
+    #[serde(default)]
+    pub layer: BackgroundLayer,
+    #[serde(default)]
+    pub position: BackgroundPosition,
+    #[serde(default = "default_background_opacity")]
+    pub opacity: u8,
+    #[serde(default)]
+    pub blur_px: u8,
+    #[serde(default = "default_background_overlay_strength")]
+    pub overlay_strength: u8,
+}
+
+const fn default_background_opacity() -> u8 {
+    100
+}
+
+const fn default_background_overlay_strength() -> u8 {
+    44
+}
+
+impl Default for CustomBackgroundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            asset_id: None,
+            fit: BackgroundFit::Cover,
+            layer: BackgroundLayer::BelowDecorations,
+            position: BackgroundPosition::Center,
+            opacity: default_background_opacity(),
+            blur_px: 0,
+            overlay_strength: default_background_overlay_strength(),
+        }
+    }
+}
+
+impl CustomBackgroundSettings {
+    pub fn normalize(&mut self) {
+        self.opacity = self.opacity.min(100);
+        self.blur_px = self.blur_px.min(24);
+        self.overlay_strength = self.overlay_strength.min(90);
+        if self.asset_id.as_deref().is_none_or(str::is_empty) {
+            self.asset_id = None;
+            self.enabled = false;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppearancePreferences {
+    #[serde(default)]
+    pub visual_theme: VisualTheme,
+    #[serde(default)]
+    pub decoration_level: DecorationLevel,
+    #[serde(default = "default_panel_opacity")]
+    pub panel_opacity: u8,
+    #[serde(default)]
+    pub custom_background: CustomBackgroundSettings,
+}
+
+const fn default_panel_opacity() -> u8 {
+    100
+}
+
+impl Default for AppearancePreferences {
+    fn default() -> Self {
+        Self {
+            visual_theme: VisualTheme::default(),
+            decoration_level: DecorationLevel::default(),
+            panel_opacity: default_panel_opacity(),
+            custom_background: CustomBackgroundSettings::default(),
+        }
+    }
+}
+
+impl AppearancePreferences {
+    pub fn normalize(&mut self) {
+        self.panel_opacity = self.panel_opacity.clamp(20, 100);
+        self.custom_background.normalize();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -592,20 +731,20 @@ fn collect_gemini_image_payloads(
 ) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(inline_data) = map.get("inline_data").or_else(|| map.get("inlineData")) {
-                if let Some(data) = inline_data.get("data").and_then(|value| value.as_str()) {
-                    let mime_type = inline_data
-                        .get("mime_type")
-                        .or_else(|| inline_data.get("mimeType"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or(fallback_mime);
-                    let data_url = format!("data:{mime_type};base64,{data}");
-                    if seen.insert(data_url.clone()) {
-                        images.push(GeneratedImageResult {
-                            url: None,
-                            data_url: Some(data_url),
-                        });
-                    }
+            if let Some(inline_data) = map.get("inline_data").or_else(|| map.get("inlineData"))
+                && let Some(data) = inline_data.get("data").and_then(|value| value.as_str())
+            {
+                let mime_type = inline_data
+                    .get("mime_type")
+                    .or_else(|| inline_data.get("mimeType"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(fallback_mime);
+                let data_url = format!("data:{mime_type};base64,{data}");
+                if seen.insert(data_url.clone()) {
+                    images.push(GeneratedImageResult {
+                        url: None,
+                        data_url: Some(data_url),
+                    });
                 }
             }
             for child in map.values() {
@@ -645,11 +784,11 @@ pub fn extract_openai_responses_result(
             if revised_prompt.is_none() {
                 revised_prompt = find_first_string(item, "revised_prompt");
             }
-            if let Some(size) = item.get("size").and_then(|value| value.as_str()) {
-                if let Some((width, height)) = parse_size_label(size) {
-                    actual_width = Some(width);
-                    actual_height = Some(height);
-                }
+            if let Some(size) = item.get("size").and_then(|value| value.as_str())
+                && let Some((width, height)) = parse_size_label(size)
+            {
+                actual_width = Some(width);
+                actual_height = Some(height);
             }
             if let Some(quality) = item.get("quality").and_then(|value| value.as_str()) {
                 actual_quality = Some(quality.to_string());
@@ -946,13 +1085,13 @@ pub fn extract_nano_banana_result(
 
     if let Some(items) = response_json.get("data").and_then(|value| value.as_array()) {
         for item in items {
-            if let Some(url) = item.get("url").and_then(|value| value.as_str()) {
-                if seen.insert(url.to_string()) {
-                    images.push(GeneratedImageResult {
-                        url: Some(url.to_string()),
-                        data_url: None,
-                    });
-                }
+            if let Some(url) = item.get("url").and_then(|value| value.as_str())
+                && seen.insert(url.to_string())
+            {
+                images.push(GeneratedImageResult {
+                    url: Some(url.to_string()),
+                    data_url: None,
+                });
             }
             if let Some(raw) = item.get("b64_json").and_then(|value| value.as_str()) {
                 let data_url = format!("data:{fallback_mime};base64,{raw}");
@@ -963,11 +1102,11 @@ pub fn extract_nano_banana_result(
                     });
                 }
             }
-            if let Some(size) = item.get("size").and_then(|value| value.as_str()) {
-                if let Some((width, height)) = parse_size_label(size) {
-                    actual_width = Some(width);
-                    actual_height = Some(height);
-                }
+            if let Some(size) = item.get("size").and_then(|value| value.as_str())
+                && let Some((width, height)) = parse_size_label(size)
+            {
+                actual_width = Some(width);
+                actual_height = Some(height);
             }
             if let Some(quality) = item.get("quality").and_then(|value| value.as_str()) {
                 actual_quality = Some(quality.to_string());
@@ -1323,6 +1462,8 @@ pub fn default_favorite_folders() -> Vec<FavoriteFolder> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppPreferences {
     pub theme: ThemePreference,
+    #[serde(default)]
+    pub appearance: AppearancePreferences,
     pub clear_prompt_after_submit: bool,
     pub preserve_draft_on_restart: bool,
     pub reuse_last_config: bool,
@@ -1338,6 +1479,7 @@ impl Default for AppPreferences {
     fn default() -> Self {
         Self {
             theme: ThemePreference::Day,
+            appearance: AppearancePreferences::default(),
             clear_prompt_after_submit: false,
             preserve_draft_on_restart: true,
             reuse_last_config: true,
@@ -1730,12 +1872,28 @@ pub fn apply_tombstones<T: SyncEntity>(
 }
 
 pub fn merge_envelopes(left: &SyncEnvelope, right: &SyncEnvelope) -> SyncEnvelope {
-    let tombstones = merge_tombstones(&left.tombstones, &right.tombstones);
-    let preferences = merge_preferences(
+    let mut tombstones = merge_tombstones(&left.tombstones, &right.tombstones);
+    let mut preferences = merge_preferences(
         &left.preferences,
         &right.preferences,
         left.updated_at >= right.updated_at,
     );
+    preferences.appearance.normalize();
+    let mut assets = apply_tombstones(
+        merge_asset_records(&left.assets, &right.assets),
+        &tombstones,
+        SyncEntityKind::Asset,
+    );
+    remove_unreferenced_theme_backgrounds(&mut assets, &preferences, &mut tombstones);
+    if preferences
+        .appearance
+        .custom_background
+        .asset_id
+        .as_deref()
+        .is_some_and(|active_id| !assets.iter().any(|asset| asset.id == active_id))
+    {
+        preferences.appearance.custom_background = CustomBackgroundSettings::default();
+    }
     SyncEnvelope {
         schema_version: left.schema_version.max(right.schema_version),
         updated_at: left.updated_at.clone().max(right.updated_at.clone()),
@@ -1754,13 +1912,44 @@ pub fn merge_envelopes(left: &SyncEnvelope, right: &SyncEnvelope) -> SyncEnvelop
             &tombstones,
             SyncEntityKind::Thread,
         ),
-        assets: apply_tombstones(
-            merge_asset_records(&left.assets, &right.assets),
-            &tombstones,
-            SyncEntityKind::Asset,
-        ),
+        assets,
         preferences,
         tombstones,
+    }
+}
+
+fn remove_unreferenced_theme_backgrounds(
+    assets: &mut Vec<ImageAssetRef>,
+    preferences: &AppPreferences,
+    tombstones: &mut Vec<SyncTombstone>,
+) {
+    let active_id = preferences.appearance.custom_background.asset_id.as_deref();
+    let removed = assets
+        .iter()
+        .filter(|asset| {
+            asset.metadata.get("asset_role").map(String::as_str) == Some("theme_background")
+                && active_id != Some(asset.id.as_str())
+        })
+        .map(|asset| asset.id.clone())
+        .collect::<Vec<_>>();
+    if removed.is_empty() {
+        return;
+    }
+    assets.retain(|asset| !removed.contains(&asset.id));
+    let deleted_at = now_rfc3339();
+    for asset_id in removed {
+        if let Some(existing) = tombstones
+            .iter_mut()
+            .find(|item| item.entity_kind == SyncEntityKind::Asset && item.entity_id == asset_id)
+        {
+            existing.deleted_at = existing.deleted_at.clone().max(deleted_at.clone());
+        } else {
+            tombstones.push(SyncTombstone {
+                entity_kind: SyncEntityKind::Asset,
+                entity_id: asset_id,
+                deleted_at: deleted_at.clone(),
+            });
+        }
     }
 }
 
@@ -2033,7 +2222,7 @@ mod tests {
             updated_at: "2026-01-02T00:00:00+00:00".into(),
             ..older.clone()
         };
-        let merged = merge_records(&[older], &[newer.clone()]);
+        let merged = merge_records(&[older], std::slice::from_ref(&newer));
         assert_eq!(merged, vec![newer]);
     }
 
@@ -2282,7 +2471,7 @@ mod tests {
             ..local.clone()
         };
 
-        let merged = merge_asset_records(&[local], &[remote.clone()]);
+        let merged = merge_asset_records(&[local], std::slice::from_ref(&remote));
 
         assert_eq!(merged, vec![remote]);
     }
@@ -2637,5 +2826,110 @@ mod tests {
         assert_eq!(config.provider_kind, ProviderKind::NanoBanana);
         assert_eq!(config.provider_template_id, BUILTIN_NANO_BANANA_TEMPLATE_ID);
         assert_eq!(config.model, "gemini-2.5-flash-image");
+    }
+
+    #[test]
+    fn legacy_preferences_without_appearance_use_aurora_defaults() {
+        let mut serialized = serde_json::to_value(AppPreferences::default()).unwrap();
+        serialized.as_object_mut().unwrap().remove("appearance");
+        let decoded: AppPreferences = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.theme, ThemePreference::Day);
+        assert_eq!(decoded.appearance.visual_theme, VisualTheme::Aurora);
+        assert_eq!(
+            decoded.appearance.decoration_level,
+            DecorationLevel::Standard
+        );
+        assert_eq!(decoded.appearance.panel_opacity, 100);
+        assert_eq!(
+            decoded.appearance.custom_background.layer,
+            BackgroundLayer::BelowDecorations
+        );
+        assert!(!decoded.appearance.custom_background.enabled);
+    }
+
+    #[test]
+    fn liquid_glass_theme_uses_stable_serialized_value() {
+        let serialized = serde_json::to_string(&VisualTheme::LiquidGlass).unwrap();
+        assert_eq!(serialized, "\"liquid_glass\"");
+        assert_eq!(
+            serde_json::from_str::<VisualTheme>(&serialized).unwrap(),
+            VisualTheme::LiquidGlass
+        );
+    }
+
+    #[test]
+    fn custom_background_settings_are_safely_normalized() {
+        let mut settings = CustomBackgroundSettings {
+            enabled: true,
+            asset_id: Some(String::new()),
+            opacity: 180,
+            blur_px: 80,
+            overlay_strength: 120,
+            ..Default::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.opacity, 100);
+        assert_eq!(settings.blur_px, 24);
+        assert_eq!(settings.overlay_strength, 90);
+        assert_eq!(settings.asset_id, None);
+        assert!(!settings.enabled);
+    }
+
+    #[test]
+    fn appearance_panel_opacity_keeps_cards_readable() {
+        let mut appearance = AppearancePreferences {
+            panel_opacity: 0,
+            ..Default::default()
+        };
+        appearance.normalize();
+        assert_eq!(appearance.panel_opacity, 20);
+
+        appearance.panel_opacity = 180;
+        appearance.normalize();
+        assert_eq!(appearance.panel_opacity, 100);
+    }
+
+    #[test]
+    fn sync_merge_removes_unreferenced_theme_backgrounds() {
+        let theme_asset = |id: &str| {
+            let mut metadata = BTreeMap::new();
+            metadata.insert("asset_role".into(), "theme_background".into());
+            ImageAssetRef {
+                id: id.into(),
+                sha256: format!("sha-{id}"),
+                mime_type: "image/webp".into(),
+                byte_len: 4,
+                width: Some(1),
+                height: Some(1),
+                created_at: "2026-01-01T00:00:00+00:00".into(),
+                updated_at: "2026-01-01T00:00:00+00:00".into(),
+                data_url: None,
+                remote_object_key: None,
+                remote_url: None,
+                source_task_id: None,
+                metadata,
+            }
+        };
+        let mut current = SyncEnvelope {
+            updated_at: "9999-01-01T00:00:00+00:00".into(),
+            assets: vec![theme_asset("current"), theme_asset("old")],
+            ..SyncEnvelope::default()
+        };
+        current.preferences.appearance.custom_background.asset_id = Some("current".into());
+        current.preferences.appearance.custom_background.enabled = true;
+        let stale = SyncEnvelope {
+            updated_at: "2000-01-01T00:00:00+00:00".into(),
+            ..SyncEnvelope::default()
+        };
+
+        let merged = merge_envelopes(&current, &stale);
+
+        assert_eq!(merged.assets.len(), 1);
+        assert_eq!(merged.assets[0].id, "current");
+        assert!(
+            merged.tombstones.iter().any(|item| {
+                item.entity_kind == SyncEntityKind::Asset && item.entity_id == "old"
+            })
+        );
     }
 }

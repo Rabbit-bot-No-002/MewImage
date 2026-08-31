@@ -219,6 +219,7 @@ pub(crate) fn build_workspace_actions(
                         for asset in items.iter().filter(|asset| {
                             asset.source_task_id.is_none()
                                 && !asset.metadata.contains_key("mask_base_asset_id")
+                                && !is_theme_background(asset)
                         }) {
                             let belongs_to_current_thread = asset
                                 .metadata

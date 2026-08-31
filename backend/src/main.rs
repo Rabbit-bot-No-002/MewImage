@@ -2716,12 +2716,12 @@ fn reject_unsafe_host(host: &str) -> Result<(), AppError> {
             "不允许访问本地或内部网络地址。",
         ));
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(ip) {
-            return Err(AppError::provider_target_blocked(
-                "不允许访问本机、私网或链路本地 IP。",
-            ));
-        }
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_private_ip(ip)
+    {
+        return Err(AppError::provider_target_blocked(
+            "不允许访问本机、私网或链路本地 IP。",
+        ));
     }
     Ok(())
 }
@@ -3281,10 +3281,10 @@ async fn invoke_custom_http(
         payload.template.count_field.as_deref().unwrap_or("n"),
         json!(payload.request.count),
     );
-    if let Some(quality) = &payload.request.quality {
-        if let Some(path) = payload.template.quality_field.as_deref() {
-            set_json_path(&mut body, path, json!(quality));
-        }
+    if let Some(quality) = &payload.request.quality
+        && let Some(path) = payload.template.quality_field.as_deref()
+    {
+        set_json_path(&mut body, path, json!(quality));
     }
 
     let response = state

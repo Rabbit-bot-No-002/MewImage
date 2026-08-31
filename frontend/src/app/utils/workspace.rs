@@ -8,6 +8,7 @@ use mew_image_shared::{
 
 use crate::app::{
     FAVORITE_ARCHIVE_ASSET_KEY, VISIBLE_THREAD_LIMIT, aspect_ratio_label, asset_display_src,
+    is_theme_background,
 };
 
 #[derive(Clone, PartialEq)]
@@ -428,7 +429,9 @@ pub(crate) fn selected_reference_assets(
     let mut selected_assets = Vec::new();
     for selected_id in selected_reference_ids {
         if let Some(asset) = assets.iter().find(|asset| {
-            asset.id == *selected_id && !asset.metadata.contains_key("mask_base_asset_id")
+            asset.id == *selected_id
+                && !asset.metadata.contains_key("mask_base_asset_id")
+                && !is_theme_background(asset)
         }) {
             selected_assets.push(asset.clone());
         }
@@ -449,7 +452,9 @@ pub(crate) fn thread_reference_assets(
         .collect::<HashSet<_>>();
     let assets_by_id = assets
         .iter()
-        .filter(|asset| !asset.metadata.contains_key("mask_base_asset_id"))
+        .filter(|asset| {
+            !asset.metadata.contains_key("mask_base_asset_id") && !is_theme_background(asset)
+        })
         .map(|asset| (asset.id.as_str(), asset))
         .collect::<HashMap<_, _>>();
 
@@ -473,6 +478,7 @@ pub(crate) fn thread_reference_assets(
         asset.source_task_id.is_none()
             && asset.metadata.get("thread_id").map(String::as_str) == Some(thread_id)
             && !asset.metadata.contains_key("mask_base_asset_id")
+            && !is_theme_background(asset)
     }) {
         if included_ids.insert(asset.id.clone()) {
             references.push(asset.clone());

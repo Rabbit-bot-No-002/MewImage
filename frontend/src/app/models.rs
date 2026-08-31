@@ -92,6 +92,7 @@ pub(crate) enum ConfirmPopoverKind {
     DeleteFavoriteFolder(String),
     DeleteTask(String),
     DeleteUser(String),
+    DeleteThemeBackground,
     ClearLocalData(LocalDataClearScope),
     ClearLocalDataFinal(LocalDataClearScope),
     ClearCloudData(CloudDataClearScope),
