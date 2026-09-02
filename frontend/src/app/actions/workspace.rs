@@ -3,7 +3,6 @@ use super::super::*;
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_workspace_actions(
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
-    enqueue_payload_writes: impl Fn(Vec<(String, String)>) + Copy + Send + Sync + 'static,
     enqueue_payload_deletes: impl Fn(Vec<String>) + Copy + Send + Sync + 'static,
     commit_current_thread_draft: impl Fn() + Copy + Send + Sync + 'static,
     build_preview_panel_state: impl Fn(&str, Option<&str>) -> Option<PreviewPanelState>
@@ -260,14 +259,24 @@ pub(crate) fn build_workspace_actions(
                     let payloads = asset_payload_pairs(&imported);
                     let imported_ids: Vec<String> =
                         imported.iter().map(|asset| asset.id.clone()).collect();
+                    if let Err(error) = apply_asset_payload_changes(&payloads, &[]).await {
+                        // 分批写入可能已有前序批次成功，失败时尽力回滚本次全新资源。
+                        let _ = apply_asset_payload_changes(&[], &imported_ids).await;
+                        status_text.set(format!(
+                            "导入图片失败：原图未能写入浏览器存储：{error}。请检查存储配额后重试。"
+                        ));
+                        return;
+                    }
+                    for asset in &mut imported {
+                        asset.data_url = None;
+                    }
                     assets_signal.update(|items| {
                         items.extend(imported);
                         touch_and_trim_asset_payload_cache(items, &imported_ids, false);
                     });
-                    enqueue_payload_writes(payloads);
                     selected_reference_ids.update(|current| {
                         for id in reused_ids.iter().chain(imported_ids.iter()) {
-                            if !current.contains(&id) {
+                            if !current.contains(id) {
                                 current.push(id.clone());
                             }
                         }
@@ -296,7 +305,11 @@ pub(crate) fn build_workspace_actions(
         let preload_asset_id = asset_id.clone();
         reference_menu_asset_id.set(Some(asset_id));
         spawn_local(async move {
-            let _ = ensure_asset_payloads_loaded(assets_signal, &[preload_asset_id]).await;
+            if let Err(error) =
+                ensure_asset_display_sources_loaded(assets_signal, &[preload_asset_id]).await
+            {
+                status_text.set(format!("参考图原文件载入失败：{error}"));
+            }
         });
     };
 
@@ -489,10 +502,10 @@ pub(crate) fn build_workspace_actions(
             }
         });
         selected_reference_ids.update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
-        if let Some(asset_id) = continuation_asset_id.get_untracked() {
-            if removed_asset_ids.contains(&asset_id) {
-                continuation_asset_id.set(None);
-            }
+        if let Some(asset_id) = continuation_asset_id.get_untracked()
+            && removed_asset_ids.contains(&asset_id)
+        {
+            continuation_asset_id.set(None);
         }
         if !removed_asset_ids.is_empty() {
             enqueue_payload_deletes(removed_asset_ids.clone());
@@ -525,8 +538,46 @@ pub(crate) fn build_workspace_actions(
     let open_preview = move |task_id: String, asset_id: Option<String>| {
         if let Some(preview_asset_id) = asset_id.clone() {
             let assets_signal = assets;
+            let preview_task_id = task_id.clone();
+            let expected_asset_id = preview_asset_id.clone();
+            let mut preload_asset_ids = vec![preview_asset_id];
+            if let Some(reference_ids) = tasks.with_untracked(|items| {
+                items
+                    .iter()
+                    .find(|task| task.id == preview_task_id)
+                    .map(|task| task.reference_asset_ids.clone())
+            }) {
+                assets.with_untracked(|items| {
+                    preload_asset_ids.extend(reference_ids.into_iter().filter(|asset_id| {
+                        items
+                            .iter()
+                            .find(|asset| asset.id == *asset_id)
+                            .map(|asset| asset_display_src(asset).is_empty())
+                            .unwrap_or(false)
+                    }));
+                });
+            }
             spawn_local(async move {
-                let _ = ensure_asset_payloads_loaded(assets_signal, &[preview_asset_id]).await;
+                if let Err(error) =
+                    ensure_asset_display_sources_loaded(assets_signal, &preload_asset_ids).await
+                {
+                    status_text.set(format!("详情原图载入失败：{error}"));
+                    return;
+                }
+                let still_open = preview_state
+                    .get_untracked()
+                    .map(|preview| {
+                        preview.task_id == preview_task_id
+                            && preview.asset_id.as_deref() == Some(expected_asset_id.as_str())
+                    })
+                    .unwrap_or(false);
+                if still_open {
+                    // 重新构建详情快照，使刚创建的运行时 Blob URL 立即替换缩略图。
+                    preview_panel_state.set(build_preview_panel_state(
+                        &preview_task_id,
+                        Some(expected_asset_id.as_str()),
+                    ));
+                }
             });
         }
         preview_panel_state.set(build_preview_panel_state(&task_id, asset_id.as_deref()));

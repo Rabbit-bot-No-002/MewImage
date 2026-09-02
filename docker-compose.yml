@@ -5,8 +5,8 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      # 左侧是宿主机端口，右侧 3000 是镜像内部固定监听端口。
-      - "${MEW_HOST_PORT}:3000"
+      # 默认只暴露给本机反向代理；直连部署可显式改为 0.0.0.0。
+      - "${MEW_HOST_BIND:-127.0.0.1}:${MEW_HOST_PORT}:3000"
     env_file:
       # 应用配置统一从同目录 .env 注入，Compose 文件无需修改。
       - .env
@@ -17,6 +17,19 @@ services:
       MEW_FRONTEND_DIST: /app/frontend/dist-app
       MEW_LOCAL_ASSET_DIR: /data/assets
     volumes:
-      - ./data:/data
+      - ./data:/data:rw
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     mem_limit: ${MEW_MEMORY_LIMIT}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     stop_grace_period: 30s

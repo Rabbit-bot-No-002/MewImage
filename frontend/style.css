@@ -1416,6 +1416,49 @@ select option:checked {
   background: rgba(15, 18, 30, 0.34);
 }
 
+.local-state-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(10, 14, 28, 0.34);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
+.local-state-gate-card {
+  width: min(520px, calc(100vw - 36px));
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 28px;
+  border: 1px solid var(--glass-border-outer, var(--line));
+  border-radius: 26px;
+  color: var(--text);
+  text-align: center;
+  background: var(--panel-strong, var(--panel));
+  box-shadow: var(--shadow);
+}
+
+.local-state-gate-card > .material-symbols-rounded {
+  font-size: 36px;
+  color: var(--primary);
+}
+
+.local-state-gate-card h2,
+.local-state-gate-card p {
+  margin: 0;
+}
+
+.local-state-gate-card p {
+  max-width: 440px;
+  color: var(--muted);
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
 .settings-overlay {
   position: fixed;
   inset: 0;

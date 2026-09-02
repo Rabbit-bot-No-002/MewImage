@@ -23,7 +23,6 @@ pub(crate) struct AppDerived {
     pub(crate) reference_assets: Memo<Vec<ImageAssetRef>>,
     pub(crate) continuation_asset: Memo<Option<ImageAssetRef>>,
     pub(crate) dimension_reference_assets: Memo<Vec<ImageAssetRef>>,
-    pub(crate) current_reference_menu_asset: Memo<Option<ImageAssetRef>>,
     pub(crate) current_preview: Memo<Option<(LocalTaskRecord, Option<ImageAssetRef>)>>,
     pub(crate) gallery_entries: Memo<Vec<GalleryItem>>,
     pub(crate) favorite_folders: Memo<Vec<FavoriteFolder>>,
@@ -120,12 +119,6 @@ impl AppDerived {
                 }
                 ordered
             })
-        });
-        let current_reference_menu_asset = Memo::new(move |_| {
-            let asset_id = composer.reference_menu_asset_id.get()?;
-            workspace
-                .assets
-                .with(|assets| assets.iter().find(|asset| asset.id == asset_id).cloned())
         });
         let current_preview = Memo::new(move |_| {
             let preview = ui.preview_state.get()?;
@@ -234,7 +227,6 @@ impl AppDerived {
             reference_assets,
             continuation_asset,
             dimension_reference_assets,
-            current_reference_menu_asset,
             current_preview,
             gallery_entries,
             favorite_folders,

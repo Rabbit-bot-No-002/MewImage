@@ -51,7 +51,7 @@ pub(crate) fn gallery_items(
                     task_id: task.id.clone(),
                     asset_id: Some(asset.id.clone()),
                     prompt: task.prompt.clone(),
-                    src: Some(asset_display_src(asset)),
+                    src: Some(asset_display_src(asset)).filter(|source| !source.is_empty()),
                     config_name: config_names
                         .get(task.config_id.as_str())
                         .copied()
@@ -223,10 +223,9 @@ pub(crate) fn visible_thread_items(
         .iter()
         .find(|thread| thread.id.as_str() == current_thread_id)
         .cloned()
+        && let Some(last) = visible.last_mut()
     {
-        if let Some(last) = visible.last_mut() {
-            *last = current_thread;
-        }
+        *last = current_thread;
     }
     visible
 }

@@ -434,10 +434,9 @@ pub(crate) fn build_account_actions(
                             .credentials(web_sys::RequestCredentials::Include)
                             .send()
                             .await
+                            && let Ok(me) = response.json::<MeResponse>().await
                         {
-                            if let Ok(me) = response.json::<MeResponse>().await {
-                                auth_user_signal.set(me.user);
-                            }
+                            auth_user_signal.set(me.user);
                         }
                     }
                     Err(error) => status_signal.set(Some(format!("同步响应解析失败：{error}"))),

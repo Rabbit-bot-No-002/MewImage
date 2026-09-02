@@ -1,11 +1,14 @@
+mod migrations;
+mod security_headers;
 mod state;
+mod sync_store;
 
 use std::{
     collections::{BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     path::{Component, Path as FsPath, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration as StdDuration, Instant},
 };
 
@@ -16,14 +19,15 @@ use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
 };
-use aws_config::BehaviorVersion;
+use aws_config::{BehaviorVersion, timeout::TimeoutConfig};
 use aws_sdk_s3::{Client as S3Client, config::Region, primitives::ByteStream};
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Bytes, to_bytes},
     extract::DefaultBodyLimit,
-    extract::{ConnectInfo, Multipart, Path, Query, State},
+    extract::{ConnectInfo, Multipart, Path, Query, Request, State, multipart::Field},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -53,11 +57,14 @@ use reqwest::Url;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row, SqliteConnection, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
-use state::{AppConfig, AppState, AssetStoreKind, ProxyGenerationJob, ProxyGenerationJobState};
-use tokio::net::TcpListener;
+use state::{
+    AppConfig, AppState, AssetStoreKind, GuestLimitRejection, GuestProxyLimits,
+    GuestProxyOperation, GuestProxyPermit, ProxyGenerationJob, ProxyGenerationJobState,
+};
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tower_cookies::{
     Cookie, CookieManagerLayer, Cookies,
     cookie::{SameSite, time::Duration as CookieDuration},
@@ -69,7 +76,6 @@ use tower_http::{
 };
 use tower_sessions::{ExpiredDeletion, Session, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
-use tower_sessions_sqlx_store::sqlx::sqlite::SqlitePool as SessionSqlitePool;
 use tracing::{error, info, warn};
 
 const MAX_ACTIVE_PROXY_GENERATION_JOBS: usize = 20;
@@ -77,12 +83,67 @@ const MAX_STORED_PROXY_GENERATION_JOBS: usize = 32;
 const PROXY_GENERATION_JOB_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
 const PROXY_GENERATION_RESULT_TTL: StdDuration = StdDuration::from_secs(10 * 60);
 const MAX_ASSET_PRESENCE_CHECKS: usize = 10_000;
+const MAX_SYNC_ASSETS: usize = 10_000;
+const DEFAULT_JSON_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const AUTH_BODY_LIMIT: usize = 64 * 1024;
+const SYNC_BODY_LIMIT: usize = 32 * 1024 * 1024;
+const GENERATION_BODY_LIMIT: usize = 192 * 1024 * 1024;
+const IMAGE_FETCH_BODY_LIMIT: usize = 32 * 1024;
+const MAX_GENERATION_REFERENCE_COUNT: usize = 16;
+const MAX_GENERATION_REFERENCE_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_GENERATION_REFERENCE_TOTAL_BYTES: usize = 160 * 1024 * 1024;
+const MAX_GENERATION_METADATA_BYTES: usize = 2 * 1024 * 1024;
+const MAX_REMOTE_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REMOTE_IMAGE_REDIRECTS: usize = 3;
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_UPSTREAM_ERROR_BYTES: usize = 64 * 1024;
+const USER_DATA_WRITE_LOCK_SHARDS: usize = 256;
+const PROXY_TEMP_FILE_TTL: StdDuration = StdDuration::from_secs(45 * 60);
+const S3_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const S3_OPERATION_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60);
+const S3_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 const REGISTRATION_DEVICE_COOKIE: &str = "mew_registration_device";
 const OPENAI_EDIT_IMAGE_FIELD: &str = "image[]";
+static PROXY_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 static MALLOC_TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 struct GenerationMemoryTrimGuard;
+
+#[derive(Debug, Clone, Copy)]
+enum UpstreamRequestKind {
+    Generation,
+    Image,
+}
+
+struct PreparedUpstreamRequest {
+    client: reqwest::Client,
+    url: Url,
+}
+
+#[derive(Clone)]
+struct ResponseMemoryPermit {
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+struct ParsedGeneratePayload {
+    payload: GenerateViaProxyRequest,
+    reference_files: Vec<TemporaryReferenceFile>,
+}
+
+struct TemporaryReferenceFile {
+    path: PathBuf,
+    mime_type: String,
+    byte_len: u64,
+    sha256: String,
+}
+
+impl Drop for TemporaryReferenceFile {
+    fn drop(&mut self) {
+        // 任务完成、取消或超时时都会随请求快照释放，避免参考图滞留临时目录。
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 impl Drop for GenerationMemoryTrimGuard {
     fn drop(&mut self) {
@@ -109,6 +170,10 @@ fn trim_process_heap() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
+        return run_healthcheck().await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -117,9 +182,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
+    prepare_proxy_temp_dir().await?;
     ensure_sqlite_parent_dir(&config.database_url)?;
     ensure_asset_store_ready(&config)?;
-    let db_options = SqliteConnectOptions::from_str(&config.database_url)?.create_if_missing(true);
+    let db_options = SqliteConnectOptions::from_str(&config.database_url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(StdDuration::from_secs(10));
     let db = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(db_options)
@@ -139,22 +209,34 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         db,
         s3,
-        http: reqwest::Client::builder().build()?,
         provider_builtins: builtins,
         generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
             MAX_ACTIVE_PROXY_GENERATION_JOBS,
         )),
+        generation_temp_budget: Arc::new(tokio::sync::Semaphore::new(
+            config.proxy_memory_budget_mib,
+        )),
+        generation_memory_budget: Arc::new(tokio::sync::Semaphore::new(
+            config.proxy_memory_budget_mib,
+        )),
         generation_jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        user_data_write_locks: Arc::new(
+            (0..USER_DATA_WRITE_LOCK_SHARDS)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
+        ),
         auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(config.auth_hash_concurrency)),
         dummy_password_hash,
+        guest_proxy_limits: Arc::new(GuestProxyLimits::default()),
     });
+    let upload_cleanup_task = tokio::spawn(periodically_cleanup_expired_uploads(state.clone()));
 
-    let session_pool = SessionSqlitePool::connect(&config.database_url).await?;
-    let session_store = SqliteStore::new(session_pool)
+    // 会话与业务数据共用连接池，避免同一个 SQLite 文件被两个独立池放大写锁竞争。
+    let session_store = SqliteStore::new(state.db.clone())
         .with_table_name("mew_image_sessions")
         .map_err(anyhow::Error::msg)?;
     session_store.migrate().await?;
-    tokio::spawn(
+    let session_cleanup_task = tokio::spawn(
         session_store
             .clone()
             .continuously_delete_expired(std::time::Duration::from_secs(900)),
@@ -165,61 +247,208 @@ async fn main() -> anyhow::Result<()> {
         .with_same_site(tower_sessions::cookie::SameSite::Lax);
 
     let cors_layer = build_cors_layer(&config)?;
+    let max_upload_body_limit = usize::try_from(config.max_upload_bytes).unwrap_or(usize::MAX);
 
     let app = Router::new()
         .route("/api/health", get(health))
-        .route("/api/auth/register", post(register))
+        .route(
+            "/api/auth/register",
+            post(register).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
         .route("/api/auth/check-username", get(check_username))
         .route("/api/auth/setup-status", get(admin_setup_status))
-        .route("/api/auth/bootstrap-admin", post(bootstrap_admin))
-        .route("/api/auth/login", post(login))
+        .route(
+            "/api/auth/bootstrap-admin",
+            post(bootstrap_admin).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
+        .route(
+            "/api/auth/login",
+            post(login).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
-        .route("/api/auth/change-password", post(change_password))
+        .route(
+            "/api/auth/change-password",
+            post(change_password).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
+        )
         .route("/api/admin/users", get(admin_list_users))
         .route("/api/admin/users/approve", post(admin_approve_user))
         .route("/api/admin/users/disable", post(admin_disable_user))
         .route("/api/admin/users/restore", post(admin_restore_user))
         .route("/api/admin/users/delete", post(admin_delete_user))
-        .route("/api/sync/push", post(sync_push))
+        .route(
+            "/api/sync/push",
+            post(sync_push).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
+        )
         .route("/api/sync/pull", get(sync_pull))
-        .route("/api/sync/merge-preview", post(sync_merge_preview))
+        .route(
+            "/api/sync/merge-preview",
+            post(sync_merge_preview).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
+        )
         .route("/api/data/stats", get(cloud_data_stats))
         .route("/api/data/clear", post(clear_cloud_data))
         .route(
             "/api/providers/templates",
-            get(list_provider_templates).post(import_provider_template),
+            get(list_provider_templates)
+                .post(import_provider_template)
+                .layer(DefaultBodyLimit::max(DEFAULT_JSON_BODY_LIMIT)),
         )
-        .route("/api/providers/generate", post(generate_via_proxy))
+        .route(
+            "/api/providers/generate",
+            post(generate_via_proxy).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT)),
+        )
         .route(
             "/api/providers/generate/{job_id}",
             get(get_proxy_generation_job).delete(cancel_proxy_generation_job),
         )
         .route("/api/assets/upload-init", post(upload_init))
-        .route("/api/assets/upload/{token}", put(upload_bytes))
+        .route(
+            "/api/assets/upload/{token}",
+            put(upload_bytes).layer(DefaultBodyLimit::max(max_upload_body_limit)),
+        )
         .route("/api/assets/complete", post(upload_complete))
         .route("/api/assets/presence", post(check_asset_presence))
         .route("/api/assets/{asset_id}", get(get_asset))
-        .route("/api/images/fetch", post(fetch_image_via_proxy))
-        .fallback_service(
-            ServeDir::new(&config.frontend_dist).append_index_html_on_directories(true),
+        .route(
+            "/api/images/fetch",
+            post(fetch_image_via_proxy).layer(DefaultBodyLimit::max(IMAGE_FETCH_BODY_LIMIT)),
         )
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
+        .fallback_service(
+            ServeDir::new(&config.frontend_dist)
+                .precompressed_br()
+                .precompressed_gzip()
+                .append_index_html_on_directories(true),
+        )
+        .layer(DefaultBodyLimit::max(DEFAULT_JSON_BODY_LIMIT))
+        .layer(middleware::from_fn(
+            security_headers::apply_security_headers,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer)
         .layer(session_layer)
         .layer(CookieManagerLayer::new())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr: SocketAddr = config.listen_addr.parse()?;
     let listener = TcpListener::bind(addr).await?;
     info!("backend listening on {}", addr);
-    axum::serve(
+    let server_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
+    session_cleanup_task.abort();
+    upload_cleanup_task.abort();
+    abort_all_proxy_generation_jobs(&state).await;
+    cleanup_current_proxy_temp_dir().await;
+    server_result?;
     Ok(())
+}
+
+async fn run_healthcheck() -> anyhow::Result<()> {
+    let config = AppConfig::from_env()?;
+    let mut address: SocketAddr = config.listen_addr.parse()?;
+    if address.ip().is_unspecified() {
+        address.set_ip(match address.ip() {
+            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        });
+    }
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(StdDuration::from_secs(2))
+        .timeout(StdDuration::from_secs(5))
+        .no_proxy()
+        .build()?
+        .get(format!("http://{address}/api/health"))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("healthcheck failed with HTTP {}", response.status());
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            error!("failed to install Ctrl+C handler: {error}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => error!("failed to install SIGTERM handler: {error}"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    info!("shutdown signal received");
+}
+
+async fn abort_all_proxy_generation_jobs(state: &AppState) {
+    let mut jobs = state.generation_jobs.lock().await;
+    for abort_handle in jobs.drain().filter_map(|(_, job)| job.abort_handle) {
+        abort_handle.abort();
+    }
+}
+
+fn proxy_temp_root() -> PathBuf {
+    std::env::temp_dir().join("mew-image-proxy")
+}
+
+fn proxy_temp_dir() -> &'static PathBuf {
+    PROXY_TEMP_DIR
+        .get_or_init(|| proxy_temp_root().join(format!("{}-{}", std::process::id(), new_id())))
+}
+
+async fn prepare_proxy_temp_dir() -> anyhow::Result<()> {
+    let directory = proxy_temp_dir();
+    tokio::fs::create_dir_all(directory).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    cleanup_stale_proxy_temp_dirs().await;
+    Ok(())
+}
+
+async fn cleanup_stale_proxy_temp_dirs() {
+    let root = proxy_temp_root();
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path() == *proxy_temp_dir() {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= PROXY_TEMP_FILE_TTL);
+        if is_stale {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
+}
+
+async fn cleanup_current_proxy_temp_dir() {
+    let _ = tokio::fs::remove_dir_all(proxy_temp_dir()).await;
 }
 
 fn ensure_sqlite_parent_dir(database_url: &str) -> anyhow::Result<()> {
@@ -251,8 +480,14 @@ async fn build_s3_client(config: &AppConfig) -> anyhow::Result<Option<S3Client>>
         return Ok(None);
     }
 
+    let timeout_config = TimeoutConfig::builder()
+        .connect_timeout(S3_CONNECT_TIMEOUT)
+        .operation_attempt_timeout(S3_OPERATION_ATTEMPT_TIMEOUT)
+        .operation_timeout(S3_OPERATION_TIMEOUT)
+        .build();
     let mut loader = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(config.s3_region.clone()));
+        .region(Region::new(config.s3_region.clone()))
+        .timeout_config(timeout_config);
     if let Some(endpoint) = config.s3_endpoint.clone() {
         loader = loader.endpoint_url(endpoint);
     }
@@ -281,6 +516,7 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             last_login_at TEXT,
             failed_login_count INTEGER NOT NULL DEFAULT 0,
             locked_until TEXT,
+            session_version INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS registration_devices (
@@ -301,11 +537,12 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
             updated_at TEXT NOT NULL
         )"#,
         r#"CREATE TABLE IF NOT EXISTS provider_templates (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
+            user_id TEXT NOT NULL,
+            id TEXT NOT NULL,
             payload TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, id)
         )"#,
         r#"CREATE TABLE IF NOT EXISTS assets (
             id TEXT PRIMARY KEY,
@@ -330,6 +567,7 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query(statement).execute(db).await?;
     }
     migrate_users_table(db).await?;
+    migrations::run_data_integrity_migrations(db).await?;
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_single_admin ON users(role) WHERE role = 'admin'",
     )
@@ -534,10 +772,7 @@ async fn register(
     .await?;
     transaction.commit().await.map_err(AppError::internal)?;
 
-    session
-        .insert("user_id", &user.id)
-        .await
-        .map_err(AppError::internal)?;
+    replace_session_identity(&session, &user.id, 0).await?;
     Ok(Json(AuthResponse { user }))
 }
 
@@ -565,22 +800,23 @@ async fn bootstrap_admin(
     }
 
     let now = now_rfc3339();
-    let result = sqlx::query(
+    let session_version = sqlx::query_scalar::<_, i64>(
         "UPDATE users
-         SET role = 'admin', status = 'approved', approved_at = ?, approved_by = ?
-         WHERE id = ? AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')",
+         SET role = 'admin', status = 'approved', approved_at = ?, approved_by = ?,
+             session_version = session_version + 1
+         WHERE id = ? AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')
+         RETURNING session_version",
     )
     .bind(&now)
     .bind(&user.id)
     .bind(&user.id)
-    .execute(&state.db)
+    .fetch_optional(&state.db)
     .await
     .map_err(AppError::internal)?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::unauthorized(
-            "系统已存在管理员，不能再使用初始化口令升级账号。",
-        ));
-    }
+    let session_version = session_version.ok_or_else(|| {
+        AppError::unauthorized("系统已存在管理员，不能再使用初始化口令升级账号。")
+    })?;
+    replace_session_identity(&session, &user.id, session_version).await?;
 
     let upgraded = UserSummary {
         role: "admin".into(),
@@ -611,7 +847,7 @@ async fn login(
     validate_login_credentials(&payload)?;
 
     let row =
-        sqlx::query("SELECT id, username, password_hash, role, status, created_at, locked_until FROM users WHERE username = ?")
+        sqlx::query("SELECT id, username, password_hash, role, status, created_at, locked_until, session_version FROM users WHERE username = ?")
             .bind(payload.username.trim())
             .fetch_optional(&state.db)
             .await
@@ -630,9 +866,7 @@ async fn login(
     let role = row.get::<String, _>("role");
     let status = row.get::<String, _>("status");
     let created_at = row.get::<String, _>("created_at");
-    if status == "disabled" {
-        return Err(AppError::unauthorized("账号已被禁用，请联系管理员。"));
-    }
+    let session_version = row.get::<i64, _>("session_version");
     if let Some(retry_after) = active_lock_retry_seconds(row.get("locked_until")) {
         return Err(AppError::rate_limited(
             format!("账号已临时锁定，请在 {retry_after} 秒后重试。"),
@@ -657,6 +891,10 @@ async fn login(
         }
         return Err(AppError::unauthorized("用户名或密码错误"));
     }
+    // 先完成密码校验再返回禁用状态，避免通过响应时延枚举已禁用账号。
+    if status == "disabled" {
+        return Err(AppError::unauthorized("账号已被禁用，请联系管理员。"));
+    }
 
     let image_count = user_image_count(&state.db, &user_id).await?;
     let user = UserSummary {
@@ -675,10 +913,7 @@ async fn login(
         .execute(&state.db)
         .await
         .map_err(AppError::internal)?;
-    session
-        .insert("user_id", &user.id)
-        .await
-        .map_err(AppError::internal)?;
+    replace_session_identity(&session, &user.id, session_version).await?;
     Ok(Json(AuthResponse { user }))
 }
 
@@ -715,17 +950,20 @@ async fn change_password(
         return Err(AppError::unauthorized("当前密码错误"));
     }
     let password_hash = hash_password_with_limit(&state, payload.new_password).await?;
-    sqlx::query(
+    let session_version = sqlx::query_scalar::<_, i64>(
         "UPDATE users
-         SET password_hash = ?, password_updated_at = ?, failed_login_count = 0, locked_until = NULL
-         WHERE id = ?",
+         SET password_hash = ?, password_updated_at = ?, failed_login_count = 0,
+             locked_until = NULL, session_version = session_version + 1
+         WHERE id = ?
+         RETURNING session_version",
     )
     .bind(password_hash)
     .bind(now_rfc3339())
     .bind(&user.id)
-    .execute(&state.db)
+    .fetch_one(&state.db)
     .await
     .map_err(AppError::internal)?;
+    replace_session_identity(&session, &user.id, session_version).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -813,6 +1051,7 @@ async fn admin_delete_user(
         return Err(AppError::bad_request("不能删除当前登录的管理员账号。"));
     }
 
+    let _write_guard = user_data_write_lock(&state, &payload.user_id).lock().await;
     let role = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = ?")
         .bind(&payload.user_id)
         .fetch_optional(&state.db)
@@ -872,6 +1111,17 @@ async fn update_user_status(
     status: &str,
     approved_by: Option<&str>,
 ) -> Result<StatusCode, AppError> {
+    let _write_guard = user_data_write_lock(state, user_id).lock().await;
+    let target_exists =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(AppError::internal)?
+            != 0;
+    if !target_exists {
+        return Err(AppError::not_found("用户不存在"));
+    }
     let approved_at = if status == "approved" {
         Some(now_rfc3339())
     } else {
@@ -879,7 +1129,8 @@ async fn update_user_status(
     };
     let result = sqlx::query(
         "UPDATE users
-         SET status = ?, approved_at = COALESCE(?, approved_at), approved_by = COALESCE(?, approved_by)
+         SET status = ?, approved_at = COALESCE(?, approved_at),
+             approved_by = COALESCE(?, approved_by), session_version = session_version + 1
          WHERE id = ?",
     )
     .bind(status)
@@ -896,29 +1147,62 @@ async fn update_user_status(
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn user_data_write_lock<'a>(state: &'a AppState, user_id: &str) -> &'a tokio::sync::Mutex<()> {
+    // 同一用户稳定落在同一分片，串行化同步、配额预留与清理；不同用户仍可并行。
+    let digest = Sha256::digest(user_id.as_bytes());
+    let index = usize::from(digest[0]) % state.user_data_write_locks.len();
+    &state.user_data_write_locks[index]
+}
+
+async fn revalidate_locked_approved_user(
+    state: &AppState,
+    session: &Session,
+    expected_user_id: &str,
+) -> Result<UserSummary, AppError> {
+    let user = require_approved_user(state, session).await?;
+    if user.id != expected_user_id {
+        return Err(AppError::unauthorized(
+            "登录状态已变更，请重新执行当前操作。",
+        ));
+    }
+    Ok(user)
+}
+
 async fn sync_push(
     State(state): State<Arc<AppState>>,
     session: Session,
     Json(payload): Json<SyncPushRequest>,
 ) -> Result<Json<SyncPullResponse>, AppError> {
     let user = require_approved_user(&state, &session).await?;
-    let existing = load_sync_envelope(&state.db, &user.id).await?;
+    let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+    let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
     let normalized = normalize_envelope_assets(&state, &user.id, payload.envelope).await?;
-    let merged = merge_envelopes(&existing, &normalized);
-    let updated_at = now_rfc3339();
+    let stored =
+        match sync_store::merge_snapshot_transactionally(&state.db, &user.id, &normalized.envelope)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                error!("transactional sync merge failed: {error:#}");
+                if let Err(rollback_error) = normalized.rollback(&state, &user.id).await {
+                    error!(
+                        "sync asset normalization rollback failed for user {}: {}",
+                        user.id, rollback_error.message
+                    );
+                }
+                return Err(AppError::internal_message("服务器内部错误"));
+            }
+        };
+    let merged = stored.envelope;
+    let updated_at = stored.updated_at;
 
-    sqlx::query(
-        "INSERT INTO sync_snapshots (user_id, payload, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
-    )
-    .bind(&user.id)
-    .bind(serde_json::to_string(&merged).map_err(AppError::internal)?)
-    .bind(&updated_at)
-    .execute(&state.db)
-    .await
-    .map_err(AppError::internal)?;
-
-    cleanup_tombstoned_assets(&state, &user.id, &merged).await?;
+    if let Err(error) = cleanup_tombstoned_assets(&state, &user.id, &merged).await {
+        // 快照已经提交，清理失败交由下次同步重试，不能把成功提交伪装成失败响应。
+        warn!(
+            "post-commit tombstone cleanup failed for user {}: {}",
+            user.id, error.message
+        );
+    }
 
     Ok(Json(SyncPullResponse {
         envelope: merged,
@@ -961,11 +1245,19 @@ async fn cleanup_tombstoned_assets(
         };
         let object_key = row.get::<String, _>("object_key");
         let other_references = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM assets WHERE user_id = ? AND object_key = ? AND id != ?",
+            "SELECT
+                (SELECT COUNT(*) FROM assets
+                 WHERE user_id = ? AND object_key = ? AND id != ?) +
+                (SELECT COUNT(*) FROM upload_tokens
+                 WHERE user_id = ? AND object_key = ? AND asset_id != ? AND expires_at > ?)",
         )
         .bind(user_id)
         .bind(&object_key)
         .bind(asset_id)
+        .bind(user_id)
+        .bind(&object_key)
+        .bind(asset_id)
+        .bind(now_rfc3339())
         .fetch_one(&state.db)
         .await
         .map_err(AppError::internal)?;
@@ -1022,6 +1314,8 @@ async fn clear_cloud_data(
     Json(payload): Json<CloudDataClearRequest>,
 ) -> Result<Json<CloudDataStatsResponse>, AppError> {
     let user = require_approved_user(&state, &session).await?;
+    let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+    let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
     match payload.scope {
         CloudDataClearScope::SyncData => clear_user_sync_data(&state, &user.id).await?,
         CloudDataClearScope::ProviderTemplates => {
@@ -1120,7 +1414,9 @@ async fn list_provider_templates(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<Vec<ProviderTemplate>>, AppError> {
-    let user = current_user(&state, &session).await?;
+    let user = current_user(&state, &session)
+        .await?
+        .filter(|user| user.status == "approved");
     let mut templates = state.provider_builtins.clone();
     if let Some(user) = user {
         let rows = sqlx::query(
@@ -1146,12 +1442,20 @@ async fn import_provider_template(
     Json(payload): Json<ProviderTemplateImportRequest>,
 ) -> Result<Json<ProviderTemplate>, AppError> {
     let user = require_approved_user(&state, &session).await?;
-    validate_template(&state, &payload.template, true)?;
+    let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+    let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
+    validate_template(
+        &state,
+        &payload.template,
+        state.config.enforce_provider_host_whitelist,
+    )?;
 
     let serialized = serde_json::to_string(&payload.template).map_err(AppError::internal)?;
     sqlx::query(
         "INSERT INTO provider_templates (id, user_id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+         ON CONFLICT(user_id, id) DO UPDATE SET
+             payload = excluded.payload,
+             updated_at = excluded.updated_at",
     )
     .bind(&payload.template.id)
     .bind(&user.id)
@@ -1171,6 +1475,8 @@ async fn check_asset_presence(
     Json(payload): Json<AssetPresenceRequest>,
 ) -> Result<Json<AssetPresenceResponse>, AppError> {
     let user = require_approved_user(&state, &session).await?;
+    let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+    let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
     if payload.asset_ids.len() > MAX_ASSET_PRESENCE_CHECKS {
         return Err(AppError::bad_request("单次图片完整性检查数量过多。"));
     }
@@ -1221,55 +1527,320 @@ async fn check_asset_presence(
     Ok(Json(AssetPresenceResponse { missing_asset_ids }))
 }
 
+struct UploadReservation<'a> {
+    user_id: &'a str,
+    asset_id: &'a str,
+    token: &'a str,
+    object_key: &'a str,
+    mime_type: &'a str,
+    byte_len: u64,
+    sha256: &'a str,
+    expires_at: &'a str,
+}
+
+fn validate_upload_metadata(
+    state: &AppState,
+    payload: &UploadInitRequest,
+) -> Result<(String, String), AppError> {
+    if payload.byte_len == 0 {
+        return Err(AppError::bad_request("不能上传空文件。"));
+    }
+    if payload.byte_len > state.config.max_upload_bytes {
+        return Err(AppError::bad_request(format!(
+            "单个图片资源不能超过 {} MiB。",
+            state.config.max_upload_bytes / 1024 / 1024
+        )));
+    }
+    let sha256 = payload.sha256.trim().to_ascii_lowercase();
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request("图片资源 SHA-256 格式无效。"));
+    }
+    let mime_type = payload
+        .mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        mime_type.as_str(),
+        "image/png" | "image/jpeg" | "image/webp"
+    ) {
+        return Err(AppError::bad_request(
+            "云端资源只支持 PNG、JPEG 或 WebP 图片。",
+        ));
+    }
+    Ok((sha256, mime_type))
+}
+
+async fn reserve_upload_token(
+    state: &AppState,
+    reservation: UploadReservation<'_>,
+) -> Result<(), AppError> {
+    let mut connection = state.db.acquire().await.map_err(AppError::internal)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await
+        .map_err(AppError::internal)?;
+    let result = reserve_upload_token_on_connection(&mut connection, state, &reservation).await;
+    match result {
+        Ok(()) => match sqlx::query("COMMIT").execute(&mut *connection).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // 手写事务提交失败时显式回滚，避免异常事务状态返回连接池。
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(AppError::internal(error))
+            }
+        },
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            Err(error)
+        }
+    }
+}
+
+async fn reserve_upload_token_on_connection(
+    connection: &mut SqliteConnection,
+    state: &AppState,
+    reservation: &UploadReservation<'_>,
+) -> Result<(), AppError> {
+    let existing_owner =
+        sqlx::query_scalar::<_, Option<String>>("SELECT user_id FROM assets WHERE id = ?")
+            .bind(reservation.asset_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(AppError::internal)?
+            .flatten();
+    if existing_owner
+        .as_deref()
+        .is_some_and(|owner| owner != reservation.user_id)
+    {
+        return Err(AppError::bad_request("图片资源 ID 与其他用户冲突。"));
+    }
+
+    let now = now_rfc3339();
+    let pending = sqlx::query(
+        "SELECT COALESCE(SUM(byte_len), 0) AS bytes, COUNT(*) AS count
+         FROM upload_tokens WHERE user_id = ? AND expires_at > ?",
+    )
+    .bind(reservation.user_id)
+    .bind(&now)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(AppError::internal)?;
+    let pending_bytes = u64::try_from(pending.get::<i64, _>("bytes")).unwrap_or(u64::MAX);
+    let pending_count = u64::try_from(pending.get::<i64, _>("count")).unwrap_or(u64::MAX);
+    if state.config.user_pending_upload_count > 0
+        && pending_count.saturating_add(1) > state.config.user_pending_upload_count
+    {
+        return Err(AppError::rate_limited(
+            "当前账号等待完成的上传过多，请完成或稍后重试。",
+            "pending_upload_limit",
+            30,
+        ));
+    }
+    if state.config.user_pending_upload_bytes > 0
+        && pending_bytes.saturating_add(reservation.byte_len)
+            > state.config.user_pending_upload_bytes
+    {
+        return Err(AppError::rate_limited(
+            "当前账号等待完成的上传总大小过高，请完成或稍后重试。",
+            "pending_upload_bytes_limit",
+            30,
+        ));
+    }
+
+    let reserved_bytes = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT SUM(byte_len) FROM (
+            SELECT object_key, MAX(byte_len) AS byte_len FROM (
+                SELECT object_key, byte_len FROM assets WHERE user_id = ?
+                UNION ALL
+                SELECT object_key, byte_len FROM upload_tokens
+                 WHERE user_id = ? AND expires_at > ?
+            ) GROUP BY object_key
+         )",
+    )
+    .bind(reservation.user_id)
+    .bind(reservation.user_id)
+    .bind(&now)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(AppError::internal)?
+    .and_then(|value| u64::try_from(value).ok())
+    .unwrap_or(0);
+    let existing_object_bytes = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(byte_len) FROM (
+            SELECT byte_len FROM assets WHERE user_id = ? AND object_key = ?
+            UNION ALL
+            SELECT byte_len FROM upload_tokens
+             WHERE user_id = ? AND object_key = ? AND expires_at > ?
+         )",
+    )
+    .bind(reservation.user_id)
+    .bind(reservation.object_key)
+    .bind(reservation.user_id)
+    .bind(reservation.object_key)
+    .bind(&now)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(AppError::internal)?
+    .and_then(|value| u64::try_from(value).ok())
+    .unwrap_or(0);
+    // 兼容旧版可能留下的低报索引：同一对象更新为实际大小时也必须补计差额。
+    let additional_bytes = reservation.byte_len.saturating_sub(existing_object_bytes);
+    let projected_bytes = reserved_bytes.saturating_add(additional_bytes);
+    if state.config.user_asset_quota_bytes > 0
+        && projected_bytes > state.config.user_asset_quota_bytes
+    {
+        return Err(AppError::bad_request(
+            "云端图片配额已满；现有资源仍可读取或删除。",
+        ));
+    }
+
+    let asset_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE user_id = ?")
+        .bind(reservation.user_id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(AppError::internal)?;
+    let is_existing_asset = existing_owner.as_deref() == Some(reservation.user_id);
+    if state.config.user_asset_quota_count > 0
+        && u64::try_from(asset_count)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(!is_existing_asset))
+            > state.config.user_asset_quota_count
+    {
+        return Err(AppError::bad_request(
+            "云端图片数量配额已满；现有资源仍可读取或删除。",
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO upload_tokens
+         (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(reservation.token)
+    .bind(reservation.asset_id)
+    .bind(reservation.user_id)
+    .bind(reservation.object_key)
+    .bind(reservation.mime_type)
+    .bind(
+        i64::try_from(reservation.byte_len)
+            .map_err(|_| AppError::bad_request("上传文件大小超过数据库可记录范围。"))?,
+    )
+    .bind(reservation.sha256)
+    .bind(reservation.expires_at)
+    .execute(&mut *connection)
+    .await
+    .map_err(AppError::internal)?;
+    Ok(())
+}
+
+async fn ensure_user_asset_capacity(
+    state: &AppState,
+    user_id: &str,
+    asset_id: &str,
+    object_key: &str,
+    byte_len: u64,
+) -> Result<(), AppError> {
+    let now = now_rfc3339();
+    let usage = sqlx::query(
+        "SELECT
+            COALESCE((
+                SELECT SUM(byte_len) FROM (
+                    SELECT object_key, MAX(byte_len) AS byte_len FROM (
+                        SELECT object_key, byte_len FROM assets WHERE user_id = ?
+                        UNION ALL
+                        SELECT object_key, byte_len FROM upload_tokens
+                         WHERE user_id = ? AND expires_at > ?
+                    ) GROUP BY object_key
+                )
+            ), 0) AS stored_bytes,
+            COALESCE((
+                SELECT MAX(byte_len) FROM (
+                    SELECT byte_len FROM assets WHERE user_id = ? AND object_key = ?
+                    UNION ALL
+                    SELECT byte_len FROM upload_tokens
+                     WHERE user_id = ? AND object_key = ? AND expires_at > ?
+                )
+            ), 0) AS object_bytes,
+            EXISTS(SELECT 1 FROM assets WHERE user_id = ? AND id = ?) AS asset_exists,
+            (SELECT COUNT(*) FROM assets WHERE user_id = ?) AS asset_count",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(&now)
+    .bind(user_id)
+    .bind(object_key)
+    .bind(user_id)
+    .bind(object_key)
+    .bind(&now)
+    .bind(user_id)
+    .bind(asset_id)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(AppError::internal)?;
+    let stored_bytes = u64::try_from(usage.get::<i64, _>("stored_bytes")).unwrap_or(u64::MAX);
+    let existing_object_bytes = u64::try_from(usage.get::<i64, _>("object_bytes")).unwrap_or(0);
+    let additional_bytes = byte_len.saturating_sub(existing_object_bytes);
+    if additional_bytes > 0
+        && state.config.user_asset_quota_bytes > 0
+        && stored_bytes.saturating_add(additional_bytes) > state.config.user_asset_quota_bytes
+    {
+        return Err(AppError::bad_request(
+            "云端图片配额已满；现有资源仍可读取或删除。",
+        ));
+    }
+
+    let asset_exists = usage.get::<i64, _>("asset_exists") != 0;
+    if !asset_exists && state.config.user_asset_quota_count > 0 {
+        let asset_count = usage.get::<i64, _>("asset_count");
+        if u64::try_from(asset_count)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1)
+            > state.config.user_asset_quota_count
+        {
+            return Err(AppError::bad_request(
+                "云端图片数量配额已满；现有资源仍可读取或删除。",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn upload_init(
     State(state): State<Arc<AppState>>,
     session: Session,
     Json(payload): Json<UploadInitRequest>,
 ) -> Result<Json<UploadInitResponse>, AppError> {
     let user = require_approved_user(&state, &session).await?;
+    let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+    let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
     ensure_object_storage_ready(&state)?;
-    cleanup_expired_upload_tokens(&state.db).await?;
+    cleanup_expired_upload_tokens(&state).await?;
+    let (sha256, mime_type) = validate_upload_metadata(&state, &payload)?;
     let asset_id = payload.asset_id.unwrap_or_else(new_id);
     if uuid::Uuid::parse_str(&asset_id).is_err() {
         return Err(AppError::bad_request("图片资源 ID 格式无效。"));
     }
-    let existing_owner =
-        sqlx::query_scalar::<_, Option<String>>("SELECT user_id FROM assets WHERE id = ?")
-            .bind(&asset_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(AppError::internal)?
-            .flatten();
-    if existing_owner
-        .as_deref()
-        .is_some_and(|owner| owner != user.id)
-    {
-        return Err(AppError::bad_request("图片资源 ID 与其他用户冲突。"));
-    }
     let token = random_token();
-    let object_key = format!(
-        "users/{}/assets/{}-{}",
-        user.id,
-        payload.sha256,
-        sanitize_file_name(&payload.file_name)
-    );
+    let object_key = format!("users/{}/assets/{sha256}.bin", user.id);
     let expires_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
-
-    sqlx::query(
-        "INSERT INTO upload_tokens (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    reserve_upload_token(
+        &state,
+        UploadReservation {
+            user_id: &user.id,
+            asset_id: &asset_id,
+            token: &token,
+            object_key: &object_key,
+            mime_type: &mime_type,
+            byte_len: payload.byte_len,
+            sha256: &sha256,
+            expires_at: &expires_at,
+        },
     )
-    .bind(&token)
-    .bind(&asset_id)
-    .bind(&user.id)
-    .bind(&object_key)
-    .bind(&payload.mime_type)
-    .bind(payload.byte_len as i64)
-    .bind(&payload.sha256)
-    .bind(&expires_at)
-    .execute(&state.db)
-    .await
-    .map_err(AppError::internal)?;
+    .await?;
 
     Ok(Json(UploadInitResponse {
         upload_token: token.clone(),
@@ -1283,28 +1854,32 @@ async fn upload_bytes(
     State(state): State<Arc<AppState>>,
     session: Session,
     Path(token): Path<String>,
-    body: Bytes,
+    request: Request,
 ) -> Result<StatusCode, AppError> {
     let user = require_approved_user(&state, &session).await?;
+    let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+    let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
     ensure_object_storage_ready(&state)?;
-    cleanup_expired_upload_tokens(&state.db).await?;
-    let row = sqlx::query(
-        "SELECT asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at FROM upload_tokens WHERE token = ?",
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(AppError::internal)?;
-    let Some(row) = row else {
-        return Err(AppError::not_found("上传凭证不存在"));
-    };
-    let owner_id = row.get::<Option<String>, _>("user_id");
-    if owner_id.as_deref() != Some(user.id.as_str()) {
-        return Err(AppError::unauthorized("上传凭证不属于当前登录用户"));
-    }
-    ensure_upload_token_not_expired(&row)?;
+    cleanup_expired_upload_tokens(&state).await?;
+    let row = lease_upload_token(&state, &user.id, &token).await?;
 
-    let expected_len = row.get::<i64, _>("byte_len") as usize;
+    let expected_len = usize::try_from(row.get::<i64, _>("byte_len"))
+        .map_err(|_| AppError::bad_request("上传大小记录无效。"))?;
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|content_length| content_length != expected_len)
+    {
+        return Err(AppError::bad_request("上传大小与预期不一致"));
+    }
+    let _memory_permit =
+        acquire_shared_byte_budget(&state, u64::try_from(expected_len).unwrap_or(u64::MAX)).await?;
+    // Request 提取器不会预先缓冲正文；鉴权、令牌租约和预算确认后才有界读取。
+    let body = to_bytes(request.into_body(), expected_len)
+        .await
+        .map_err(|error| AppError::bad_request(format!("上传正文读取失败：{error}")))?;
     if expected_len != body.len() {
         return Err(AppError::bad_request("上传大小与预期不一致"));
     }
@@ -1314,12 +1889,19 @@ async fn upload_bytes(
     if hash != expected_hash {
         return Err(AppError::bad_request("文件哈希校验失败"));
     }
+    let detected_mime = detect_image_mime(&body)
+        .ok_or_else(|| AppError::bad_request("只允许上传 PNG、JPEG 或 WebP 图片。"))?;
+    if detected_mime != row.get::<String, _>("mime_type") {
+        return Err(AppError::bad_request(
+            "上传文件内容与声明的图片类型不一致。",
+        ));
+    }
 
     put_object(
         &state,
         row.get::<String, _>("object_key").as_str(),
         row.get::<String, _>("mime_type").as_str(),
-        body.to_vec(),
+        body,
     )
     .await?;
 
@@ -1332,25 +1914,41 @@ async fn upload_complete(
     Json(payload): Json<UploadCompleteRequest>,
 ) -> Result<Json<UploadCompleteResponse>, AppError> {
     let user = require_approved_user(&state, &session).await?;
+    let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+    let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
     ensure_object_storage_ready(&state)?;
-    cleanup_expired_upload_tokens(&state.db).await?;
-    let row = sqlx::query(
-        "SELECT asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at FROM upload_tokens WHERE token = ?",
-    )
-    .bind(&payload.upload_token)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(AppError::internal)?;
-    let Some(row) = row else {
-        return Err(AppError::not_found("上传凭证不存在"));
-    };
-    let owner_id = row.get::<Option<String>, _>("user_id");
-    if owner_id.as_deref() != Some(user.id.as_str()) {
-        return Err(AppError::unauthorized("上传凭证不属于当前登录用户"));
+    cleanup_expired_upload_tokens(&state).await?;
+    let row = lease_upload_token(&state, &user.id, &payload.upload_token).await?;
+
+    let object_key = row.get::<String, _>("object_key");
+    let expected_len = usize::try_from(row.get::<i64, _>("byte_len"))
+        .map_err(|_| AppError::bad_request("上传大小记录无效。"))?;
+    let _memory_permit =
+        acquire_shared_byte_budget(&state, u64::try_from(expected_len).unwrap_or(u64::MAX)).await?;
+    let object_bytes = get_object_bytes(&state, &object_key, state.config.max_upload_bytes)
+        .await
+        .map_err(|_| AppError::bad_request("上传原文件不存在，请重新上传。"))?;
+    if object_bytes.len() != expected_len
+        || hex_sha256(&object_bytes) != row.get::<String, _>("sha256")
+    {
+        return Err(AppError::bad_request("上传原文件的大小或哈希校验失败。"));
     }
-    ensure_upload_token_not_expired(&row)?;
+    let detected_mime = detect_image_mime(&object_bytes)
+        .ok_or_else(|| AppError::bad_request("上传原文件不是受支持的图片。"))?;
+    if detected_mime != row.get::<String, _>("mime_type") {
+        return Err(AppError::bad_request("上传原文件的图片类型校验失败。"));
+    }
 
     let created_at = now_rfc3339();
+    let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
+    let previous_object_key = sqlx::query_scalar::<_, String>(
+        "SELECT object_key FROM assets WHERE id = ? AND user_id = ?",
+    )
+    .bind(row.get::<String, _>("asset_id"))
+    .bind(&user.id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(AppError::internal)?;
     let result = sqlx::query(
         "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
@@ -1367,7 +1965,7 @@ async fn upload_complete(
     .bind(row.get::<String, _>("sha256"))
     .bind(row.get::<i64, _>("byte_len"))
     .bind(&created_at)
-    .execute(&state.db)
+    .execute(&mut *transaction)
     .await
     .map_err(AppError::internal)?;
     if result.rows_affected() == 0 {
@@ -1375,9 +1973,21 @@ async fn upload_complete(
     }
     sqlx::query("DELETE FROM upload_tokens WHERE token = ?")
         .bind(&payload.upload_token)
-        .execute(&state.db)
+        .execute(&mut *transaction)
         .await
         .map_err(AppError::internal)?;
+    transaction.commit().await.map_err(AppError::internal)?;
+    if let Some(previous_object_key) = previous_object_key
+        && previous_object_key != object_key
+        && let Err(error) =
+            delete_object_if_unreferenced(&state, &user.id, &previous_object_key).await
+    {
+        // 新资产和凭证状态已经提交，旧对象清理失败不得改写已提交响应。
+        warn!(
+            "post-commit previous object cleanup failed for user {}: {}",
+            user.id, error.message
+        );
+    }
 
     let asset = ImageAssetRef {
         id: row.get("asset_id"),
@@ -1389,7 +1999,7 @@ async fn upload_complete(
         created_at: created_at.clone(),
         updated_at: created_at,
         data_url: None,
-        remote_object_key: Some(row.get("object_key")),
+        remote_object_key: Some(object_key),
         remote_url: Some(format!("/api/assets/{}", row.get::<String, _>("asset_id"))),
         source_task_id: None,
         metadata: Default::default(),
@@ -1404,7 +2014,7 @@ async fn get_asset(
 ) -> Result<Response, AppError> {
     let user = require_approved_user(&state, &session).await?;
     let row = sqlx::query("SELECT object_key, mime_type, user_id FROM assets WHERE id = ?")
-        .bind(asset_id)
+        .bind(&asset_id)
         .fetch_optional(&state.db)
         .await
         .map_err(AppError::internal)?;
@@ -1416,42 +2026,221 @@ async fn get_asset(
         return Err(AppError::unauthorized("当前登录用户无权访问该资源"));
     }
 
-    let object_key = row.get::<String, _>("object_key");
+    let mut object_key = row.get::<String, _>("object_key");
+    let mut mime_type = row.get::<String, _>("mime_type");
     if !object_exists(&state, &object_key).await? {
-        delete_asset_indexes_for_object(&state.db, &user.id, &object_key).await?;
-        return Err(AppError::not_found(
-            "资源原文件不存在，请重新同步本地原图。",
-        ));
+        let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
+        let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
+        let current =
+            sqlx::query("SELECT object_key, mime_type FROM assets WHERE id = ? AND user_id = ?")
+                .bind(&asset_id)
+                .bind(&user.id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(AppError::internal)?;
+        let Some(current) = current else {
+            return Err(AppError::not_found("资源不存在"));
+        };
+        object_key = current.get("object_key");
+        mime_type = current.get("mime_type");
+        if !object_exists(&state, &object_key).await? {
+            delete_asset_indexes_for_object(&state.db, &user.id, &object_key).await?;
+            return Err(AppError::not_found(
+                "资源原文件不存在，请重新同步本地原图。",
+            ));
+        }
     }
-    let bytes = get_object_bytes(&state, &object_key).await?;
+    // 旧索引可能低报大小，因此下载按单文件安全上限预留，并让许可随响应正文一起释放。
+    let response_permit = acquire_shared_byte_budget(&state, state.config.max_upload_bytes).await?;
+    let bytes = get_object_bytes(&state, &object_key, state.config.max_upload_bytes).await?;
 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(&row.get::<String, _>("mime_type")).map_err(AppError::internal)?,
+        HeaderValue::from_str(&mime_type).map_err(AppError::internal)?,
     );
-    Ok((StatusCode::OK, headers, bytes).into_response())
+    let mut response = (StatusCode::OK, headers, bytes).into_response();
+    response.extensions_mut().insert(ResponseMemoryPermit {
+        _permit: Arc::new(response_permit),
+    });
+    Ok(response)
 }
 
 async fn fetch_image_via_proxy(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    session: Session,
     Json(payload): Json<FetchImageRequest>,
-) -> Result<Json<FetchImageResponse>, AppError> {
-    if !state.config.enable_guest_proxy {
-        return Err(AppError::unauthorized("当前部署已关闭游客代理。"));
-    }
+) -> Result<Response, AppError> {
+    let approved_user = current_user(&state, &session)
+        .await?
+        .filter(|user| user.status == "approved");
+    let _guest_permit = if approved_user.is_none() {
+        if !state.config.enable_guest_proxy {
+            return Err(AppError::unauthorized("当前部署已关闭游客代理。"));
+        }
+        Some(acquire_guest_proxy_permit(
+            &state,
+            resolve_client_ip(&state.config, &headers, peer_addr),
+            GuestProxyOperation::ImageFetch,
+        )?)
+    } else {
+        None
+    };
+    // 下载字节与 Base64 JSON 会短暂并存，按三倍文件上限预留并持有到响应发送结束。
+    let response_permit =
+        acquire_shared_byte_budget(&state, (MAX_REMOTE_IMAGE_BYTES as u64).saturating_mul(3))
+            .await?;
     let (mime_type, bytes) = fetch_remote_image_bytes(&state, &payload.url).await?;
-    Ok(Json(FetchImageResponse {
+    let mut response = Json(FetchImageResponse {
         mime_type,
         body_base64: BASE64.encode(bytes),
-    }))
+    })
+    .into_response();
+    response.extensions_mut().insert(ResponseMemoryPermit {
+        _permit: Arc::new(response_permit),
+    });
+    Ok(response)
+}
+
+fn acquire_guest_proxy_permit(
+    state: &AppState,
+    client_ip: IpAddr,
+    operation: GuestProxyOperation,
+) -> Result<GuestProxyPermit, AppError> {
+    let (concurrency, requests, scope_name) = match operation {
+        GuestProxyOperation::Generation => (
+            state.config.guest_generation_concurrency,
+            state.config.guest_generation_rate_limit,
+            "生图",
+        ),
+        GuestProxyOperation::ImageFetch => (
+            state.config.guest_image_concurrency,
+            state.config.guest_image_rate_limit,
+            "图片下载",
+        ),
+    };
+    state
+        .guest_proxy_limits
+        .acquire(
+            client_ip,
+            operation,
+            concurrency,
+            requests,
+            StdDuration::from_secs(state.config.guest_rate_window_seconds),
+        )
+        .map_err(|rejection| match rejection {
+            GuestLimitRejection::Concurrent => AppError::rate_limited(
+                format!("当前 IP 的游客{scope_name}并发数已达上限。"),
+                "guest_proxy_concurrency_limit",
+                2,
+            ),
+            GuestLimitRejection::RateLimited {
+                retry_after_seconds,
+            } => AppError::rate_limited(
+                format!("当前 IP 的游客{scope_name}请求过于频繁。"),
+                "guest_proxy_rate_limit",
+                retry_after_seconds,
+            ),
+        })
+}
+
+fn generation_temp_permits(state: &AppState, headers: &HeaderMap) -> Result<u32, AppError> {
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| AppError::bad_request("生成请求的 Content-Length 无效。"))
+        })
+        .transpose()?;
+    if content_length.is_some_and(|length| length > GENERATION_BODY_LIMIT as u64) {
+        return Err(AppError::bad_request("生成请求超过 192 MiB 安全上限。"));
+    }
+
+    let request_bytes = content_length.unwrap_or(GENERATION_BODY_LIMIT as u64);
+    // 排队参考图会流式落盘；按请求体两倍计费，为 multipart 边界和未知长度保留余量，
+    // 并限制所有等待任务占用的临时磁盘总量。
+    let weighted_bytes = request_bytes
+        .saturating_mul(2)
+        .saturating_add(16 * 1024 * 1024);
+    Ok(bytes_to_budget_permits(
+        weighted_bytes,
+        state.config.proxy_memory_budget_mib,
+    ))
+}
+
+fn estimate_generation_memory_permits(
+    state: &AppState,
+    request: &mew_image_shared::GenerationRequest,
+) -> u32 {
+    let reference_bytes = request
+        .reference_assets
+        .iter()
+        .map(|asset| asset.byte_len)
+        .fold(0_u64, u64::saturating_add);
+    let output_bytes = u64::from(request.width)
+        .saturating_mul(u64::from(request.height))
+        .saturating_mul(4)
+        .saturating_mul(u64::from(request.count));
+    // 参考图在 data URL、JSON/multipart 和解码缓冲之间会短暂重复；结果也会同时
+    // 存在于上游响应、提取结果与序列化轮询正文中，预算需覆盖峰值而非文件净大小。
+    bytes_to_budget_permits(
+        reference_bytes
+            .saturating_mul(3)
+            .saturating_add(output_bytes.saturating_mul(2))
+            .saturating_add(32 * 1024 * 1024),
+        state.config.proxy_memory_budget_mib,
+    )
+}
+
+fn bytes_to_budget_permits(bytes: u64, max_budget_mib: usize) -> u32 {
+    let permits = bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024);
+    permits
+        .max(1)
+        .min(max_budget_mib.max(1) as u64)
+        .min(u64::from(u32::MAX)) as u32
+}
+
+async fn acquire_shared_byte_budget(
+    state: &AppState,
+    bytes: u64,
+) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+    let permits = bytes_to_budget_permits(bytes, state.config.proxy_memory_budget_mib);
+    state
+        .generation_memory_budget
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .map_err(AppError::internal)
 }
 
 async fn generate_via_proxy(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     session: Session,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<ProxyGenerationJobAccepted>), AppError> {
+    let approved_user = current_user(&state, &session)
+        .await?
+        .filter(|user| user.status == "approved");
+    if approved_user.is_none() && !state.config.enable_guest_proxy {
+        return Err(AppError::unauthorized(
+            "当前部署已关闭游客代理，请登录后再试。",
+        ));
+    }
+    let guest_permit = approved_user.is_none().then(|| {
+        acquire_guest_proxy_permit(
+            &state,
+            resolve_client_ip(&state.config, &headers, peer_addr),
+            GuestProxyOperation::Generation,
+        )
+    });
+    let guest_permit = guest_permit.transpose()?;
     let job_slot = state
         .generation_job_slots
         .clone()
@@ -1463,9 +2252,16 @@ async fn generate_via_proxy(
                 5,
             )
         })?;
+    let temp_permits = generation_temp_permits(&state, &headers)?;
+    let temp_budget_permit = state
+        .generation_temp_budget
+        .clone()
+        .acquire_many_owned(temp_permits)
+        .await
+        .map_err(AppError::internal)?;
     let payload = parse_generate_multipart(multipart).await?;
-    let user = current_user(&state, &session).await?;
-    validate_generate_request(&state, user.as_ref(), &payload)?;
+    validate_generate_request(&state, approved_user.as_ref(), &payload.payload)?;
+    let memory_permits = estimate_generation_memory_permits(&state, &payload.payload.request);
 
     cleanup_proxy_generation_jobs(&state).await;
     let job_id = format!("{}{}", new_id(), new_id());
@@ -1475,6 +2271,7 @@ async fn generate_via_proxy(
             state: ProxyGenerationJobState::Queued,
             updated_at: Instant::now(),
             abort_handle: None,
+            memory_permit: None,
         },
     );
     let task_state = state.clone();
@@ -1483,6 +2280,9 @@ async fn generate_via_proxy(
         job_id.clone(),
         payload,
         job_slot,
+        temp_budget_permit,
+        memory_permits,
+        guest_permit,
     ));
     if let Some(job) = task_state.generation_jobs.lock().await.get_mut(&job_id) {
         job.abort_handle = Some(task.abort_handle());
@@ -1497,12 +2297,35 @@ async fn generate_via_proxy(
 async fn run_proxy_generation_job(
     state: Arc<AppState>,
     job_id: String,
-    payload: GenerateViaProxyRequest,
+    mut payload: ParsedGeneratePayload,
     job_slot: tokio::sync::OwnedSemaphorePermit,
+    temp_budget_permit: tokio::sync::OwnedSemaphorePermit,
+    memory_permits: u32,
+    guest_permit: Option<GuestProxyPermit>,
 ) {
+    let memory_permit = match state
+        .generation_memory_budget
+        .clone()
+        .acquire_many_owned(memory_permits)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            update_proxy_generation_job(
+                &state,
+                &job_id,
+                ProxyGenerationJobState::Failed(format!("生成内存预算不可用：{error}")),
+            )
+            .await;
+            return;
+        }
+    };
+    // 参考图即将载入受执行预算约束的内存，此时再释放排队临时磁盘预算。
+    drop(temp_budget_permit);
     let result = tokio::time::timeout(PROXY_GENERATION_JOB_TIMEOUT, async {
         update_proxy_generation_job(&state, &job_id, ProxyGenerationJobState::Running).await;
-        execute_proxy_generation(&state, &payload).await
+        hydrate_temporary_reference_files(&mut payload).await?;
+        execute_proxy_generation(&state, &payload.payload).await
     })
     .await;
 
@@ -1511,7 +2334,16 @@ async fn run_proxy_generation_job(
         let _memory_trim_guard = GenerationMemoryTrimGuard;
         match result {
             Ok(Ok(result)) => serialize_proxy_generation_result(result)
-                .map(ProxyGenerationJobState::Succeeded)
+                .and_then(|body| {
+                    let reserved_bytes = memory_permits as usize * 1024 * 1024;
+                    if body.len() > reserved_bytes {
+                        return Err(format!(
+                            "上游结果超过本任务的 {} MiB 内存预算，已停止缓存。",
+                            memory_permits
+                        ));
+                    }
+                    Ok(ProxyGenerationJobState::Succeeded(body))
+                })
                 .unwrap_or_else(ProxyGenerationJobState::Failed),
             Ok(Err(error)) => ProxyGenerationJobState::Failed(error.message),
             Err(_) => ProxyGenerationJobState::Failed(
@@ -1519,8 +2351,16 @@ async fn run_proxy_generation_job(
             ),
         }
     };
-    update_proxy_generation_job(&state, &job_id, final_state).await;
+    let keep_memory_permit = matches!(final_state, ProxyGenerationJobState::Succeeded(_));
+    complete_proxy_generation_job(
+        &state,
+        &job_id,
+        final_state,
+        keep_memory_permit.then_some(memory_permit),
+    )
+    .await;
     drop(job_slot);
+    drop(guest_permit);
 
     // 即使浏览器关闭后不再轮询，也会按时释放未读取结果。
     tokio::time::sleep(PROXY_GENERATION_RESULT_TTL).await;
@@ -1557,6 +2397,19 @@ async fn update_proxy_generation_job(
 ) {
     if let Some(job) = state.generation_jobs.lock().await.get_mut(job_id) {
         job.state = job_state;
+        job.updated_at = Instant::now();
+    }
+}
+
+async fn complete_proxy_generation_job(
+    state: &AppState,
+    job_id: &str,
+    job_state: ProxyGenerationJobState,
+    memory_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) {
+    if let Some(job) = state.generation_jobs.lock().await.get_mut(job_id) {
+        job.state = job_state;
+        job.memory_permit = memory_permit;
         job.updated_at = Instant::now();
     }
 }
@@ -1680,10 +2533,11 @@ fn cleanup_proxy_generation_job_entries(
 
 async fn parse_generate_multipart(
     mut multipart: Multipart,
-) -> Result<GenerateViaProxyRequest, AppError> {
+) -> Result<ParsedGeneratePayload, AppError> {
     let mut payload = None;
     let mut reference_assets_meta = None;
     let mut reference_assets_files = Vec::new();
+    let mut reference_total_bytes = 0usize;
 
     while let Some(field) = multipart.next_field().await.map_err(AppError::internal)? {
         let name = field.name().unwrap_or_default().to_string();
@@ -1693,7 +2547,15 @@ async fn parse_generate_multipart(
             .to_string();
         match name.as_str() {
             "payload" => {
-                let text = field.text().await.map_err(AppError::internal)?;
+                if payload.is_some() {
+                    return Err(AppError::bad_request("生成请求主体不能重复。"));
+                }
+                let text = read_multipart_text_limited(
+                    field,
+                    MAX_GENERATION_METADATA_BYTES,
+                    "生成请求主体",
+                )
+                .await?;
                 payload = Some(
                     serde_json::from_str::<GenerateViaProxyRequest>(&text).map_err(|error| {
                         AppError::bad_request(format!("生成请求解析失败：{error}"))
@@ -1701,11 +2563,44 @@ async fn parse_generate_multipart(
                 );
             }
             "reference_assets_meta" => {
-                reference_assets_meta = Some(field.text().await.map_err(AppError::internal)?);
+                if reference_assets_meta.is_some() {
+                    return Err(AppError::bad_request("参考图元数据不能重复。"));
+                }
+                reference_assets_meta = Some(
+                    read_multipart_text_limited(
+                        field,
+                        MAX_GENERATION_METADATA_BYTES,
+                        "参考图元数据",
+                    )
+                    .await?,
+                );
             }
             "reference_asset_files" => {
-                let bytes = field.bytes().await.map_err(AppError::internal)?;
-                reference_assets_files.push((content_type, bytes.to_vec()));
+                if reference_assets_files.len() >= MAX_GENERATION_REFERENCE_COUNT {
+                    return Err(AppError::bad_request(format!(
+                        "参考图最多允许 {MAX_GENERATION_REFERENCE_COUNT} 张。"
+                    )));
+                }
+                if !content_type.to_ascii_lowercase().starts_with("image/") {
+                    return Err(AppError::bad_request("参考图文件类型无效。"));
+                }
+                let temporary_file = write_multipart_field_to_temp_file(
+                    field,
+                    MAX_GENERATION_REFERENCE_FILE_BYTES,
+                    "单张参考图",
+                    content_type,
+                )
+                .await?;
+                reference_total_bytes = reference_total_bytes
+                    .checked_add(temporary_file.byte_len as usize)
+                    .ok_or_else(|| AppError::bad_request("参考图总大小溢出。"))?;
+                if reference_total_bytes > MAX_GENERATION_REFERENCE_TOTAL_BYTES {
+                    return Err(AppError::bad_request(format!(
+                        "参考图总大小不能超过 {} MiB。",
+                        MAX_GENERATION_REFERENCE_TOTAL_BYTES / 1024 / 1024
+                    )));
+                }
+                reference_assets_files.push(temporary_file);
             }
             _ => {}
         }
@@ -1719,25 +2614,36 @@ async fn parse_generate_multipart(
         })
         .transpose()?
         .unwrap_or_default();
+    if reference_assets_meta.len() > MAX_GENERATION_REFERENCE_COUNT {
+        return Err(AppError::bad_request(format!(
+            "参考图最多允许 {MAX_GENERATION_REFERENCE_COUNT} 张。"
+        )));
+    }
     if reference_assets_meta.len() != reference_assets_files.len() {
         return Err(AppError::bad_request("参考图文件数量与元数据数量不一致"));
     }
 
     let mut reference_assets = Vec::with_capacity(reference_assets_meta.len());
-    for (asset, (mime_type, bytes)) in reference_assets_meta
+    for (asset, temporary_file) in reference_assets_meta
         .into_iter()
-        .zip(reference_assets_files.into_iter())
+        .zip(reference_assets_files.iter())
     {
+        if asset.sha256 != temporary_file.sha256 {
+            return Err(AppError::bad_request(format!(
+                "参考图 `{}` 的哈希校验失败。",
+                asset.id
+            )));
+        }
         reference_assets.push(ImageAssetRef {
             id: asset.id,
             sha256: asset.sha256,
-            mime_type: mime_type.clone(),
-            byte_len: bytes.len() as u64,
+            mime_type: temporary_file.mime_type.clone(),
+            byte_len: temporary_file.byte_len,
             width: asset.width,
             height: asset.height,
             created_at: asset.created_at,
             updated_at: asset.updated_at,
-            data_url: Some(format!("data:{mime_type};base64,{}", BASE64.encode(&bytes))),
+            data_url: None,
             remote_object_key: None,
             remote_url: None,
             source_task_id: asset.source_task_id,
@@ -1746,7 +2652,130 @@ async fn parse_generate_multipart(
     }
 
     payload.request.reference_assets = reference_assets;
-    Ok(payload)
+    Ok(ParsedGeneratePayload {
+        payload,
+        reference_files: reference_assets_files,
+    })
+}
+
+async fn read_multipart_text_limited(
+    field: Field<'_>,
+    max_bytes: usize,
+    label: &str,
+) -> Result<String, AppError> {
+    let bytes = read_multipart_field_limited(field, max_bytes, label).await?;
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::bad_request(format!("{label}必须使用 UTF-8 编码。")))
+}
+
+async fn read_multipart_field_limited(
+    mut field: Field<'_>,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, AppError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(AppError::internal)? {
+        let next_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| AppError::bad_request(format!("{label}大小溢出。")))?;
+        if next_len > max_bytes {
+            return Err(AppError::bad_request(format!(
+                "{label}不能超过 {} MiB。",
+                max_bytes / 1024 / 1024
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn write_multipart_field_to_temp_file(
+    mut field: Field<'_>,
+    max_bytes: usize,
+    label: &str,
+    mime_type: String,
+) -> Result<TemporaryReferenceFile, AppError> {
+    tokio::fs::create_dir_all(proxy_temp_dir())
+        .await
+        .map_err(AppError::internal)?;
+    let path = proxy_temp_dir().join(format!("reference-{}.part", new_id()));
+    let mut output = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .await
+        .map_err(AppError::internal)?;
+    let mut temporary_file = TemporaryReferenceFile {
+        path,
+        mime_type,
+        byte_len: 0,
+        sha256: String::new(),
+    };
+    let mut hasher = Sha256::new();
+
+    while let Some(chunk) = field.chunk().await.map_err(AppError::internal)? {
+        let next_len = temporary_file
+            .byte_len
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| AppError::bad_request(format!("{label}大小溢出。")))?;
+        if next_len > max_bytes as u64 {
+            return Err(AppError::bad_request(format!(
+                "{label}不能超过 {} MiB。",
+                max_bytes / 1024 / 1024
+            )));
+        }
+        output.write_all(&chunk).await.map_err(AppError::internal)?;
+        hasher.update(&chunk);
+        temporary_file.byte_len = next_len;
+    }
+    output.flush().await.map_err(AppError::internal)?;
+    temporary_file.sha256 = format!("{:x}", hasher.finalize());
+    Ok(temporary_file)
+}
+
+async fn hydrate_temporary_reference_files(
+    parsed: &mut ParsedGeneratePayload,
+) -> Result<(), AppError> {
+    if parsed.payload.request.reference_assets.len() != parsed.reference_files.len() {
+        return Err(AppError::internal_message(
+            "代理生成参考图快照与临时文件数量不一致。",
+        ));
+    }
+
+    for (asset, temporary_file) in parsed
+        .payload
+        .request
+        .reference_assets
+        .iter_mut()
+        .zip(&parsed.reference_files)
+    {
+        asset.data_url = Some(load_temporary_reference_data_url(asset, temporary_file).await?);
+    }
+    parsed.reference_files.clear();
+    Ok(())
+}
+
+async fn load_temporary_reference_data_url(
+    asset: &ImageAssetRef,
+    temporary_file: &TemporaryReferenceFile,
+) -> Result<String, AppError> {
+    let bytes = tokio::fs::read(&temporary_file.path)
+        .await
+        .map_err(|error| {
+            AppError::internal_message(format!("读取代理参考图临时文件失败：{error}"))
+        })?;
+    if bytes.len() as u64 != temporary_file.byte_len || hex_sha256(&bytes) != asset.sha256 {
+        return Err(AppError::bad_request(format!(
+            "参考图 `{}` 的临时文件校验失败。",
+            asset.id
+        )));
+    }
+    Ok(format!(
+        "data:{};base64,{}",
+        temporary_file.mime_type,
+        BASE64.encode(bytes)
+    ))
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1774,13 +2803,25 @@ async fn current_user(
     else {
         return Ok(None);
     };
-    let row = sqlx::query("SELECT id, username, role, status, created_at FROM users WHERE id = ?")
-        .bind(user_id)
-        .fetch_optional(&state.db)
+    let session_version = session
+        .get::<i64>("session_version")
         .await
         .map_err(AppError::internal)?;
+    let row = sqlx::query(
+        "SELECT id, username, role, status, created_at, session_version
+         FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::internal)?;
 
     if let Some(row) = row {
+        let current_session_version = row.get::<i64, _>("session_version");
+        if session_version != Some(current_session_version) {
+            session.delete().await.map_err(AppError::internal)?;
+            return Ok(None);
+        }
         let id = row.get::<String, _>("id");
         let image_count = user_image_count(&state.db, &id).await?;
         Ok(Some(UserSummary {
@@ -1792,8 +2833,27 @@ async fn current_user(
             created_at: row.get("created_at"),
         }))
     } else {
+        session.delete().await.map_err(AppError::internal)?;
         Ok(None)
     }
+}
+
+async fn replace_session_identity(
+    session: &Session,
+    user_id: &str,
+    session_version: i64,
+) -> Result<(), AppError> {
+    session.clear().await;
+    session.cycle_id().await.map_err(AppError::internal)?;
+    session
+        .insert("user_id", user_id)
+        .await
+        .map_err(AppError::internal)?;
+    session
+        .insert("session_version", session_version)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(())
 }
 
 async fn require_user(state: &AppState, session: &Session) -> Result<UserSummary, AppError> {
@@ -1840,10 +2900,100 @@ async fn load_sync_envelope(db: &SqlitePool, user_id: &str) -> Result<SyncEnvelo
     Ok(envelope)
 }
 
+#[derive(Debug, Clone)]
+struct StoredAssetIndex {
+    id: String,
+    object_key: String,
+    mime_type: String,
+    sha256: String,
+    byte_len: i64,
+    created_at: String,
+}
+
+#[derive(Debug)]
+struct AssetIndexMutation {
+    asset_id: String,
+    previous: Option<StoredAssetIndex>,
+}
+
+#[derive(Debug, Default)]
+struct AssetNormalizationJournal {
+    index_mutations: Vec<AssetIndexMutation>,
+    new_object_keys: Vec<String>,
+}
+
+impl AssetNormalizationJournal {
+    fn record_index_mutation(&mut self, asset_id: String, previous: Option<StoredAssetIndex>) {
+        self.index_mutations
+            .push(AssetIndexMutation { asset_id, previous });
+    }
+
+    fn record_new_object(&mut self, object_key: String) {
+        if !self.new_object_keys.contains(&object_key) {
+            self.new_object_keys.push(object_key);
+        }
+    }
+
+    async fn rollback(self, state: &AppState, user_id: &str) -> Result<(), AppError> {
+        let mut first_error =
+            rollback_asset_index_mutations(&state.db, user_id, self.index_mutations)
+                .await
+                .err();
+        for object_key in self.new_object_keys.into_iter().rev() {
+            if let Err(error) = delete_object_if_unreferenced(state, user_id, &object_key).await {
+                warn!(
+                    "failed to remove rolled-back sync object {object_key}: {}",
+                    error.message
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[derive(Debug)]
+struct NormalizedSyncEnvelope {
+    envelope: SyncEnvelope,
+    journal: AssetNormalizationJournal,
+}
+
+impl NormalizedSyncEnvelope {
+    async fn rollback(self, state: &AppState, user_id: &str) -> Result<(), AppError> {
+        self.journal.rollback(state, user_id).await
+    }
+}
+
 async fn normalize_envelope_assets(
     state: &AppState,
     user_id: &str,
+    envelope: SyncEnvelope,
+) -> Result<NormalizedSyncEnvelope, AppError> {
+    if envelope.assets.len() > MAX_SYNC_ASSETS {
+        return Err(AppError::bad_request(format!(
+            "单次同步最多包含 {MAX_SYNC_ASSETS} 个图片资源。"
+        )));
+    }
+    let mut journal = AssetNormalizationJournal::default();
+    match normalize_envelope_assets_inner(state, user_id, envelope, &mut journal).await {
+        Ok(envelope) => Ok(NormalizedSyncEnvelope { envelope, journal }),
+        Err(error) => {
+            if let Err(rollback_error) = journal.rollback(state, user_id).await {
+                error!(
+                    "partial sync asset normalization rollback failed for user {}: {}",
+                    user_id, rollback_error.message
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn normalize_envelope_assets_inner(
+    state: &AppState,
+    user_id: &str,
     mut envelope: SyncEnvelope,
+    journal: &mut AssetNormalizationJournal,
 ) -> Result<SyncEnvelope, AppError> {
     for config in &mut envelope.configs {
         config.api_key_plaintext = None;
@@ -1853,15 +3003,60 @@ async fn normalize_envelope_assets(
         let mut invalidated_remote_reference = false;
         if let Some(object_key) = asset.remote_object_key.take() {
             if is_user_asset_object_key(&object_key, user_id, &asset.sha256) {
-                if object_exists(state, &object_key).await? {
+                let trusted_index = find_trusted_asset_index_for_object(
+                    &state.db,
+                    user_id,
+                    &object_key,
+                    &asset.sha256,
+                    state.config.max_upload_bytes,
+                )
+                .await?;
+                if let Some(indexed) = trusted_index
+                    && object_exists(state, &object_key).await?
+                {
                     asset.remote_object_key = Some(object_key.clone());
                     asset.remote_url = Some(format!("/api/assets/{}", asset.id));
                     asset.data_url = None;
+                    asset.mime_type = indexed.mime_type.clone();
+                    asset.byte_len = indexed.byte_len as u64;
+                    asset.sha256 = indexed.sha256;
                     let mime_type = asset.mime_type.clone();
-                    upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
+                    upsert_asset_index(state, user_id, asset, &object_key, &mime_type, journal)
+                        .await?;
                     continue;
                 }
-                delete_asset_indexes_for_object(&state.db, user_id, &object_key).await?;
+
+                if object_exists(state, &object_key).await? {
+                    // 没有服务端索引时必须读取原文件；客户端声明的 MIME 和大小均不可作为配额依据。
+                    let bytes =
+                        get_object_bytes(state, &object_key, state.config.max_upload_bytes).await?;
+                    let mime_type = detect_image_mime(&bytes).ok_or_else(|| {
+                        AppError::bad_request(format!(
+                            "同步图片 `{}` 的远程原文件格式无效。",
+                            asset.id
+                        ))
+                    })?;
+                    let actual_sha256 = hex_sha256(&bytes);
+                    if actual_sha256 != asset.sha256 {
+                        return Err(AppError::bad_request(format!(
+                            "同步图片 `{}` 的远程原文件哈希校验失败。",
+                            asset.id
+                        )));
+                    }
+                    let actual_byte_len = bytes.len() as u64;
+                    asset.mime_type = mime_type.to_string();
+                    asset.byte_len = actual_byte_len;
+                    asset.sha256 = actual_sha256;
+                    asset.remote_object_key = Some(object_key.clone());
+                    asset.remote_url = Some(format!("/api/assets/{}", asset.id));
+                    asset.data_url = None;
+                    upsert_asset_index(state, user_id, asset, &object_key, mime_type, journal)
+                        .await?;
+                    continue;
+                }
+
+                delete_asset_indexes_for_object_journaled(&state.db, user_id, &object_key, journal)
+                    .await?;
                 invalidated_remote_reference = true;
                 warn!(
                     "discarded missing synced object for user {}: {}",
@@ -1878,7 +3073,7 @@ async fn normalize_envelope_assets(
         asset.remote_url = None;
 
         if let Some((object_key, mime_type, byte_len, sha256)) =
-            find_available_indexed_asset_object(state, user_id, &asset.id).await?
+            find_available_indexed_asset_object(state, user_id, &asset.id, journal).await?
         {
             asset.remote_object_key = Some(object_key.clone());
             asset.remote_url = Some(format!("/api/assets/{}", asset.id));
@@ -1886,19 +3081,19 @@ async fn normalize_envelope_assets(
             asset.mime_type = mime_type.clone();
             asset.byte_len = byte_len.max(0) as u64;
             asset.sha256 = sha256;
-            upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
+            upsert_asset_index(state, user_id, asset, &object_key, &mime_type, journal).await?;
             continue;
         }
 
         if let Some((object_key, mime_type, byte_len)) =
-            find_available_asset_object_by_hash(state, user_id, &asset.sha256).await?
+            find_available_asset_object_by_hash(state, user_id, &asset.sha256, journal).await?
         {
             asset.remote_object_key = Some(object_key.clone());
             asset.remote_url = Some(format!("/api/assets/{}", asset.id));
             asset.data_url = None;
             asset.mime_type = mime_type.clone();
             asset.byte_len = byte_len.max(0) as u64;
-            upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
+            upsert_asset_index(state, user_id, asset, &object_key, &mime_type, journal).await?;
             continue;
         }
 
@@ -1909,12 +3104,34 @@ async fn normalize_envelope_assets(
         let Some(data_url) = asset.data_url.take() else {
             continue;
         };
-        let (mime_type, bytes) = decode_data_url(&data_url)?;
+        let (declared_mime, bytes) = decode_data_url(&data_url)?;
+        if bytes.is_empty() || bytes.len() as u64 > state.config.max_upload_bytes {
+            return Err(AppError::bad_request(format!(
+                "同步图片 `{}` 超过单文件存储限制。",
+                asset.id
+            )));
+        }
+        let mime_type = detect_image_mime(&bytes)
+            .ok_or_else(|| AppError::bad_request("同步数据包含不受支持的图片格式。"))?;
+        if declared_mime != mime_type || hex_sha256(&bytes) != asset.sha256 {
+            return Err(AppError::bad_request(format!(
+                "同步图片 `{}` 的类型或哈希校验失败。",
+                asset.id
+            )));
+        }
+        let byte_len = bytes.len() as u64;
         let object_key = format!("users/{user_id}/assets/{}.bin", asset.sha256);
-        put_object(state, &object_key, &mime_type, bytes).await?;
+        ensure_user_asset_capacity(state, user_id, &asset.id, &object_key, byte_len).await?;
+        let object_already_existed = object_exists(state, &object_key).await?;
+        put_object(state, &object_key, mime_type, bytes).await?;
+        if !object_already_existed {
+            journal.record_new_object(object_key.clone());
+        }
+        asset.mime_type = mime_type.to_string();
+        asset.byte_len = byte_len;
         asset.remote_object_key = Some(object_key.clone());
         asset.remote_url = Some(format!("/api/assets/{}", asset.id));
-        upsert_asset_index(state, user_id, asset, &object_key, &mime_type).await?;
+        upsert_asset_index_record(state, user_id, asset, &object_key, mime_type, journal).await?;
     }
     envelope.updated_at = now_rfc3339();
     Ok(envelope)
@@ -1936,10 +3153,73 @@ async fn find_indexed_asset_object(
     .map_err(AppError::internal)
 }
 
+async fn find_asset_index_record(
+    db: &SqlitePool,
+    user_id: &str,
+    asset_id: &str,
+) -> Result<Option<StoredAssetIndex>, AppError> {
+    let row = sqlx::query(
+        "SELECT id, object_key, mime_type, sha256, byte_len, created_at FROM assets
+         WHERE user_id = ? AND id = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(asset_id)
+    .fetch_optional(db)
+    .await
+    .map_err(AppError::internal)?;
+    Ok(row.map(|row| StoredAssetIndex {
+        id: row.get("id"),
+        object_key: row.get("object_key"),
+        mime_type: row.get("mime_type"),
+        sha256: row.get("sha256"),
+        byte_len: row.get("byte_len"),
+        created_at: row.get("created_at"),
+    }))
+}
+
+async fn find_trusted_asset_index_for_object(
+    db: &SqlitePool,
+    user_id: &str,
+    object_key: &str,
+    expected_sha256: &str,
+    max_bytes: u64,
+) -> Result<Option<StoredAssetIndex>, AppError> {
+    let row = sqlx::query(
+        "SELECT id, object_key, mime_type, sha256, byte_len, created_at FROM assets
+         WHERE user_id = ? AND object_key = ? AND sha256 = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(object_key)
+    .bind(expected_sha256)
+    .fetch_optional(db)
+    .await
+    .map_err(AppError::internal)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let indexed = StoredAssetIndex {
+        id: row.get("id"),
+        object_key: row.get("object_key"),
+        mime_type: row.get("mime_type"),
+        sha256: row.get("sha256"),
+        byte_len: row.get("byte_len"),
+        created_at: row.get("created_at"),
+    };
+    let metadata_is_valid = indexed.byte_len > 0
+        && u64::try_from(indexed.byte_len).is_ok_and(|length| length <= max_bytes)
+        && matches!(
+            indexed.mime_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp"
+        )
+        && is_user_asset_object_key(&indexed.object_key, user_id, &indexed.sha256);
+    Ok(metadata_is_valid.then_some(indexed))
+}
+
 async fn find_available_indexed_asset_object(
     state: &AppState,
     user_id: &str,
     asset_id: &str,
+    journal: &mut AssetNormalizationJournal,
 ) -> Result<Option<(String, String, i64, String)>, AppError> {
     let Some(indexed) = find_indexed_asset_object(&state.db, user_id, asset_id).await? else {
         return Ok(None);
@@ -1947,7 +3227,7 @@ async fn find_available_indexed_asset_object(
     if object_exists(state, &indexed.0).await? {
         return Ok(Some(indexed));
     }
-    delete_asset_indexes_for_object(&state.db, user_id, &indexed.0).await?;
+    delete_asset_indexes_for_object_journaled(&state.db, user_id, &indexed.0, journal).await?;
     Ok(None)
 }
 
@@ -1983,6 +3263,7 @@ async fn find_available_asset_object_by_hash(
     state: &AppState,
     user_id: &str,
     sha256: &str,
+    journal: &mut AssetNormalizationJournal,
 ) -> Result<Option<(String, String, i64)>, AppError> {
     loop {
         let Some(indexed) = find_existing_asset_object(&state.db, user_id, sha256).await? else {
@@ -1991,8 +3272,42 @@ async fn find_available_asset_object_by_hash(
         if object_exists(state, &indexed.0).await? {
             return Ok(Some(indexed));
         }
-        delete_asset_indexes_for_object(&state.db, user_id, &indexed.0).await?;
+        delete_asset_indexes_for_object_journaled(&state.db, user_id, &indexed.0, journal).await?;
     }
+}
+
+async fn delete_asset_indexes_for_object_journaled(
+    db: &SqlitePool,
+    user_id: &str,
+    object_key: &str,
+    journal: &mut AssetNormalizationJournal,
+) -> Result<(), AppError> {
+    let rows = sqlx::query(
+        "SELECT id, object_key, mime_type, sha256, byte_len, created_at FROM assets
+         WHERE user_id = ? AND object_key = ?",
+    )
+    .bind(user_id)
+    .bind(object_key)
+    .fetch_all(db)
+    .await
+    .map_err(AppError::internal)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    delete_asset_indexes_for_object(db, user_id, object_key).await?;
+    for row in rows {
+        let previous = StoredAssetIndex {
+            id: row.get("id"),
+            object_key: row.get("object_key"),
+            mime_type: row.get("mime_type"),
+            sha256: row.get("sha256"),
+            byte_len: row.get("byte_len"),
+            created_at: row.get("created_at"),
+        };
+        journal.record_index_mutation(previous.id.clone(), Some(previous));
+    }
+    Ok(())
 }
 
 async fn delete_asset_indexes_for_object(
@@ -2009,13 +3324,79 @@ async fn delete_asset_indexes_for_object(
     Ok(())
 }
 
+async fn rollback_asset_index_mutations(
+    db: &SqlitePool,
+    user_id: &str,
+    mutations: Vec<AssetIndexMutation>,
+) -> Result<(), AppError> {
+    if mutations.is_empty() {
+        return Ok(());
+    }
+
+    let mut transaction = db.begin().await.map_err(AppError::internal)?;
+    for mutation in mutations.into_iter().rev() {
+        if let Some(previous) = mutation.previous {
+            let result = sqlx::query(
+                "INSERT INTO assets
+                 (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                     object_key = excluded.object_key,
+                     mime_type = excluded.mime_type,
+                     sha256 = excluded.sha256,
+                     byte_len = excluded.byte_len,
+                     created_at = excluded.created_at
+                 WHERE assets.user_id = excluded.user_id",
+            )
+            .bind(&previous.id)
+            .bind(user_id)
+            .bind(&previous.object_key)
+            .bind(&previous.mime_type)
+            .bind(&previous.sha256)
+            .bind(previous.byte_len)
+            .bind(&previous.created_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?;
+            if result.rows_affected() == 0 {
+                transaction.rollback().await.map_err(AppError::internal)?;
+                return Err(AppError::internal_message(
+                    "同步图片索引回滚遇到资源 ID 冲突。",
+                ));
+            }
+        } else {
+            sqlx::query("DELETE FROM assets WHERE id = ? AND user_id = ?")
+                .bind(&mutation.asset_id)
+                .bind(user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(AppError::internal)?;
+        }
+    }
+    transaction.commit().await.map_err(AppError::internal)
+}
+
 async fn upsert_asset_index(
     state: &AppState,
     user_id: &str,
     asset: &ImageAssetRef,
     object_key: &str,
     mime_type: &str,
+    journal: &mut AssetNormalizationJournal,
 ) -> Result<(), AppError> {
+    ensure_user_asset_capacity(state, user_id, &asset.id, object_key, asset.byte_len).await?;
+    upsert_asset_index_record(state, user_id, asset, object_key, mime_type, journal).await
+}
+
+async fn upsert_asset_index_record(
+    state: &AppState,
+    user_id: &str,
+    asset: &ImageAssetRef,
+    object_key: &str,
+    mime_type: &str,
+    journal: &mut AssetNormalizationJournal,
+) -> Result<(), AppError> {
+    let previous = find_asset_index_record(&state.db, user_id, &asset.id).await?;
     let result = sqlx::query(
         "INSERT INTO assets (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2031,7 +3412,10 @@ async fn upsert_asset_index(
     .bind(object_key)
     .bind(mime_type)
     .bind(&asset.sha256)
-    .bind(asset.byte_len as i64)
+    .bind(
+        i64::try_from(asset.byte_len)
+            .map_err(|_| AppError::bad_request("图片资源大小超过数据库范围。"))?,
+    )
     .bind(&asset.created_at)
     .execute(&state.db)
     .await
@@ -2039,6 +3423,7 @@ async fn upsert_asset_index(
     if result.rows_affected() == 0 {
         return Err(AppError::bad_request("图片资源 ID 与其他用户冲突。"));
     }
+    journal.record_index_mutation(asset.id.clone(), previous);
     Ok(())
 }
 
@@ -2046,8 +3431,9 @@ async fn put_object(
     state: &AppState,
     object_key: &str,
     mime_type: &str,
-    bytes: Vec<u8>,
+    bytes: impl Into<Bytes>,
 ) -> Result<(), AppError> {
+    let bytes = bytes.into();
     match state.config.asset_store {
         AssetStoreKind::Local => {
             let path = local_object_path(&state.config.local_asset_dir, object_key)?;
@@ -2056,9 +3442,36 @@ async fn put_object(
                     .await
                     .map_err(AppError::internal)?;
             }
-            tokio::fs::write(path, bytes)
+            let expected_hash = hex_sha256(&bytes);
+            let staging_dir = PathBuf::from(&state.config.local_asset_dir).join(".staging");
+            tokio::fs::create_dir_all(&staging_dir)
                 .await
                 .map_err(AppError::internal)?;
+            let staging_path = staging_dir.join(format!("{}.upload", random_token()));
+            tokio::fs::write(&staging_path, &bytes)
+                .await
+                .map_err(AppError::internal)?;
+            if let Err(error) = tokio::fs::rename(&staging_path, &path).await {
+                let existing_matches = tokio::fs::read(&path)
+                    .await
+                    .ok()
+                    .is_some_and(|existing| hex_sha256(&existing) == expected_hash);
+                if existing_matches {
+                    let _ = tokio::fs::remove_file(&staging_path).await;
+                    return Ok(());
+                }
+                if tokio::fs::metadata(&path).await.is_ok() {
+                    tokio::fs::remove_file(&path)
+                        .await
+                        .map_err(AppError::internal)?;
+                    tokio::fs::rename(&staging_path, &path)
+                        .await
+                        .map_err(AppError::internal)?;
+                } else {
+                    let _ = tokio::fs::remove_file(&staging_path).await;
+                    return Err(AppError::internal(error));
+                }
+            }
             Ok(())
         }
         AssetStoreKind::S3 => {
@@ -2118,11 +3531,25 @@ async fn object_exists(state: &AppState, object_key: &str) -> Result<bool, AppEr
     }
 }
 
-async fn get_object_bytes(state: &AppState, object_key: &str) -> Result<Vec<u8>, AppError> {
+async fn get_object_bytes(
+    state: &AppState,
+    object_key: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, AppError> {
     match state.config.asset_store {
         AssetStoreKind::Local => {
             let path = local_object_path(&state.config.local_asset_dir, object_key)?;
-            tokio::fs::read(path).await.map_err(AppError::internal)
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .map_err(AppError::internal)?;
+            if metadata.len() > max_bytes {
+                return Err(AppError::bad_request("资源原文件超过服务器读取上限。"));
+            }
+            let bytes = tokio::fs::read(path).await.map_err(AppError::internal)?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(AppError::bad_request("资源原文件超过服务器读取上限。"));
+            }
+            Ok(bytes)
         }
         AssetStoreKind::S3 => {
             let client = state.s3.as_ref().ok_or_else(|| {
@@ -2135,18 +3562,43 @@ async fn get_object_bytes(state: &AppState, object_key: &str) -> Result<Vec<u8>,
                 .send()
                 .await
                 .map_err(AppError::internal)?;
-            Ok(output
-                .body
-                .collect()
-                .await
-                .map_err(AppError::internal)?
-                .into_bytes()
-                .to_vec())
+            if output
+                .content_length()
+                .is_some_and(|length| length < 0 || length as u64 > max_bytes)
+            {
+                return Err(AppError::bad_request("资源原文件超过服务器读取上限。"));
+            }
+            let content_length = output.content_length();
+            read_s3_body_bounded(output.body, max_bytes, content_length).await
         }
         AssetStoreKind::Disabled => Err(AppError::bad_request(
             "服务器未启用远程资源存储，当前资源无法读取。",
         )),
     }
+}
+
+async fn read_s3_body_bounded(
+    mut body: ByteStream,
+    max_bytes: u64,
+    content_length: Option<i64>,
+) -> Result<Vec<u8>, AppError> {
+    let initial_capacity = content_length
+        .and_then(|length| usize::try_from(length).ok())
+        .filter(|length| u64::try_from(*length).is_ok_and(|length| length <= max_bytes))
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(AppError::internal)?;
+        let next_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| AppError::bad_request("资源原文件大小溢出。"))?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
+            return Err(AppError::bad_request("资源原文件超过服务器读取上限。"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn delete_object(state: &AppState, object_key: &str) -> Result<(), AppError> {
@@ -2251,24 +3703,43 @@ async fn user_image_count(db: &SqlitePool, user_id: &str) -> Result<usize, AppEr
 }
 
 fn resolve_client_ip(config: &AppConfig, headers: &HeaderMap, peer_addr: SocketAddr) -> IpAddr {
-    if config.trust_proxy_headers {
-        if let Some(ip) = headers
-            .get("x-real-ip")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse().ok())
+    let peer_ip = peer_addr.ip();
+    if !config.trust_proxy_headers || !is_trusted_proxy(config, peer_ip) {
+        return peer_ip;
+    }
+
+    if let Some(value) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    {
+        let mut chain = value
+            .split(',')
+            .filter_map(|value| value.trim().parse::<IpAddr>().ok())
+            .collect::<Vec<_>>();
+        chain.push(peer_ip);
+        if let Some(client_ip) = chain
+            .into_iter()
+            .rev()
+            .find(|ip| !is_trusted_proxy(config, *ip))
         {
-            return ip;
-        }
-        if let Some(ip) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-            .and_then(|value| value.trim().parse().ok())
-        {
-            return ip;
+            return client_ip;
         }
     }
-    peer_addr.ip()
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+    {
+        return ip;
+    }
+    peer_ip
+}
+
+fn is_trusted_proxy(config: &AppConfig, ip: IpAddr) -> bool {
+    config
+        .trusted_proxy_cidrs
+        .iter()
+        .any(|network| network.contains(&ip))
 }
 
 fn registration_device_id(cookies: &Cookies, config: &AppConfig) -> String {
@@ -2559,7 +4030,6 @@ fn validate_template(
             template.kind,
             &template.base_url,
             true,
-            true,
             require_custom_host_whitelist,
         )?;
     }
@@ -2576,40 +4046,30 @@ fn validate_generate_request(
     user: Option<&UserSummary>,
     payload: &GenerateViaProxyRequest,
 ) -> Result<(), AppError> {
-    if user.is_none() && !state.config.enable_guest_proxy {
+    let user_is_approved = user.is_some_and(|user| user.status == "approved");
+    if !user_is_approved && !state.config.enable_guest_proxy {
         return Err(AppError::unauthorized(
             "当前部署已关闭游客代理，请登录后再试。",
         ));
     }
 
-    let require_custom_login = matches!(payload.template.kind, ProviderKind::CustomHttp)
-        && state.config.require_login_for_custom_provider;
-    if require_custom_login && user.is_none() {
+    if matches!(payload.template.kind, ProviderKind::CustomHttp) && !user_is_approved {
         return Err(AppError::unauthorized(
-            "自定义服务商仅对登录用户开放，请先登录。",
+            "自定义服务商仅对已审批的登录用户开放。",
         ));
     }
 
     validate_template(
         state,
         &payload.template,
-        state.config.enforce_provider_host_whitelist
-            && matches!(
-                payload.template.kind,
-                ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp
-            ),
+        state.config.enforce_provider_host_whitelist,
     )?;
     let _ = resolve_upstream_target(
         state,
         payload.template.kind,
         &payload.config.base_url,
-        user.is_some(),
         false,
-        state.config.enforce_provider_host_whitelist
-            && matches!(
-                payload.template.kind,
-                ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp
-            ),
+        state.config.enforce_provider_host_whitelist,
     )?;
     Ok(())
 }
@@ -2618,7 +4078,6 @@ fn resolve_provider_base_url(
     state: &AppState,
     kind: ProviderKind,
     configured_base_url: &str,
-    user_present: bool,
 ) -> Result<String, AppError> {
     let default_base_url = match kind {
         ProviderKind::OpenAiImage => Some("https://api.openai.com"),
@@ -2638,13 +4097,8 @@ fn resolve_provider_base_url(
         state,
         kind,
         &base_url,
-        user_present,
         false,
-        state.config.enforce_provider_host_whitelist
-            && matches!(
-                kind,
-                ProviderKind::OpenAiCompatible | ProviderKind::CustomHttp
-            ),
+        state.config.enforce_provider_host_whitelist,
     )?;
     Ok(target.base_url)
 }
@@ -2653,7 +4107,6 @@ fn resolve_upstream_target(
     state: &AppState,
     kind: ProviderKind,
     base_url: &str,
-    user_present: bool,
     require_https: bool,
     enforce_custom_whitelist: bool,
 ) -> Result<ResolvedUpstreamTarget, AppError> {
@@ -2664,9 +4117,9 @@ fn resolve_upstream_target(
             "仅允许 http/https 上游地址。",
         ));
     }
-    if require_https && url.scheme() != "https" {
+    if (require_https || !state.config.allow_insecure_upstreams) && url.scheme() != "https" {
         return Err(AppError::provider_target_blocked(
-            "当前上游仅允许 HTTPS 地址。",
+            "当前上游仅允许 HTTPS 地址；如确需明文 HTTP，部署者必须显式开启兼容开关。",
         ));
     }
 
@@ -2690,10 +4143,8 @@ fn resolve_upstream_target(
         allowed_hosts.insert(host.to_ascii_lowercase());
     }
 
-    let requires_trusted_host = enforce_custom_whitelist
-        || (state.config.enforce_provider_host_whitelist
-            && (!matches!(kind, ProviderKind::OpenAiImage | ProviderKind::NanoBanana)
-                || user_present));
+    // 游客可使用任意安全公网 HTTPS 标准上游；白名单只在部署者显式开启时生效。
+    let requires_trusted_host = enforce_custom_whitelist;
     if requires_trusted_host && !host_matches_allowlist(&host, &allowed_hosts) {
         return Err(AppError::provider_target_blocked(format!(
             "上游 `{host}` 不在受信任白名单中；可关闭 `MEW_ENFORCE_HOST_WHITELIST`，或将该域名加入 `MEW_TRUSTED_HOSTS`。"
@@ -2729,19 +4180,36 @@ fn reject_unsafe_host(host: &str) -> Result<(), AppError> {
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
+            let [first, second, third, _] = ipv4.octets();
             ipv4.is_private()
                 || ipv4.is_loopback()
                 || ipv4.is_link_local()
                 || ipv4.is_broadcast()
                 || ipv4.is_documentation()
-                || ipv4.octets()[0] == 0
+                || first == 0
+                || first == 100 && (second & 0b1100_0000) == 0b0100_0000
+                || first == 192 && second == 0 && third == 0
+                || first == 192 && second == 88 && third == 99
+                || first == 198 && matches!(second, 18 | 19)
+                || first >= 224
         }
         IpAddr::V6(ipv6) => {
+            let segments = ipv6.segments();
+            if let Some(mapped) = ipv6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(mapped));
+            }
+
+            // 公网 IPv6 当前位于 2000::/3；其余地址保守视作内部、保留或特殊用途地址。
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
                 || ipv6.is_unique_local()
                 || ipv6.is_unicast_link_local()
-                || ipv6.segments()[0] == 0x2001 && ipv6.segments()[1] == 0x0db8
+                || ipv6.is_multicast()
+                || segments[0] & 0xe000 != 0x2000
+                || segments[0] == 0x2001 && segments[1] == 0
+                || segments[0] == 0x2001 && segments[1] == 2
+                || segments[0] == 0x2001 && segments[1] == 0x0db8
+                || segments[0] == 0x2002
         }
     }
 }
@@ -2756,6 +4224,382 @@ fn host_matches_allowlist(host: &str, allowed_hosts: &BTreeSet<String>) -> bool 
     })
 }
 
+async fn prepare_upstream_request(
+    state: &AppState,
+    raw_url: &str,
+    kind: UpstreamRequestKind,
+) -> Result<PreparedUpstreamRequest, AppError> {
+    let url =
+        Url::parse(raw_url).map_err(|_| AppError::provider_target_blocked("上游地址格式无效。"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::provider_target_blocked(
+            "仅允许访问 HTTP/HTTPS 上游。",
+        ));
+    }
+    if url.scheme() != "https" && !state.config.allow_insecure_upstreams {
+        return Err(AppError::provider_target_blocked(
+            "上游必须使用 HTTPS；明文 HTTP 默认关闭。",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::provider_target_blocked(
+            "上游地址不得在 URL 中携带账号或密码。",
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::provider_target_blocked("上游地址缺少主机名。"))?
+        .to_ascii_lowercase();
+    reject_unsafe_host(&host)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| AppError::provider_target_blocked("无法确定上游端口。"))?;
+    let lookup = tokio::time::timeout(
+        StdDuration::from_secs(5),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| AppError::bad_gateway("上游 DNS 解析超时。"))?
+    .map_err(|error| {
+        warn!("upstream DNS resolution failed for {host}: {error}");
+        AppError::bad_gateway("上游 DNS 解析失败。")
+    })?;
+    let mut addresses = lookup.collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(AppError::bad_gateway("上游域名没有可用的解析地址。"));
+    }
+    if addresses.iter().any(|address| is_private_ip(address.ip())) {
+        return Err(AppError::provider_target_blocked(
+            "上游域名解析到了本机、私网、保留或链路本地地址。",
+        ));
+    }
+
+    // 固定本次请求已校验的地址，避免校验后再次解析造成 DNS rebinding。
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(StdDuration::from_secs(10))
+        .no_proxy()
+        .resolve_to_addrs(&host, &addresses);
+    builder = match kind {
+        UpstreamRequestKind::Generation => builder
+            .read_timeout(StdDuration::from_secs(10 * 60))
+            .timeout(PROXY_GENERATION_JOB_TIMEOUT),
+        UpstreamRequestKind::Image => builder
+            .read_timeout(StdDuration::from_secs(30))
+            .timeout(StdDuration::from_secs(2 * 60)),
+    };
+    let client = builder.build().map_err(AppError::internal)?;
+    Ok(PreparedUpstreamRequest { client, url })
+}
+
+fn upstream_transport_error(label: &str, error: &reqwest::Error) -> AppError {
+    let reason = if error.is_timeout() {
+        "请求超时"
+    } else if error.is_connect() {
+        "连接失败"
+    } else if error.is_request() {
+        "请求构建失败"
+    } else if error.is_body() {
+        "请求或响应正文读取失败"
+    } else {
+        "网络请求失败"
+    };
+    warn!(
+        "{label} upstream transport error (timeout={}, connect={}, request={}, body={})",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request(),
+        error.is_body()
+    );
+    AppError::bad_gateway(format!("{label}{reason}。"))
+}
+
+async fn read_response_bytes_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, AppError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(AppError::bad_gateway(format!(
+            "{label}响应超过 {} MiB 安全上限。",
+            max_bytes / 1024 / 1024
+        )));
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| upstream_transport_error(label, &error))?
+    {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| AppError::bad_gateway(format!("{label}响应大小溢出。")))?;
+        if next_len > max_bytes {
+            return Err(AppError::bad_gateway(format!(
+                "{label}响应超过 {} MiB 安全上限。",
+                max_bytes / 1024 / 1024
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn read_error_body_prefix(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(Vec<u8>, bool), AppError> {
+    let mut body = Vec::with_capacity(max_bytes.min(16 * 1024));
+    let mut truncated = response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64);
+    loop {
+        let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| upstream_transport_error(label, &error))?
+        else {
+            break;
+        };
+        if body.len() == max_bytes {
+            truncated = true;
+            break;
+        }
+        let remaining = max_bytes - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, truncated))
+}
+
+fn is_sensitive_json_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "apikey",
+        "accesstoken",
+        "refreshtoken",
+        "authorization",
+        "cookie",
+        "credential",
+        "password",
+        "secret",
+        "sessionid",
+        "setcookie",
+    ]
+    .iter()
+    .any(|candidate| normalized.contains(candidate))
+        || normalized == "token"
+}
+
+fn redact_sensitive_json_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                if is_sensitive_json_key(key) {
+                    *value = serde_json::Value::String("[REDACTED]".into());
+                } else {
+                    redact_sensitive_json_fields(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_sensitive_json_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn clean_control_characters(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+}
+
+fn redact_bearer_tokens(value: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let lowercase_bytes = lowercase.as_bytes();
+    let original_bytes = value.as_bytes();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = lowercase[cursor..].find("bearer ") {
+        let start = cursor + relative_start;
+        let token_start = start + "bearer ".len();
+        let mut token_end = token_start;
+        while token_end < original_bytes.len()
+            && !matches!(
+                original_bytes[token_end],
+                b' ' | b'\t' | b'\r' | b'\n' | b'\"' | b'\'' | b',' | b'<' | b'>' | b'}'
+            )
+        {
+            token_end += 1;
+        }
+        output.push_str(&value[cursor..start]);
+        output.push_str("Bearer [REDACTED]");
+        cursor = token_end;
+        if cursor >= lowercase_bytes.len() {
+            break;
+        }
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn redact_sensitive_header_lines(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| {
+            let normalized = line.trim_start().to_ascii_lowercase();
+            if [
+                "authorization:",
+                "cookie:",
+                "set-cookie:",
+                "x-api-key:",
+                "api-key:",
+            ]
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
+            {
+                let name = line.split_once(':').map(|(name, _)| name).unwrap_or(line);
+                format!("{name}: [REDACTED]")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_large_encoded_blocks(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0usize;
+    let mut encoded_start = None;
+    for (index, character) in value
+        .char_indices()
+        .chain(std::iter::once((value.len(), ' ')))
+    {
+        let looks_encoded =
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=' | '-' | '_');
+        if looks_encoded {
+            encoded_start.get_or_insert(index);
+            continue;
+        }
+        let Some(start) = encoded_start.take() else {
+            continue;
+        };
+        if index.saturating_sub(start) < 256 {
+            continue;
+        }
+        output.push_str(&value[cursor..start]);
+        output.push_str("[LARGE_ENCODED_DATA_REDACTED]");
+        cursor = index;
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[已截断]", &value[..end])
+}
+
+fn sanitize_upstream_error_body(body: &[u8], api_key: &str, truncated: bool) -> String {
+    let lossy = String::from_utf8_lossy(body);
+    let mut sanitized = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&lossy) {
+        redact_sensitive_json_fields(&mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| clean_control_characters(&lossy))
+    } else {
+        redact_sensitive_header_lines(&lossy)
+    };
+    sanitized = clean_control_characters(&sanitized);
+    if !api_key.is_empty() {
+        sanitized = sanitized.replace(api_key, "[REDACTED]");
+    }
+    sanitized = redact_bearer_tokens(&sanitized);
+    sanitized = redact_large_encoded_blocks(&sanitized);
+    sanitized = truncate_utf8(sanitized.trim(), MAX_UPSTREAM_ERROR_BYTES);
+    if sanitized.is_empty() {
+        sanitized.push_str("上游未返回错误正文");
+    }
+    if truncated && !sanitized.ends_with("[已截断]") {
+        sanitized.push_str("…[已截断]");
+    }
+    sanitized
+}
+
+async fn upstream_response_error(
+    response: reqwest::Response,
+    label: &str,
+    api_key: &str,
+) -> AppError {
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(clean_control_characters)
+        .map(|value| truncate_utf8(value.trim(), 256));
+    let body = match read_error_body_prefix(response, MAX_UPSTREAM_ERROR_BYTES, label).await {
+        Ok((body, truncated)) => sanitize_upstream_error_body(&body, api_key, truncated),
+        Err(error) => return error,
+    };
+    let request_id = request_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("，request_id={value}"))
+        .unwrap_or_default();
+    warn!("{label} upstream error: HTTP {status}{request_id}, {body}");
+    AppError::bad_gateway(format!(
+        "{label}上游请求失败：HTTP {status}{request_id}，{body}"
+    ))
+}
+
+async fn parse_upstream_json_response(
+    response: reqwest::Response,
+    label: &str,
+    api_key: &str,
+) -> Result<serde_json::Value, AppError> {
+    if !response.status().is_success() {
+        return Err(upstream_response_error(response, label, api_key).await);
+    }
+    let body = read_response_bytes_limited(response, MAX_UPSTREAM_RESPONSE_BYTES, label).await?;
+    serde_json::from_slice(&body).map_err(|error| {
+        warn!("{label} returned invalid JSON: {error}");
+        AppError::bad_gateway(format!("{label}返回了无法解析的 JSON。"))
+    })
+}
+
 fn ensure_object_storage_ready(state: &AppState) -> Result<(), AppError> {
     match state.config.asset_store {
         AssetStoreKind::Local => Ok(()),
@@ -2766,23 +4610,140 @@ fn ensure_object_storage_ready(state: &AppState) -> Result<(), AppError> {
     }
 }
 
-fn ensure_upload_token_not_expired(row: &sqlx::sqlite::SqliteRow) -> Result<(), AppError> {
-    let expires_at = row.get::<String, _>("expires_at");
-    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at).map_err(|error| {
-        AppError::internal_message(format!("上传凭证过期时间解析失败：{error}"))
-    })?;
-    if expires_at.with_timezone(&Utc) <= Utc::now() {
-        return Err(AppError::bad_request("上传凭证已过期，请重新发起上传。"));
+async fn lease_upload_token(
+    state: &AppState,
+    user_id: &str,
+    token: &str,
+) -> Result<sqlx::sqlite::SqliteRow, AppError> {
+    let now = now_rfc3339();
+    let lease_expires_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+    sqlx::query(
+        "UPDATE upload_tokens SET expires_at = ?
+         WHERE token = ? AND user_id = ? AND expires_at > ?
+         RETURNING asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at",
+    )
+    .bind(lease_expires_at)
+    .bind(token)
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::internal)?
+    .ok_or_else(|| AppError::not_found("上传凭证不存在、已过期或不属于当前用户。"))
+}
+
+async fn periodically_cleanup_expired_uploads(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(StdDuration::from_secs(15 * 60));
+    loop {
+        interval.tick().await;
+        if let Err(error) = cleanup_expired_upload_tokens(&state).await {
+            warn!("expired upload cleanup failed: {}", error.message);
+        }
+        if let Err(error) = cleanup_local_staging_files(&state).await {
+            warn!("local upload staging cleanup failed: {}", error.message);
+        }
+        cleanup_stale_proxy_temp_dirs().await;
+    }
+}
+
+async fn cleanup_local_staging_files(state: &AppState) -> Result<(), AppError> {
+    if state.config.asset_store != AssetStoreKind::Local {
+        return Ok(());
+    }
+    let staging_dir = PathBuf::from(&state.config.local_asset_dir).join(".staging");
+    let mut entries = match tokio::fs::read_dir(&staging_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(AppError::internal(error)),
+    };
+    while let Some(entry) = entries.next_entry().await.map_err(AppError::internal)? {
+        let metadata = entry.metadata().await.map_err(AppError::internal)?;
+        let is_expired = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= StdDuration::from_secs(30 * 60));
+        if metadata.is_file() && is_expired {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
     }
     Ok(())
 }
 
-async fn cleanup_expired_upload_tokens(db: &SqlitePool) -> Result<(), AppError> {
-    sqlx::query("DELETE FROM upload_tokens WHERE expires_at <= ?")
-        .bind(now_rfc3339())
-        .execute(db)
+async fn cleanup_expired_upload_tokens(state: &AppState) -> Result<(), AppError> {
+    let now = now_rfc3339();
+    let rows = sqlx::query("SELECT DISTINCT object_key FROM upload_tokens WHERE expires_at <= ?")
+        .bind(&now)
+        .fetch_all(&state.db)
         .await
         .map_err(AppError::internal)?;
+    for row in rows {
+        let object_key = row.get::<String, _>("object_key");
+        let live_references = sqlx::query_scalar::<_, i64>(
+            "SELECT
+                (SELECT COUNT(*) FROM assets WHERE object_key = ?) +
+                (SELECT COUNT(*) FROM upload_tokens
+                 WHERE object_key = ? AND expires_at > ?)",
+        )
+        .bind(&object_key)
+        .bind(&object_key)
+        .bind(&now)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+        if live_references == 0
+            && let Err(error) = delete_object(state, &object_key).await
+        {
+            // 保留过期凭证作为可重试的清理记录，避免暂时的对象存储故障制造永久孤儿。
+            warn!(
+                "expired upload object cleanup failed for {object_key}: {}",
+                error.message
+            );
+            continue;
+        }
+        sqlx::query("DELETE FROM upload_tokens WHERE object_key = ? AND expires_at <= ?")
+            .bind(&object_key)
+            .bind(&now)
+            .execute(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    Ok(())
+}
+
+async fn delete_object_if_unreferenced(
+    state: &AppState,
+    user_id: &str,
+    object_key: &str,
+) -> Result<(), AppError> {
+    let references = if user_id.is_empty() {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT
+                (SELECT COUNT(*) FROM assets WHERE object_key = ?) +
+                (SELECT COUNT(*) FROM upload_tokens WHERE object_key = ?)",
+        )
+        .bind(object_key)
+        .bind(object_key)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT
+                (SELECT COUNT(*) FROM assets WHERE user_id = ? AND object_key = ?) +
+                (SELECT COUNT(*) FROM upload_tokens WHERE user_id = ? AND object_key = ?)",
+        )
+        .bind(user_id)
+        .bind(object_key)
+        .bind(user_id)
+        .bind(object_key)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?
+    };
+    if references == 0 {
+        delete_object(state, object_key).await?;
+    }
     Ok(())
 }
 
@@ -2790,10 +4751,14 @@ fn decode_data_url(data_url: &str) -> Result<(String, Vec<u8>), AppError> {
     let Some((meta, data)) = data_url.split_once(',') else {
         return Err(AppError::bad_request("无效的数据 URL"));
     };
-    let mime_type = meta
-        .trim_start_matches("data:")
-        .trim_end_matches(";base64")
-        .to_string();
+    let meta = meta
+        .strip_prefix("data:")
+        .ok_or_else(|| AppError::bad_request("无效的数据 URL"))?;
+    let mut parts = meta.split(';');
+    let mime_type = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    if !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return Err(AppError::bad_request("图片数据 URL 必须使用 Base64 编码。"));
+    }
     let bytes = BASE64
         .decode(data)
         .map_err(|_| AppError::bad_request("资源 Base64 无效"))?;
@@ -2809,25 +4774,6 @@ fn local_object_path(base_dir: &str, object_key: &str) -> Result<PathBuf, AppErr
         }
     }
     Ok(path)
-}
-
-fn sanitize_file_name(file_name: &str) -> String {
-    let sanitized = file_name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let sanitized = sanitized.trim_matches('_').trim_matches('.');
-    if sanitized.is_empty() {
-        "asset.bin".into()
-    } else {
-        sanitized.chars().take(120).collect()
-    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -2905,12 +4851,8 @@ async fn invoke_openai_image(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let base_url = resolve_provider_base_url(
-        state,
-        ProviderKind::OpenAiImage,
-        &payload.config.base_url,
-        true,
-    )?;
+    let base_url =
+        resolve_provider_base_url(state, ProviderKind::OpenAiImage, &payload.config.base_url)?;
     let url = join_api_url(
         &base_url,
         match payload.config.endpoint_mode {
@@ -2919,8 +4861,11 @@ async fn invoke_openai_image(
             ProviderEndpointMode::CustomJson => payload.template.endpoint_path.as_str(),
         },
     );
-
-    let request = state.http.post(url).bearer_auth(api_key);
+    let prepared = prepare_upstream_request(state, &url, UpstreamRequestKind::Generation).await?;
+    let request = prepared
+        .client
+        .post(prepared.url.clone())
+        .bearer_auth(&api_key);
 
     let response = if payload.config.endpoint_mode == ProviderEndpointMode::ImagesApi
         && !payload.request.reference_assets.is_empty()
@@ -2965,10 +4910,11 @@ async fn invoke_openai_image(
         if supports_configurable_input_fidelity(&payload.request.model) {
             form = form.text("input_fidelity", "high");
         }
-        request.multipart(form).send().await.map_err(|error| {
-            warn!("openai image multipart request failed: {}", error);
-            AppError::bad_gateway("OpenAI-Image 图像编辑请求失败")
-        })?
+        request
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| upstream_transport_error("Images API", &error))?
     } else if payload.config.endpoint_mode == ProviderEndpointMode::ResponsesApi {
         let mut content = vec![json!({
             "type": "input_text",
@@ -3022,10 +4968,11 @@ async fn invoke_openai_image(
             "tool_choice": "required",
             "stream": true,
         });
-        request.json(&body).send().await.map_err(|error| {
-            warn!("openai image responses request failed: {}", error);
-            AppError::bad_gateway("Responses API 请求失败")
-        })?
+        request
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| upstream_transport_error("Responses API", &error))?
     } else {
         let mut body = json!({
             "prompt": payload.request.prompt,
@@ -3043,73 +4990,68 @@ async fn invoke_openai_image(
         ) {
             body["output_compression"] = json!(compression);
         }
-        request.json(&body).send().await.map_err(|error| {
-            warn!("openai image json request failed: {}", error);
-            AppError::bad_gateway("Images API 请求失败")
-        })?
+        request
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| upstream_transport_error("Images API", &error))?
     };
 
     if payload.config.endpoint_mode == ProviderEndpointMode::ResponsesApi {
-        let status = response.status();
         let is_event_stream = response
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(|value| value.contains("text/event-stream"))
             .unwrap_or(false);
-        if !status.is_success() {
-            let request_id = response
-                .headers()
-                .get("x-request-id")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body = response.text().await.map_err(AppError::internal)?;
-            let request_id = request_id
-                .as_deref()
-                .map(|value| format!("，request_id={value}"))
-                .unwrap_or_default();
-            return Err(AppError::bad_gateway(format!(
-                "Responses API 上游请求失败：HTTP {status}{request_id}，{body}"
-            )));
+        if !response.status().is_success() {
+            return Err(upstream_response_error(response, "Responses API", &api_key).await);
         }
         if is_event_stream {
             let mut response = response;
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_UPSTREAM_RESPONSE_BYTES as u64)
+            {
+                return Err(AppError::bad_gateway(
+                    "Responses API 响应超过 256 MiB 安全上限。",
+                ));
+            }
             let mut accumulator = OpenAiResponsesStreamAccumulator::new();
-            while let Some(chunk) = response.chunk().await.map_err(|error| {
-                AppError::bad_gateway(format!("Responses API 流读取失败：{error}"))
-            })? {
+            let mut total_bytes = 0usize;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| upstream_transport_error("Responses API", &error))?
+            {
+                total_bytes = total_bytes
+                    .checked_add(chunk.len())
+                    .ok_or_else(|| AppError::bad_gateway("Responses API 响应大小溢出。"))?;
+                if total_bytes > MAX_UPSTREAM_RESPONSE_BYTES {
+                    return Err(AppError::bad_gateway(
+                        "Responses API 响应超过 256 MiB 安全上限。",
+                    ));
+                }
                 accumulator
                     .push_chunk(&chunk)
                     .map_err(AppError::bad_gateway)?;
             }
             return accumulator.finish().map_err(AppError::bad_gateway);
         }
-        let body = response.text().await.map_err(AppError::internal)?;
+        let body =
+            read_response_bytes_limited(response, MAX_UPSTREAM_RESPONSE_BYTES, "Responses API")
+                .await?;
+        let body = String::from_utf8(body)
+            .map_err(|_| AppError::bad_gateway("Responses API 返回了非 UTF-8 响应。"))?;
         if body.trim_start().starts_with("data:") {
             return parse_openai_responses_event_stream(&body).map_err(AppError::bad_gateway);
         }
-        return serde_json::from_str(&body).map_err(AppError::internal);
+        return serde_json::from_str(&body).map_err(|error| {
+            warn!("Responses API returned invalid JSON: {error}");
+            AppError::bad_gateway("Responses API 返回了无法解析的 JSON。")
+        });
     }
-
-    let status = response.status();
-    if !status.is_success() {
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response.text().await.map_err(AppError::internal)?;
-        let request_id = request_id
-            .as_deref()
-            .map(|value| format!("，request_id={value}"))
-            .unwrap_or_default();
-        warn!("Images API upstream error: HTTP {status}{request_id}, {body}");
-        return Err(AppError::bad_gateway(format!(
-            "Images API 上游请求失败：HTTP {status}{request_id}，{body}"
-        )));
-    }
-
-    response.json().await.map_err(AppError::internal)
+    parse_upstream_json_response(response, "Images API", &api_key).await
 }
 
 async fn invoke_openai_compatible_image(
@@ -3125,15 +5067,15 @@ async fn invoke_openai_compatible_image(
         state,
         ProviderKind::OpenAiCompatible,
         &payload.config.base_url,
-        true,
     )?;
     let url = join_api_url(&base_url, openai_compatible_endpoint(&payload.request));
+    let prepared = prepare_upstream_request(state, &url, UpstreamRequestKind::Generation).await?;
 
     let response = if payload.request.reference_assets.is_empty() {
-        state
-            .http
-            .post(url)
-            .header("Authorization", format!("Bearer {api_key}"))
+        prepared
+            .client
+            .post(prepared.url.clone())
+            .bearer_auth(&api_key)
             .header("Accept", "application/json")
             .json(&json!({
                 "model": payload.request.model,
@@ -3146,10 +5088,7 @@ async fn invoke_openai_compatible_image(
             }))
             .send()
             .await
-            .map_err(|error| {
-                warn!("openai compatible request failed: {}", error);
-                AppError::bad_gateway("OpenAI 兼容请求失败")
-            })?
+            .map_err(|error| upstream_transport_error("OpenAI 兼容接口", &error))?
     } else {
         let mut form = reqwest::multipart::Form::new()
             .text("model", payload.request.model.clone())
@@ -3178,21 +5117,18 @@ async fn invoke_openai_compatible_image(
                 .map_err(AppError::internal)?;
             form = form.part("image", part);
         }
-        state
-            .http
-            .post(url)
-            .header("Authorization", format!("Bearer {api_key}"))
+        prepared
+            .client
+            .post(prepared.url.clone())
+            .bearer_auth(&api_key)
             .header("Accept", "application/json")
             .multipart(form)
             .send()
             .await
-            .map_err(|error| {
-                warn!("openai compatible multipart request failed: {}", error);
-                AppError::bad_gateway("OpenAI 兼容请求失败")
-            })?
+            .map_err(|error| upstream_transport_error("OpenAI 兼容接口", &error))?
     };
 
-    response.json().await.map_err(AppError::internal)
+    parse_upstream_json_response(response, "OpenAI 兼容接口", &api_key).await
 }
 
 async fn invoke_nano_banana(
@@ -3204,12 +5140,8 @@ async fn invoke_nano_banana(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let base_url = resolve_provider_base_url(
-        state,
-        ProviderKind::NanoBanana,
-        &payload.config.base_url,
-        true,
-    )?;
+    let base_url =
+        resolve_provider_base_url(state, ProviderKind::NanoBanana, &payload.config.base_url)?;
     let model = if is_google_official_gemini_base_url(&base_url) {
         normalize_google_image_model(&payload.request.model)
     } else {
@@ -3219,22 +5151,20 @@ async fn invoke_nano_banana(
         return Err(AppError::bad_request("当前配置缺少 Gemini 模型名称"));
     }
     let url = gemini_generate_content_url(&base_url, &model);
+    let prepared = prepare_upstream_request(state, &url, UpstreamRequestKind::Generation).await?;
     let body = build_gemini_payload(state, payload, &model).await?;
     let (auth_header, auth_value) = gemini_auth_header(&base_url, &api_key);
-    let response = state
-        .http
-        .post(url)
+    let response = prepared
+        .client
+        .post(prepared.url)
         .header("Accept", "application/json")
         .header(auth_header, auth_value)
         .json(&body)
         .send()
         .await
-        .map_err(|error| {
-            warn!("nano banana request failed: {}", error);
-            AppError::bad_gateway("Nano Banana 请求失败")
-        })?;
+        .map_err(|error| upstream_transport_error("Nano Banana", &error))?;
 
-    response.json().await.map_err(AppError::internal)
+    parse_upstream_json_response(response, "Nano Banana", &api_key).await
 }
 
 async fn invoke_custom_http(
@@ -3246,17 +5176,14 @@ async fn invoke_custom_http(
         .api_key_plaintext
         .clone()
         .ok_or_else(|| AppError::bad_request("当前配置缺少 API Key"))?;
-    let base_url = resolve_provider_base_url(
-        state,
-        ProviderKind::CustomHttp,
-        &payload.config.base_url,
-        true,
-    )?;
+    let base_url =
+        resolve_provider_base_url(state, ProviderKind::CustomHttp, &payload.config.base_url)?;
     let url = format!(
         "{}{}",
         base_url.trim_end_matches('/'),
         payload.template.endpoint_path
     );
+    let prepared = prepare_upstream_request(state, &url, UpstreamRequestKind::Generation).await?;
     let mut body = json!({});
     set_json_path(
         &mut body,
@@ -3287,26 +5214,23 @@ async fn invoke_custom_http(
         set_json_path(&mut body, path, json!(quality));
     }
 
-    let response = state
-        .http
+    let response = prepared
+        .client
         .request(
             payload
                 .template
                 .method
                 .parse()
                 .map_err(|_| AppError::bad_request("自定义模板 HTTP 方法无效"))?,
-            url,
+            prepared.url,
         )
-        .header(&payload.template.auth_header, format!("Bearer {}", api_key))
+        .header(&payload.template.auth_header, format!("Bearer {api_key}"))
         .json(&body)
         .send()
         .await
-        .map_err(|error| {
-            warn!("custom provider request failed: {}", error);
-            AppError::bad_gateway("自定义服务商请求失败")
-        })?;
+        .map_err(|error| upstream_transport_error("自定义服务商", &error))?;
 
-    response.json().await.map_err(AppError::internal)
+    parse_upstream_json_response(response, "自定义服务商", &api_key).await
 }
 
 fn mime_extension(mime_type: &str) -> &'static str {
@@ -3329,9 +5253,9 @@ async fn hydrate_proxy_result_images(
         let Some(url) = image.url.clone() else {
             continue;
         };
-        if let Ok((mime_type, bytes)) = fetch_remote_image_bytes(state, &url).await {
-            image.data_url = Some(format!("data:{mime_type};base64,{}", BASE64.encode(bytes)));
-        }
+        // URL 往往带短期签名；必须在任务成功前固化原图，避免画廊只剩失效链接。
+        let (mime_type, bytes) = fetch_remote_image_bytes(state, &url).await?;
+        image.data_url = Some(format!("data:{mime_type};base64,{}", BASE64.encode(bytes)));
     }
     Ok(result)
 }
@@ -3340,9 +5264,74 @@ async fn fetch_remote_image_bytes(
     state: &AppState,
     image_url: &str,
 ) -> Result<(String, Vec<u8>), AppError> {
-    let parsed =
+    let mut current_url =
         Url::parse(image_url).map_err(|_| AppError::bad_request("上游返回了无效的图片地址。"))?;
-    let host = parsed
+    for redirect_count in 0..=MAX_REMOTE_IMAGE_REDIRECTS {
+        validate_remote_image_target(state, &current_url)?;
+        let prepared =
+            prepare_upstream_request(state, current_url.as_str(), UpstreamRequestKind::Image)
+                .await?;
+        let response = prepared
+            .client
+            .get(prepared.url.clone())
+            .header(header::ACCEPT, "image/png,image/jpeg,image/webp")
+            .send()
+            .await
+            .map_err(|error| upstream_transport_error("下载上游图片", &error))?;
+
+        if response.status().is_redirection() {
+            if redirect_count == MAX_REMOTE_IMAGE_REDIRECTS {
+                return Err(AppError::bad_gateway(format!(
+                    "上游图片重定向超过 {MAX_REMOTE_IMAGE_REDIRECTS} 次安全上限。"
+                )));
+            }
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .ok_or_else(|| AppError::bad_gateway("上游图片重定向缺少 Location。"))?
+                .to_str()
+                .map_err(|_| AppError::bad_gateway("上游图片重定向地址无效。"))?;
+            current_url = current_url
+                .join(location)
+                .map_err(|_| AppError::bad_gateway("上游图片重定向地址无效。"))?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(AppError::bad_gateway(format!(
+                "下载上游图片失败：HTTP {}",
+                response.status()
+            )));
+        }
+        let declared_mime = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .map(str::to_ascii_lowercase);
+        let bytes =
+            read_response_bytes_limited(response, MAX_REMOTE_IMAGE_BYTES, "下载上游图片").await?;
+        let detected_mime = detect_image_mime(&bytes).ok_or_else(|| {
+            AppError::bad_gateway("上游返回内容不是受支持的 PNG、JPEG 或 WebP 图片。")
+        })?;
+        if declared_mime
+            .as_deref()
+            .is_some_and(|declared| declared != detected_mime)
+        {
+            warn!(
+                "remote image content type mismatch: declared={:?}, detected={detected_mime}",
+                declared_mime
+            );
+        }
+        return Ok((detected_mime.to_string(), bytes));
+    }
+
+    Err(AppError::bad_gateway("下载上游图片失败。"))
+}
+
+fn validate_remote_image_target(state: &AppState, url: &Url) -> Result<(), AppError> {
+    let host = url
         .host_str()
         .ok_or_else(|| AppError::provider_target_blocked("上游返回的图片地址缺少主机名。"))?
         .to_ascii_lowercase();
@@ -3362,25 +5351,20 @@ async fn fetch_remote_image_bytes(
             "上游返回的图片地址 `{host}` 不在允许的下载白名单中；可关闭 `MEW_ENFORCE_HOST_WHITELIST`，或将该域名加入 `MEW_TRUSTED_HOSTS`。"
         )));
     }
+    Ok(())
+}
 
-    let response = state.http.get(parsed).send().await.map_err(|error| {
-        warn!("remote image fetch failed: {}", error);
-        AppError::bad_gateway("下载上游图片失败")
-    })?;
-    if !response.status().is_success() {
-        return Err(AppError::bad_gateway(format!(
-            "下载上游图片失败：HTTP {}",
-            response.status()
-        )));
+fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
     }
-    let mime_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("image/png")
-        .to_string();
-    let bytes = response.bytes().await.map_err(AppError::internal)?.to_vec();
-    Ok((mime_type, bytes))
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 #[derive(serde::Deserialize)]
@@ -3457,7 +5441,6 @@ fn extract_generation_result(
                     },
                     raw_response_json: Some(serde_json::json!({
                         "parse_error": error,
-                        "upstream_response": response_json,
                     })),
                 },
             };
@@ -3511,7 +5494,8 @@ fn extract_generation_result(
             revised_prompt,
             duration_ms: Some(duration_ms),
         },
-        raw_response_json: Some(response_json),
+        // Base64/URL 已提取到 images，避免代理结果再次携带整份上游 JSON。
+        raw_response_json: None,
     }
 }
 
@@ -3555,7 +5539,12 @@ async fn resolve_asset_bytes(
         .remote_object_key
         .as_ref()
         .ok_or_else(|| AppError::bad_request("资源缺少可读取的图像数据"))?;
-    let bytes = get_object_bytes(state, object_key).await?;
+    let bytes = get_object_bytes(
+        state,
+        object_key,
+        MAX_GENERATION_REFERENCE_FILE_BYTES as u64,
+    )
+    .await?;
     Ok((asset.mime_type.clone(), bytes))
 }
 
@@ -3730,8 +5719,12 @@ impl IntoResponse for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mew_image_shared::{GenerationRequest, ProviderEndpointMode, SyncTombstone};
+    use mew_image_shared::{
+        EncryptedApiConfig, GenerationRequest, ProviderAccessMode, ProviderEndpointMode,
+        SyncTombstone,
+    };
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use tower_sessions::{MemoryStore, SessionStore};
 
     fn test_config(local_asset_dir: String) -> AppConfig {
         AppConfig {
@@ -3740,6 +5733,7 @@ mod tests {
             frontend_dist: String::new(),
             session_secure: false,
             trust_proxy_headers: false,
+            trusted_proxy_cidrs: Vec::new(),
             auth_secret: "test-auth-secret".into(),
             register_device_limit: 3,
             register_ip_limit: 10,
@@ -3752,8 +5746,14 @@ mod tests {
             allowed_web_origins: Vec::new(),
             trusted_provider_hosts: Vec::new(),
             enforce_provider_host_whitelist: false,
+            allow_insecure_upstreams: false,
             enable_guest_proxy: true,
-            require_login_for_custom_provider: true,
+            guest_generation_concurrency: 4,
+            guest_image_concurrency: 2,
+            guest_generation_rate_limit: 30,
+            guest_image_rate_limit: 120,
+            guest_rate_window_seconds: 600,
+            proxy_memory_budget_mib: 384,
             admin_setup_token: None,
             allow_first_admin_setup: false,
             asset_store: AssetStoreKind::Local,
@@ -3763,6 +5763,11 @@ mod tests {
             s3_endpoint: None,
             s3_access_key: None,
             s3_secret_key: None,
+            max_upload_bytes: 64 * 1024 * 1024,
+            user_asset_quota_bytes: 10 * 1024 * 1024 * 1024,
+            user_asset_quota_count: 20_000,
+            user_pending_upload_bytes: 256 * 1024 * 1024,
+            user_pending_upload_count: 32,
         }
     }
 
@@ -3781,15 +5786,454 @@ mod tests {
             config: test_config(local_asset_dir),
             db: test_db().await,
             s3: None,
-            http: reqwest::Client::new(),
             provider_builtins: Vec::new(),
             generation_job_slots: Arc::new(tokio::sync::Semaphore::new(
                 MAX_ACTIVE_PROXY_GENERATION_JOBS,
             )),
+            generation_temp_budget: Arc::new(tokio::sync::Semaphore::new(384)),
+            generation_memory_budget: Arc::new(tokio::sync::Semaphore::new(384)),
             generation_jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            user_data_write_locks: Arc::new(
+                (0..USER_DATA_WRITE_LOCK_SHARDS)
+                    .map(|_| tokio::sync::Mutex::new(()))
+                    .collect(),
+            ),
             auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             dummy_password_hash: hash_password("dummy").unwrap(),
+            guest_proxy_limits: Arc::new(GuestProxyLimits::default()),
         }
+    }
+
+    fn test_png_bytes(label: &[u8]) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(label);
+        bytes
+    }
+
+    fn test_sync_asset(
+        id: &str,
+        sha256: &str,
+        mime_type: &str,
+        byte_len: u64,
+        data_url: Option<String>,
+        remote_object_key: Option<String>,
+    ) -> ImageAssetRef {
+        let now = now_rfc3339();
+        ImageAssetRef {
+            id: id.into(),
+            sha256: sha256.into(),
+            mime_type: mime_type.into(),
+            byte_len,
+            width: None,
+            height: None,
+            created_at: now.clone(),
+            updated_at: now,
+            data_url,
+            remote_object_key,
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    async fn insert_test_user(
+        db: &SqlitePool,
+        user_id: &str,
+        username: &str,
+        password_hash: &str,
+        role: &str,
+        status: &str,
+        session_version: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO users
+             (id, username, password_hash, role, status, session_version, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(password_hash)
+        .bind(role)
+        .bind(status)
+        .bind(session_version)
+        .bind(now_rfc3339())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    async fn authenticated_test_session(
+        store: Arc<MemoryStore>,
+        user_id: &str,
+        session_version: i64,
+    ) -> Session {
+        let session = Session::new(None, store, None);
+        replace_session_identity(&session, user_id, session_version)
+            .await
+            .unwrap();
+        session.save().await.unwrap();
+        session
+    }
+
+    fn test_proxy_request(kind: ProviderKind) -> GenerateViaProxyRequest {
+        let now = now_rfc3339();
+        let mut template = ProviderTemplate::builtin_openai();
+        template.kind = kind;
+        template.base_url = "https://api.example.com".into();
+        template.id = format!("test-{kind:?}");
+
+        GenerateViaProxyRequest {
+            config: EncryptedApiConfig {
+                id: "config-1".into(),
+                name: "test".into(),
+                provider_template_id: template.id.clone(),
+                provider_kind: kind,
+                endpoint_mode: ProviderEndpointMode::ImagesApi,
+                base_url: template.base_url.clone(),
+                model: "test-model".into(),
+                responses_model: None,
+                access_mode: ProviderAccessMode::Proxy,
+                known_requires_proxy: true,
+                output_format: Some("png".into()),
+                output_compression: None,
+                background: Some("auto".into()),
+                moderation: None,
+                api_key_plaintext: Some("test-key".into()),
+                api_key_encrypted: None,
+                api_key_hint: None,
+                prompt_guard_enabled: false,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            request: GenerationRequest {
+                prompt: "test".into(),
+                model: "test-model".into(),
+                width: 1024,
+                height: 1024,
+                quality: None,
+                count: 1,
+                endpoint_mode: ProviderEndpointMode::ImagesApi,
+                reference_assets: Vec::new(),
+            },
+            template,
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_session_identity_cycles_id_and_clears_pre_auth_data() {
+        let store = Arc::new(MemoryStore::default());
+        let session = Session::new(None, store.clone(), None);
+        session.insert("pre_auth", "temporary").await.unwrap();
+        session.save().await.unwrap();
+        let old_id = session.id().unwrap();
+
+        replace_session_identity(&session, "user-1", 7)
+            .await
+            .unwrap();
+        session.save().await.unwrap();
+
+        assert_ne!(session.id(), Some(old_id));
+        assert_eq!(session.get::<String>("pre_auth").await.unwrap(), None);
+        assert_eq!(
+            session.get::<String>("user_id").await.unwrap().as_deref(),
+            Some("user-1")
+        );
+        assert_eq!(
+            session.get::<i64>("session_version").await.unwrap(),
+            Some(7)
+        );
+        assert!(store.load(&old_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_login_rotates_existing_session_id() {
+        let state = Arc::new(test_app_state(String::new()).await);
+        let password = "OldSecure1!";
+        insert_test_user(
+            &state.db,
+            "user-login",
+            "login-user",
+            &hash_password(password).unwrap(),
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        let store = Arc::new(MemoryStore::default());
+        let session = Session::new(None, store.clone(), None);
+        session.insert("pre_auth", "temporary").await.unwrap();
+        session.save().await.unwrap();
+        let old_id = session.id().unwrap();
+
+        let _ = login(
+            State(state),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12000))),
+            HeaderMap::new(),
+            session.clone(),
+            Json(AuthRequest {
+                username: "login-user".into(),
+                password: password.into(),
+            }),
+        )
+        .await
+        .unwrap();
+        session.save().await.unwrap();
+
+        assert_ne!(session.id(), Some(old_id));
+        assert_eq!(
+            session.get::<String>("user_id").await.unwrap().as_deref(),
+            Some("user-login")
+        );
+        assert!(store.load(&old_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn password_change_invalidates_other_sessions_and_refreshes_current_one() {
+        let state = Arc::new(test_app_state(String::new()).await);
+        let old_password = "OldSecure1!";
+        insert_test_user(
+            &state.db,
+            "user-password",
+            "password-user",
+            &hash_password(old_password).unwrap(),
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        let store = Arc::new(MemoryStore::default());
+        let current = authenticated_test_session(store.clone(), "user-password", 0).await;
+        let other = authenticated_test_session(store, "user-password", 0).await;
+
+        change_password(
+            State(state.clone()),
+            current.clone(),
+            Json(ChangePasswordRequest {
+                old_password: old_password.into(),
+                new_password: "NewSecure2!".into(),
+                new_password_confirm: "NewSecure2!".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            current.get::<i64>("session_version").await.unwrap(),
+            Some(1)
+        );
+        assert!(current_user(&state, &current).await.unwrap().is_some());
+        assert!(current_user(&state, &other).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn account_status_changes_invalidate_sessions_and_gate_cloud_routes() {
+        let state = test_app_state(String::new()).await;
+        insert_test_user(
+            &state.db,
+            "user-status",
+            "status-user",
+            "hash",
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        let store = Arc::new(MemoryStore::default());
+        let approved_session = authenticated_test_session(store.clone(), "user-status", 0).await;
+
+        update_user_status(&state, "user-status", "disabled", None)
+            .await
+            .unwrap();
+        assert!(
+            current_user(&state, &approved_session)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let disabled_session = authenticated_test_session(store.clone(), "user-status", 1).await;
+        assert!(require_user(&state, &disabled_session).await.is_ok());
+        assert!(
+            require_approved_user(&state, &disabled_session)
+                .await
+                .is_err()
+        );
+
+        update_user_status(&state, "user-status", "approved", Some("admin-1"))
+            .await
+            .unwrap();
+        assert!(
+            current_user(&state, &disabled_session)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let restored_session = authenticated_test_session(store, "user-status", 2).await;
+        assert!(
+            require_approved_user(&state, &restored_session)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_write_revalidation_rejects_session_invalidated_after_initial_check() {
+        let state = test_app_state(String::new()).await;
+        insert_test_user(
+            &state.db,
+            "user-locked-write",
+            "locked-write-user",
+            "hash",
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        let session =
+            authenticated_test_session(Arc::new(MemoryStore::default()), "user-locked-write", 0)
+                .await;
+        let initially_approved = require_approved_user(&state, &session).await.unwrap();
+
+        sqlx::query(
+            "UPDATE users SET status = 'disabled', session_version = session_version + 1
+             WHERE id = ?",
+        )
+        .bind(&initially_approved.id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let error =
+            revalidate_locked_approved_user(&state, &session, initially_approved.id.as_str())
+                .await
+                .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(current_user(&state, &session).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_role_change_invalidates_other_sessions() {
+        let mut state = test_app_state(String::new()).await;
+        state.config.allow_first_admin_setup = true;
+        state.config.admin_setup_token = Some("setup-token".into());
+        insert_test_user(
+            &state.db,
+            "user-bootstrap",
+            "bootstrap-user",
+            "hash",
+            "user",
+            "pending",
+            0,
+        )
+        .await;
+        let state = Arc::new(state);
+        let store = Arc::new(MemoryStore::default());
+        let current = authenticated_test_session(store.clone(), "user-bootstrap", 0).await;
+        let other = authenticated_test_session(store, "user-bootstrap", 0).await;
+
+        let response = bootstrap_admin(
+            State(state.clone()),
+            current.clone(),
+            Json(AdminBootstrapRequest {
+                admin_setup_token: "setup-token".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.user.role, "admin");
+        assert_eq!(response.user.status, "approved");
+        assert_eq!(
+            current.get::<i64>("session_version").await.unwrap(),
+            Some(1)
+        );
+        assert!(current_user(&state, &other).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_and_disabled_users_only_receive_guest_proxy_permissions() {
+        let state = test_app_state(String::new()).await;
+        let standard_request = test_proxy_request(ProviderKind::OpenAiImage);
+        let custom_request = test_proxy_request(ProviderKind::CustomHttp);
+
+        for status in ["pending", "disabled"] {
+            let user = UserSummary {
+                id: format!("user-{status}"),
+                username: status.into(),
+                role: "user".into(),
+                status: status.into(),
+                image_count: 0,
+                created_at: now_rfc3339(),
+            };
+            assert!(validate_generate_request(&state, Some(&user), &standard_request).is_ok());
+            let error =
+                validate_generate_request(&state, Some(&user), &custom_request).unwrap_err();
+            assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        }
+
+        let approved = UserSummary {
+            id: "user-approved".into(),
+            username: "approved".into(),
+            role: "user".into(),
+            status: "approved".into(),
+            image_count: 0,
+            created_at: now_rfc3339(),
+        };
+        assert!(validate_generate_request(&state, Some(&approved), &custom_request).is_ok());
+    }
+
+    #[tokio::test]
+    async fn private_provider_templates_are_scoped_and_only_visible_when_approved() {
+        let mut state = test_app_state(String::new()).await;
+        state.provider_builtins = vec![ProviderTemplate::builtin_openai()];
+        for (id, username, status) in [
+            ("user-a", "alice", "approved"),
+            ("user-b", "bob", "approved"),
+            ("user-pending", "pending-user", "pending"),
+        ] {
+            insert_test_user(&state.db, id, username, "hash", "user", status, 0).await;
+            let mut template = ProviderTemplate::builtin_openai();
+            template.id = "shared-template-id".into();
+            template.name = format!("template-{id}");
+            let payload = serde_json::to_string(&template).unwrap();
+            sqlx::query(
+                "INSERT INTO provider_templates
+                 (user_id, id, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(&template.id)
+            .bind(payload)
+            .bind(&template.created_at)
+            .bind(&template.updated_at)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        let state = Arc::new(state);
+        let store = Arc::new(MemoryStore::default());
+        let approved = authenticated_test_session(store.clone(), "user-a", 0).await;
+        let pending = authenticated_test_session(store, "user-pending", 0).await;
+
+        let approved_templates = list_provider_templates(State(state.clone()), approved)
+            .await
+            .unwrap()
+            .0;
+        let pending_templates = list_provider_templates(State(state), pending)
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(approved_templates.len(), 2);
+        assert!(
+            approved_templates
+                .iter()
+                .any(|item| item.name == "template-user-a")
+        );
+        assert!(
+            !approved_templates
+                .iter()
+                .any(|item| item.name == "template-user-b")
+        );
+        assert_eq!(pending_templates.len(), 1);
     }
 
     #[test]
@@ -3802,6 +6246,7 @@ mod tests {
                 state: ProxyGenerationJobState::Running,
                 updated_at: now - PROXY_GENERATION_RESULT_TTL - StdDuration::from_secs(1),
                 abort_handle: None,
+                memory_permit: None,
             },
         );
         jobs.insert(
@@ -3810,6 +6255,7 @@ mod tests {
                 state: ProxyGenerationJobState::Failed("expired".into()),
                 updated_at: now - PROXY_GENERATION_RESULT_TTL - StdDuration::from_secs(1),
                 abort_handle: None,
+                memory_permit: None,
             },
         );
         for index in 0..=MAX_STORED_PROXY_GENERATION_JOBS {
@@ -3819,6 +6265,7 @@ mod tests {
                     state: ProxyGenerationJobState::Failed("failed".into()),
                     updated_at: now - StdDuration::from_secs(index as u64),
                     abort_handle: None,
+                    memory_permit: None,
                 },
             );
         }
@@ -3843,6 +6290,52 @@ mod tests {
         assert!(slots.clone().try_acquire_owned().is_err());
         drop(permits);
         assert!(slots.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn response_extension_holds_byte_budget_until_response_is_dropped() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = budget.clone().acquire_owned().await.unwrap();
+        let mut response = StatusCode::OK.into_response();
+        response.extensions_mut().insert(ResponseMemoryPermit {
+            _permit: Arc::new(permit),
+        });
+
+        assert!(budget.clone().try_acquire_owned().is_err());
+        drop(response);
+        assert!(budget.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn generation_memory_estimate_uses_references_pixels_and_fixed_overhead() {
+        let mut state = test_app_state(String::new()).await;
+        state.config.proxy_memory_budget_mib = 512;
+        let request = GenerationRequest {
+            prompt: "test".into(),
+            model: "gpt-image-2".into(),
+            width: 1024,
+            height: 1024,
+            quality: None,
+            count: 2,
+            endpoint_mode: ProviderEndpointMode::ImagesApi,
+            reference_assets: vec![ImageAssetRef {
+                id: "asset".into(),
+                sha256: "hash".into(),
+                mime_type: "image/png".into(),
+                byte_len: 8 * 1024 * 1024,
+                width: None,
+                height: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+                data_url: None,
+                remote_object_key: None,
+                remote_url: None,
+                source_task_id: None,
+                metadata: Default::default(),
+            }],
+        };
+
+        assert_eq!(estimate_generation_memory_permits(&state, &request), 72);
     }
 
     #[test]
@@ -4002,11 +6495,85 @@ mod tests {
     fn private_ip_detection_covers_v4_and_v6() {
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(239, 1, 1, 1))));
         assert!(is_private_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert!(is_private_ip(IpAddr::V6(
             "fd00::1".parse::<Ipv6Addr>().unwrap()
         )));
+        assert!(is_private_ip(IpAddr::V6(
+            "::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_private_ip(IpAddr::V6(
+            "ff02::1".parse::<Ipv6Addr>().unwrap()
+        )));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_ip(IpAddr::V6(
+            "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    #[test]
+    fn upstream_error_sanitization_redacts_credentials_and_controls() {
+        let body = br#"{
+            "error": {
+                "api_key": "another-secret",
+                "authorization": "Bearer upstream-token",
+                "message": "request failed for caller-key\u0000"
+            }
+        }"#;
+        let sanitized = sanitize_upstream_error_body(body, "caller-key", false);
+
+        assert!(!sanitized.contains("another-secret"));
+        assert!(!sanitized.contains("upstream-token"));
+        assert!(!sanitized.contains("caller-key"));
+        assert!(!sanitized.contains('\0'));
+        assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn upstream_error_sanitization_removes_cookies_and_large_encoded_data() {
+        let encoded = "A".repeat(512);
+        let body = format!("Cookie: session=secret\nupstream payload: {encoded}");
+        let sanitized = sanitize_upstream_error_body(body.as_bytes(), "", false);
+
+        assert!(!sanitized.contains("session=secret"));
+        assert!(!sanitized.contains(&encoded));
+        assert!(sanitized.contains("[LARGE_ENCODED_DATA_REDACTED]"));
+    }
+
+    #[test]
+    fn image_mime_is_derived_from_magic_bytes() {
+        assert_eq!(
+            detect_image_mime(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(detect_image_mime(b"\xff\xd8\xffrest"), Some("image/jpeg"));
+        assert_eq!(
+            detect_image_mime(b"RIFF\x00\x00\x00\x00WEBPrest"),
+            Some("image/webp")
+        );
+        assert_eq!(detect_image_mime(b"GIF89arest"), None);
+        assert_eq!(detect_image_mime(b"<html>error</html>"), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_s3_reader_accepts_exact_limit() {
+        let bytes = read_s3_body_bounded(ByteStream::from(vec![1_u8, 2, 3, 4]), 4, Some(4))
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn bounded_s3_reader_rejects_stream_larger_than_limit() {
+        let error = read_s3_body_bounded(ByteStream::from(vec![0_u8; 5]), 4, None)
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("读取上限"));
     }
 
     #[test]
@@ -4022,9 +6589,11 @@ mod tests {
 
         assert_eq!(resolve_client_ip(&config, &headers, peer), peer.ip());
         config.trust_proxy_headers = true;
+        assert_eq!(resolve_client_ip(&config, &headers, peer), peer.ip());
+        config.trusted_proxy_cidrs = vec!["172.18.0.0/16".parse().unwrap()];
         assert_eq!(
             resolve_client_ip(&config, &headers, peer),
-            "198.51.100.7".parse::<IpAddr>().unwrap()
+            "203.0.113.9".parse::<IpAddr>().unwrap()
         );
     }
 
@@ -4123,6 +6692,422 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_reservation_enforces_user_byte_quota_atomically() {
+        let mut state = test_app_state(String::new()).await;
+        state.config.user_asset_quota_bytes = 100;
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES ('asset-a', 'user-a', 'users/user-a/assets/a.bin',
+                     'image/png', 'a', 80, ?)",
+        )
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let expires_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+        let reservation = UploadReservation {
+            user_id: "user-a",
+            asset_id: "asset-b",
+            token: "token-b",
+            object_key: "users/user-a/assets/b.bin",
+            mime_type: "image/png",
+            byte_len: 30,
+            sha256: "b",
+            expires_at: &expires_at,
+        };
+
+        let error = reserve_upload_token(&state, reservation).await.unwrap_err();
+        assert!(error.message.contains("配额已满"));
+        let token_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_tokens")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(token_count, 0);
+    }
+
+    #[tokio::test]
+    async fn underreported_asset_index_cannot_bypass_user_byte_quota() {
+        let mut state = test_app_state(String::new()).await;
+        state.config.user_asset_quota_bytes = 100;
+        let underreported_object_key = "users/user-a/assets/shared.bin";
+        for (asset_id, object_key, sha256, byte_len) in [
+            ("asset-a", "users/user-a/assets/a.bin", "a", 80_i64),
+            ("asset-shared", underreported_object_key, "shared", 1_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO assets
+                 (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+                 VALUES (?, 'user-a', ?, 'image/png', ?, ?, ?)",
+            )
+            .bind(asset_id)
+            .bind(object_key)
+            .bind(sha256)
+            .bind(byte_len)
+            .bind(now_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let error = ensure_user_asset_capacity(
+            &state,
+            "user-a",
+            "asset-shared",
+            underreported_object_key,
+            30,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("配额已满"));
+
+        let expires_at = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+        let mut connection = state.db.acquire().await.unwrap();
+        let reservation = UploadReservation {
+            user_id: "user-a",
+            asset_id: "asset-shared",
+            token: "direct-token",
+            object_key: underreported_object_key,
+            mime_type: "image/png",
+            byte_len: 30,
+            sha256: "shared",
+            expires_at: &expires_at,
+        };
+        let error = reserve_upload_token_on_connection(&mut connection, &state, &reservation)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("配额已满"));
+        drop(connection);
+
+        let reservation = UploadReservation {
+            token: "transaction-token",
+            ..reservation
+        };
+        let error = reserve_upload_token(&state, reservation).await.unwrap_err();
+        assert!(error.message.contains("配额已满"));
+        let token_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_tokens")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(token_count, 0);
+    }
+
+    #[tokio::test]
+    async fn active_upload_token_is_leased_but_expired_token_cannot_be_revived() {
+        let state = test_app_state(String::new()).await;
+        let active_expiry = (Utc::now() + Duration::minutes(1)).to_rfc3339();
+        let expired_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+        for (token, expires_at) in [
+            ("active-token", active_expiry.as_str()),
+            ("expired-token", expired_at.as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO upload_tokens
+                 (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
+                 VALUES (?, ?, 'user-a', ?, 'image/png', 4, ?, ?)",
+            )
+            .bind(token)
+            .bind(format!("asset-{token}"))
+            .bind(format!("users/user-a/assets/{token}.bin"))
+            .bind(format!("hash-{token}"))
+            .bind(expires_at)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        let leased = lease_upload_token(&state, "user-a", "active-token")
+            .await
+            .unwrap();
+        assert!(leased.get::<String, _>("expires_at") > active_expiry);
+        assert!(
+            lease_upload_token(&state, "user-a", "expired-token")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_upload_cleanup_keeps_live_shared_object_then_removes_it() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        let object_key = "users/user-a/assets/shared.bin";
+        put_object(&state, object_key, "image/png", b"image".to_vec())
+            .await
+            .unwrap();
+        for (token, expires_at) in [
+            (
+                "expired-token",
+                (Utc::now() - Duration::minutes(1)).to_rfc3339(),
+            ),
+            (
+                "active-token",
+                (Utc::now() + Duration::minutes(5)).to_rfc3339(),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO upload_tokens
+                 (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
+                 VALUES (?, ?, 'user-a', ?, 'image/png', 5, 'shared', ?)",
+            )
+            .bind(token)
+            .bind(format!("asset-{token}"))
+            .bind(object_key)
+            .bind(expires_at)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        cleanup_expired_upload_tokens(&state).await.unwrap();
+        assert!(object_exists(&state, object_key).await.unwrap());
+        let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_tokens")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+
+        sqlx::query("UPDATE upload_tokens SET expires_at = ?")
+            .bind((Utc::now() - Duration::minutes(1)).to_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        cleanup_expired_upload_tokens(&state).await.unwrap();
+        assert!(!object_exists(&state, object_key).await.unwrap());
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
+    async fn expired_upload_cleanup_retries_when_object_store_is_unavailable() {
+        let mut state = test_app_state(String::new()).await;
+        state.config.asset_store = AssetStoreKind::S3;
+        sqlx::query(
+            "INSERT INTO upload_tokens
+             (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
+             VALUES ('expired-token', 'asset-a', 'user-a', 'users/user-a/assets/a.bin',
+                     'image/png', 1, 'a', ?)",
+        )
+        .bind((Utc::now() - Duration::minutes(1)).to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        cleanup_expired_upload_tokens(&state).await.unwrap();
+        let remaining = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM upload_tokens")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_remote_object_uses_trusted_server_metadata() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        let bytes = test_png_bytes(b"trusted-index");
+        let sha256 = hex_sha256(&bytes);
+        let object_key = format!("users/user-1/assets/{sha256}.bin");
+        put_object(&state, &object_key, "image/png", bytes.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES ('server-asset', 'user-1', ?, 'image/png', ?, ?, ?)",
+        )
+        .bind(&object_key)
+        .bind(&sha256)
+        .bind(i64::try_from(bytes.len()).unwrap())
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let envelope = SyncEnvelope {
+            assets: vec![test_sync_asset(
+                "client-alias",
+                &sha256,
+                "image/jpeg",
+                1,
+                None,
+                Some(object_key),
+            )],
+            ..SyncEnvelope::default()
+        };
+
+        let normalized = normalize_envelope_assets(&state, "user-1", envelope)
+            .await
+            .unwrap();
+        let asset = &normalized.envelope.assets[0];
+        assert_eq!(asset.mime_type, "image/png");
+        assert_eq!(asset.byte_len, bytes.len() as u64);
+        let stored = find_indexed_asset_object(&state.db, "user-1", "client-alias")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.1, "image/png");
+        assert_eq!(stored.2, bytes.len() as i64);
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
+    async fn sync_rejects_excessive_asset_count_before_storage_work() {
+        let state = test_app_state(String::new()).await;
+        let asset = test_sync_asset("asset", "hash", "image/png", 1, None, None);
+        let envelope = SyncEnvelope {
+            assets: vec![asset; MAX_SYNC_ASSETS + 1],
+            ..SyncEnvelope::default()
+        };
+
+        let error = normalize_envelope_assets(&state, "user-1", envelope)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("最多包含"));
+    }
+
+    #[tokio::test]
+    async fn sync_unindexed_remote_object_validates_actual_metadata_and_quota() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let mut state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        let bytes = test_png_bytes(b"unindexed-object");
+        let sha256 = hex_sha256(&bytes);
+        let object_key = format!("users/user-1/assets/{sha256}.bin");
+        put_object(&state, &object_key, "image/png", bytes.clone())
+            .await
+            .unwrap();
+        let spoofed_asset = || {
+            test_sync_asset(
+                "unindexed-asset",
+                &sha256,
+                "image/jpeg",
+                1,
+                None,
+                Some(object_key.clone()),
+            )
+        };
+
+        state.config.user_asset_quota_bytes = bytes.len() as u64 - 1;
+        let error = normalize_envelope_assets(
+            &state,
+            "user-1",
+            SyncEnvelope {
+                assets: vec![spoofed_asset()],
+                ..SyncEnvelope::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("配额已满"));
+
+        state.config.user_asset_quota_bytes = bytes.len() as u64;
+        let normalized = normalize_envelope_assets(
+            &state,
+            "user-1",
+            SyncEnvelope {
+                assets: vec![spoofed_asset()],
+                ..SyncEnvelope::default()
+            },
+        )
+        .await
+        .unwrap();
+        let asset = &normalized.envelope.assets[0];
+        assert_eq!(asset.mime_type, "image/png");
+        assert_eq!(asset.byte_len, bytes.len() as u64);
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
+    async fn sync_normalization_rolls_back_prior_assets_when_later_asset_fails() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+
+        let old_bytes = test_png_bytes(b"old-index");
+        let old_sha256 = hex_sha256(&old_bytes);
+        let old_object_key = format!("users/user-1/assets/{old_sha256}.bin");
+        put_object(&state, &old_object_key, "image/png", old_bytes.clone())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES ('overwritten-asset', 'user-1', ?, 'image/png', ?, ?, ?)",
+        )
+        .bind(&old_object_key)
+        .bind(&old_sha256)
+        .bind(i64::try_from(old_bytes.len()).unwrap())
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let remote_bytes = test_png_bytes(b"replacement-index");
+        let remote_sha256 = hex_sha256(&remote_bytes);
+        let remote_object_key = format!("users/user-1/assets/{remote_sha256}.bin");
+        put_object(&state, &remote_object_key, "image/png", remote_bytes)
+            .await
+            .unwrap();
+        let new_bytes = test_png_bytes(b"new-object");
+        let new_sha256 = hex_sha256(&new_bytes);
+        let new_object_key = format!("users/user-1/assets/{new_sha256}.bin");
+        let invalid_bytes = test_png_bytes(b"invalid-hash");
+        let envelope = SyncEnvelope {
+            assets: vec![
+                test_sync_asset(
+                    "new-asset",
+                    &new_sha256,
+                    "image/png",
+                    new_bytes.len() as u64,
+                    Some(format!(
+                        "data:image/png;base64,{}",
+                        BASE64.encode(&new_bytes)
+                    )),
+                    None,
+                ),
+                test_sync_asset(
+                    "overwritten-asset",
+                    &remote_sha256,
+                    "image/jpeg",
+                    1,
+                    None,
+                    Some(remote_object_key.clone()),
+                ),
+                test_sync_asset(
+                    "invalid-asset",
+                    "not-the-real-hash",
+                    "image/png",
+                    invalid_bytes.len() as u64,
+                    Some(format!(
+                        "data:image/png;base64,{}",
+                        BASE64.encode(invalid_bytes)
+                    )),
+                    None,
+                ),
+            ],
+            ..SyncEnvelope::default()
+        };
+
+        assert!(
+            normalize_envelope_assets(&state, "user-1", envelope)
+                .await
+                .is_err()
+        );
+        assert!(
+            find_indexed_asset_object(&state.db, "user-1", "new-asset")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let restored = find_indexed_asset_object(&state.db, "user-1", "overwritten-asset")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.0, old_object_key);
+        assert_eq!(restored.3, old_sha256);
+        assert!(!object_exists(&state, &new_object_key).await.unwrap());
+        assert!(object_exists(&state, &remote_object_key).await.unwrap());
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
     async fn sync_normalization_discards_index_when_object_file_is_missing() {
         let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
         let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
@@ -4165,7 +7150,7 @@ mod tests {
         let normalized = normalize_envelope_assets(&state, "user-1", envelope)
             .await
             .unwrap();
-        let asset = &normalized.assets[0];
+        let asset = &normalized.envelope.assets[0];
         assert!(asset.remote_object_key.is_none());
         assert!(asset.remote_url.is_none());
         assert!(asset.updated_at > old_updated_at);
@@ -4219,6 +7204,50 @@ mod tests {
             result.parameter_snapshot.revised_prompt.as_deref(),
             Some("better prompt")
         );
+    }
+
+    #[tokio::test]
+    async fn temporary_reference_is_verified_encoded_and_removed_on_drop() {
+        let path = std::env::temp_dir().join(format!("mew-reference-test-{}.part", new_id()));
+        let bytes = b"\x89PNG\r\n\x1a\nreference";
+        tokio::fs::write(&path, bytes).await.unwrap();
+        let temporary_file = TemporaryReferenceFile {
+            path: path.clone(),
+            mime_type: "image/png".into(),
+            byte_len: bytes.len() as u64,
+            sha256: hex_sha256(bytes),
+        };
+        let asset = ImageAssetRef {
+            id: "reference-1".into(),
+            sha256: temporary_file.sha256.clone(),
+            mime_type: temporary_file.mime_type.clone(),
+            byte_len: temporary_file.byte_len,
+            width: None,
+            height: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            data_url: None,
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        };
+
+        let data_url = load_temporary_reference_data_url(&asset, &temporary_file)
+            .await
+            .unwrap();
+        assert_eq!(
+            data_url,
+            format!("data:image/png;base64,{}", BASE64.encode(bytes))
+        );
+        tokio::fs::write(&path, b"tampered").await.unwrap();
+        assert!(
+            load_temporary_reference_data_url(&asset, &temporary_file)
+                .await
+                .is_err()
+        );
+        drop(temporary_file);
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -4294,6 +7323,270 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
+    async fn tombstone_cleanup_keeps_object_referenced_by_an_active_upload() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        let object_key = "users/user-1/assets/active-upload.bin";
+        put_object(&state, object_key, "image/png", b"image".to_vec())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES ('deleted-asset', 'user-1', ?, 'image/png', 'shared', 5, ?)",
+        )
+        .bind(object_key)
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_tokens
+             (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
+             VALUES ('active-token', 'uploading-asset', 'user-1', ?, 'image/png', 5, 'shared', ?)",
+        )
+        .bind(object_key)
+        .bind((Utc::now() + Duration::minutes(5)).to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let envelope = SyncEnvelope {
+            tombstones: vec![SyncTombstone {
+                entity_kind: SyncEntityKind::Asset,
+                entity_id: "deleted-asset".into(),
+                deleted_at: now_rfc3339(),
+            }],
+            ..SyncEnvelope::default()
+        };
+
+        cleanup_tombstoned_assets(&state, "user-1", &envelope)
+            .await
+            .unwrap();
+        assert!(object_exists(&state, object_key).await.unwrap());
+        let active_token_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upload_tokens WHERE token = 'active-token'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(active_token_count, 1);
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
+    async fn sync_push_returns_committed_snapshot_when_tombstone_cleanup_needs_retry() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        insert_test_user(
+            &state.db,
+            "user-sync-cleanup",
+            "sync-cleanup-user",
+            "hash",
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        let object_key = "users/user-sync-cleanup/assets/retry.bin";
+        let object_path = local_object_path(&state.config.local_asset_dir, object_key).unwrap();
+        // 用目录模拟暂时无法删除的对象，确保快照提交不会被后置清理伪装成失败。
+        tokio::fs::create_dir_all(&object_path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES ('asset-retry', 'user-sync-cleanup', ?, 'image/png', 'retry', 1, ?)",
+        )
+        .bind(object_key)
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let state = Arc::new(state);
+        let session =
+            authenticated_test_session(Arc::new(MemoryStore::default()), "user-sync-cleanup", 0)
+                .await;
+
+        let response = sync_push(
+            State(state.clone()),
+            session,
+            Json(SyncPushRequest {
+                client_updated_at: now_rfc3339(),
+                envelope: SyncEnvelope {
+                    tombstones: vec![SyncTombstone {
+                        entity_kind: SyncEntityKind::Asset,
+                        entity_id: "asset-retry".into(),
+                        deleted_at: now_rfc3339(),
+                    }],
+                    ..SyncEnvelope::default()
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            response
+                .envelope
+                .tombstones
+                .iter()
+                .any(|item| item.entity_id == "asset-retry")
+        );
+        let indexed_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE id = 'asset-retry'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(indexed_count, 1, "失败的清理记录应保留供后续重试");
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
+    async fn sync_push_rolls_back_normalized_assets_when_snapshot_merge_fails() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        insert_test_user(
+            &state.db,
+            "user-sync-rollback",
+            "sync-rollback-user",
+            "hash",
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        sqlx::query("INSERT INTO sync_snapshots (user_id, payload, updated_at) VALUES (?, ?, ?)")
+            .bind("user-sync-rollback")
+            .bind("not-valid-json")
+            .bind(now_rfc3339())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let bytes = test_png_bytes(b"merge-failure");
+        let sha256 = hex_sha256(&bytes);
+        let object_key = format!("users/user-sync-rollback/assets/{sha256}.bin");
+        let envelope = SyncEnvelope {
+            assets: vec![test_sync_asset(
+                "merge-failure-asset",
+                &sha256,
+                "image/png",
+                bytes.len() as u64,
+                Some(format!("data:image/png;base64,{}", BASE64.encode(bytes))),
+                None,
+            )],
+            ..SyncEnvelope::default()
+        };
+        let state = Arc::new(state);
+        let session =
+            authenticated_test_session(Arc::new(MemoryStore::default()), "user-sync-rollback", 0)
+                .await;
+
+        assert!(
+            sync_push(
+                State(state.clone()),
+                session,
+                Json(SyncPushRequest {
+                    client_updated_at: now_rfc3339(),
+                    envelope,
+                }),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            find_indexed_asset_object(&state.db, "user-sync-rollback", "merge-failure-asset")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!object_exists(&state, &object_key).await.unwrap());
+        let _ = tokio::fs::remove_dir_all(asset_dir).await;
+    }
+
+    #[tokio::test]
+    async fn upload_complete_returns_committed_asset_when_old_object_cleanup_needs_retry() {
+        let asset_dir = std::env::temp_dir().join(format!("mew-image-test-{}", new_id()));
+        let state = test_app_state(asset_dir.to_string_lossy().into_owned()).await;
+        insert_test_user(
+            &state.db,
+            "user-upload-cleanup",
+            "upload-cleanup-user",
+            "hash",
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        let asset_id = new_id();
+        let bytes = b"\x89PNG\r\n\x1a\nverified".to_vec();
+        let sha256 = hex_sha256(&bytes);
+        let old_object_key = "users/user-upload-cleanup/assets/old.bin";
+        let new_object_key = format!("users/user-upload-cleanup/assets/{sha256}.bin");
+        put_object(&state, &new_object_key, "image/png", bytes.clone())
+            .await
+            .unwrap();
+        let old_path = local_object_path(&state.config.local_asset_dir, old_object_key).unwrap();
+        tokio::fs::create_dir_all(&old_path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO assets
+             (id, user_id, object_key, mime_type, sha256, byte_len, created_at)
+             VALUES (?, 'user-upload-cleanup', ?, 'image/png', 'old', 1, ?)",
+        )
+        .bind(&asset_id)
+        .bind(old_object_key)
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_tokens
+             (token, asset_id, user_id, object_key, mime_type, byte_len, sha256, expires_at)
+             VALUES ('cleanup-token', ?, 'user-upload-cleanup', ?, 'image/png', ?, ?, ?)",
+        )
+        .bind(&asset_id)
+        .bind(&new_object_key)
+        .bind(i64::try_from(bytes.len()).unwrap())
+        .bind(&sha256)
+        .bind((Utc::now() + Duration::minutes(5)).to_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let state = Arc::new(state);
+        let session =
+            authenticated_test_session(Arc::new(MemoryStore::default()), "user-upload-cleanup", 0)
+                .await;
+
+        let response = upload_complete(
+            State(state.clone()),
+            session,
+            Json(UploadCompleteRequest {
+                upload_token: "cleanup-token".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.asset.remote_object_key.as_deref(),
+            Some(new_object_key.as_str())
+        );
+        let stored_key =
+            sqlx::query_scalar::<_, String>("SELECT object_key FROM assets WHERE id = ?")
+                .bind(&asset_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(stored_key, new_object_key);
+        let token_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upload_tokens WHERE token = 'cleanup-token'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(token_count, 0);
         let _ = tokio::fs::remove_dir_all(asset_dir).await;
     }
 }

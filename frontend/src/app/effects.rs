@@ -28,6 +28,7 @@ pub(crate) fn install_app_effects() {
         );
         let _ =
             query.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref());
+        // 根 Effect 与页面同寿命，固定保留一个监听器不会随交互累积。
         on_change.forget();
     });
 
@@ -150,6 +151,7 @@ pub(crate) fn install_app_effects() {
         });
         let _ =
             window.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref());
+        // 根 Effect 只安装一次，监听器数量固定为一。
         on_keydown.forget();
     });
 
@@ -158,11 +160,9 @@ pub(crate) fn install_app_effects() {
             if tip.persistent {
                 return;
             }
-            let Some(window) = web_sys::window() else {
-                return;
-            };
             let token = tip.token;
-            let callback = Closure::<dyn FnMut()>::once(move || {
+            spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(1_400).await;
                 if ui
                     .floating_tip_state
                     .get_untracked()
@@ -172,12 +172,12 @@ pub(crate) fn install_app_effects() {
                     ui.floating_tip_state.set(None);
                 }
             });
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                callback.as_ref().unchecked_ref(),
-                1400,
-            );
-            callback.forget();
         }
+    });
+
+    on_cleanup(move || {
+        clear_background_display(ui);
+        revoke_all_asset_object_urls();
     });
 
     spawn_local(async move {
@@ -234,13 +234,19 @@ async fn initialize_app_state(
     account: AccountState,
     persistence: PersistenceState,
 ) {
-    let mut state = load_snapshot().await.unwrap_or_else(|_| {
-        let mut next = LocalAppState::default();
-        next.threads = vec![default_thread()];
-        next.configs
-            .push(default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID));
-        next
-    });
+    let mut state = match load_snapshot().await {
+        Ok(state) => state,
+        Err(error) => {
+            // 读取失败不等同于“没有数据”。保留当前内存状态，避免空快照覆盖旧工作区。
+            persistence
+                .local_state_status
+                .set(LocalStateLoadStatus::Failed(error.clone()));
+            composer.status_text.set(format!(
+                "读取浏览器本地数据失败：{error}。为避免覆盖旧数据，本次未初始化工作区；请关闭其他 MewImage 页面后刷新重试。"
+            ));
+            return;
+        }
+    };
     if state.threads.is_empty() {
         state.threads.push(default_thread());
     }
@@ -253,10 +259,20 @@ async fn initialize_app_state(
         normalize_api_config(config);
     }
     state.preferences.appearance.normalize();
-    let stripped_task_payloads = strip_successful_task_payloads(&mut state.tasks);
+    let stripped_task_payloads = strip_task_payloads(&mut state.tasks);
     state
         .assets
         .retain(|asset| !asset.metadata.contains_key("mask_base_asset_id"));
+    for asset in &mut state.assets {
+        let invalid_thumbnail = asset
+            .metadata
+            .get(THUMBNAIL_DATA_URL_KEY)
+            .map(|value| !is_embedded_asset_data_url(value))
+            .unwrap_or(false);
+        if invalid_thumbnail {
+            asset.metadata.remove(THUMBNAIL_DATA_URL_KEY);
+        }
+    }
     let removed_local_background_source_ids =
         data_management::discard_legacy_local_background_sources(&mut state);
     record_sync_tombstones_in(
@@ -266,7 +282,38 @@ async fn initialize_app_state(
             .cloned()
             .map(|asset_id| (SyncEntityKind::Asset, asset_id)),
     );
-    let had_embedded_payloads = state.assets.iter().any(|asset| asset.data_url.is_some());
+    let initial_payloads = asset_payload_pairs(&state.assets);
+    let had_embedded_payloads = !initial_payloads.is_empty();
+    let mut embedded_migration_error = None;
+    let embedded_payloads_persisted = if had_embedded_payloads {
+        match apply_asset_payload_changes(&initial_payloads, &[]).await {
+            Ok(()) => {
+                for asset in &mut state.assets {
+                    asset.data_url = None;
+                    asset.metadata.remove(PENDING_BLOB_MIGRATION_KEY);
+                }
+                true
+            }
+            Err(error) => {
+                for asset in &mut state.assets {
+                    if asset
+                        .data_url
+                        .as_deref()
+                        .map(is_embedded_asset_data_url)
+                        .unwrap_or(false)
+                    {
+                        asset
+                            .metadata
+                            .insert(PENDING_BLOB_MIGRATION_KEY.into(), "true".into());
+                    }
+                }
+                embedded_migration_error = Some(error);
+                false
+            }
+        }
+    } else {
+        false
+    };
     reconcile_task_integrity(&mut state.tasks, &state.assets, true);
     let initial_thread_id = state
         .threads
@@ -298,21 +345,21 @@ async fn initialize_app_state(
         workspace.checkpoint,
         workspace.tombstones,
     );
-    composer
-        .status_text
-        .set("本地工作台已恢复，缩略图正在后台补全……".into());
+    // 只有快照已经成功读取并应用后，才允许任何后台持久化覆盖 IndexedDB。
+    persistence
+        .local_state_status
+        .set(LocalStateLoadStatus::Ready);
+    if let Some(error) = embedded_migration_error.as_deref() {
+        composer.status_text.set(format!(
+            "旧版图片迁移到 Blob 存储失败：{error}。原数据仍保留，本次不会写入精简快照；请检查浏览器存储配额后刷新重试。"
+        ));
+    } else {
+        composer
+            .status_text
+            .set("本地工作台已恢复，缩略图正在后台补全……".into());
+    }
 
     let tasks_for_thumbnails = state.tasks.clone();
-    let mut assets_for_thumbnails = state.assets.clone();
-    let initial_payloads = asset_payload_pairs(&state.assets);
-    if had_embedded_payloads {
-        persistence.payload_write_queue.update(|queued| {
-            for (asset_id, data_url) in initial_payloads {
-                queued.insert(asset_id, data_url);
-            }
-        });
-        request_payload_flush_for_state(persistence);
-    }
     if !removed_local_background_source_ids.is_empty() {
         persistence.payload_write_queue.update(|queued| {
             for asset_id in &removed_local_background_source_ids {
@@ -322,60 +369,74 @@ async fn initialize_app_state(
         persistence.payload_delete_queue.update(|queued| {
             queued.extend(removed_local_background_source_ids.iter().cloned());
         });
-        request_payload_flush_for_state(persistence);
+        request_payload_flush_for_state(persistence, composer.status_text);
     }
-    if had_embedded_payloads
-        || stripped_task_payloads
-        || !removed_local_background_source_ids.is_empty()
+    if (!had_embedded_payloads || embedded_payloads_persisted)
+        && (embedded_payloads_persisted
+            || stripped_task_payloads
+            || !removed_local_background_source_ids.is_empty())
     {
         request_workspace_persist_for_state(workspace, persistence);
     }
 
     let thumbnail_order = prioritized_asset_indexes_for_thread(
-        &assets_for_thumbnails,
+        &state.assets,
         &tasks_for_thumbnails,
         &initial_thread_id,
-    );
+    )
+    .into_iter()
+    .filter_map(|index| state.assets.get(index).map(|asset| asset.id.clone()))
+    .collect::<Vec<_>>();
     spawn_local(async move {
         let mut changed = false;
-        let mut first_batch_changed = false;
-        for (position, asset_index) in thumbnail_order.into_iter().enumerate() {
-            let Some(asset) = assets_for_thumbnails.get_mut(asset_index) else {
+        for asset_id in thumbnail_order {
+            let Some(mut asset) = workspace.assets.with_untracked(|items| {
+                items
+                    .iter()
+                    .find(|asset| {
+                        asset.id == asset_id
+                            && !asset.metadata.contains_key(THUMBNAIL_DATA_URL_KEY)
+                            && !is_theme_background(asset)
+                    })
+                    .cloned()
+            }) else {
                 continue;
             };
-            if asset.metadata.contains_key(THUMBNAIL_DATA_URL_KEY) {
+            let _ = ensure_asset_display_sources_loaded(
+                workspace.assets,
+                std::slice::from_ref(&asset_id),
+            )
+            .await;
+            asset = workspace
+                .assets
+                .with_untracked(|items| items.iter().find(|item| item.id == asset_id).cloned())
+                .unwrap_or(asset);
+            let Ok(thumbnail) = thumbnail_data_url_from_asset(&asset, THUMBNAIL_MAX_EDGE).await
+            else {
                 continue;
-            }
-            if is_theme_background(asset) {
-                continue;
-            }
-            if let Ok(thumbnail) = thumbnail_data_url_from_asset(asset, THUMBNAIL_MAX_EDGE).await {
-                asset
-                    .metadata
-                    .insert(THUMBNAIL_DATA_URL_KEY.into(), thumbnail);
-                changed = true;
-                if position < 6 {
-                    first_batch_changed = true;
-                }
-            }
-            if first_batch_changed && position == 5 {
-                workspace.assets.set(assets_for_thumbnails.clone());
-            }
-        }
-        if changed {
-            workspace.assets.set(assets_for_thumbnails.clone());
-            let payloads = asset_payload_pairs(&assets_for_thumbnails);
-            persistence.payload_write_queue.update(|queued| {
-                for (asset_id, data_url) in payloads {
-                    queued.insert(asset_id, data_url);
+            };
+            workspace.assets.update(|items| {
+                if let Some(current) = items.iter_mut().find(|item| item.id == asset_id)
+                    && !current.metadata.contains_key(THUMBNAIL_DATA_URL_KEY)
+                {
+                    current
+                        .metadata
+                        .insert(THUMBNAIL_DATA_URL_KEY.into(), thumbnail);
+                    changed = true;
                 }
             });
-            request_payload_flush_for_state(persistence);
+        }
+        if changed {
             request_workspace_persist_for_state(workspace, persistence);
         }
-        composer
-            .status_text
-            .set("本地工作台已恢复，可以直接开始生成或继续修改。".into());
+        trim_asset_payload_cache(workspace.assets);
+        if persistence.payload_flush_failures.get_untracked() == 0
+            && (!had_embedded_payloads || embedded_payloads_persisted)
+        {
+            composer
+                .status_text
+                .set("本地工作台已恢复，可以直接开始生成或继续修改。".into());
+        }
     });
 
     if let Ok(remote_templates) = load_templates().await
@@ -416,26 +477,10 @@ async fn initialize_app_state(
     {
         account.admin_setup_allowed.set(!status.admin_exists);
     }
-
-    if !composer
-        .status_text
-        .get_untracked()
-        .contains("可以直接开始")
-    {
-        composer
-            .status_text
-            .set("本地工作台已恢复，可以直接开始生成或继续修改。".into());
-    }
 }
 
-fn request_payload_flush_for_state(persistence: PersistenceState) {
-    request_payload_flush(
-        persistence.payload_write_queue,
-        persistence.payload_delete_queue,
-        persistence.payload_flush_scheduled,
-        persistence.payload_flush_inflight,
-        persistence.payload_flush_pending,
-    );
+fn request_payload_flush_for_state(persistence: PersistenceState, status_text: RwSignal<String>) {
+    request_payload_flush(persistence, status_text);
 }
 
 fn request_workspace_persist_for_state(workspace: WorkspaceState, persistence: PersistenceState) {
@@ -445,8 +490,6 @@ fn request_workspace_persist_for_state(workspace: WorkspaceState, persistence: P
         workspace.assets,
         workspace.checkpoint,
         workspace.tombstones,
-        persistence.workspace_persist_scheduled,
-        persistence.workspace_persist_inflight,
-        persistence.workspace_persist_pending,
+        persistence,
     );
 }

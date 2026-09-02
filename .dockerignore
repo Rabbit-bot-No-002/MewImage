@@ -3,12 +3,14 @@
 .agents
 .codex
 .vscode
+AGENTS.md
+测试
 
 target
 frontend/dist
 frontend/dist-app
 
-.env
+.env*
 *.db
 *.sqlite
 *.sqlite3

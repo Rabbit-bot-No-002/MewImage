@@ -13,12 +13,6 @@ pub(crate) fn download_file_name_for_asset(asset: &ImageAssetRef) -> String {
     format!("mew_{date}_{hash}.{extension}")
 }
 
-pub(crate) fn download_file_name_for_src(src: &str) -> String {
-    let hash = short_hash_from_text(src);
-    let extension = extension_from_src(src).unwrap_or("png");
-    format!("mew_{}_{}.{}", today_compact(), hash, extension)
-}
-
 pub(crate) fn short_download_hash(asset: &ImageAssetRef) -> String {
     let candidate = if asset.sha256.trim().is_empty() {
         asset.id.as_str()
@@ -26,10 +20,6 @@ pub(crate) fn short_download_hash(asset: &ImageAssetRef) -> String {
         asset.sha256.as_str()
     };
     short_hash_text(candidate)
-}
-
-pub(crate) fn short_hash_from_text(value: &str) -> String {
-    short_hash_text(&sha256_hex(value.as_bytes()))
 }
 
 pub(crate) fn short_hash_text(value: &str) -> String {
@@ -57,27 +47,11 @@ pub(crate) fn extension_from_mime(mime_type: &str) -> &'static str {
     }
 }
 
-pub(crate) fn extension_from_src(src: &str) -> Option<&'static str> {
-    let lowered = src.split('?').next().unwrap_or(src).to_ascii_lowercase();
-    if lowered.ends_with(".jpg") || lowered.ends_with(".jpeg") {
-        Some("jpg")
-    } else if lowered.ends_with(".webp") {
-        Some("webp")
-    } else if lowered.ends_with(".gif") {
-        Some("gif")
-    } else if lowered.ends_with(".avif") {
-        Some("avif")
-    } else if lowered.ends_with(".png") {
-        Some("png")
-    } else {
-        None
-    }
-}
-
 pub(crate) fn asset_src(asset: &ImageAssetRef) -> String {
     asset
         .data_url
         .clone()
+        .or_else(|| runtime_asset_object_url(&asset.id))
         .or_else(|| asset.remote_url.clone())
         .unwrap_or_default()
 }
@@ -86,19 +60,26 @@ pub(crate) fn asset_full_preview_src(asset: &ImageAssetRef) -> String {
     asset
         .data_url
         .clone()
+        .or_else(|| runtime_asset_object_url(&asset.id))
         .or_else(|| asset.remote_url.clone())
-        .or_else(|| asset.metadata.get(THUMBNAIL_DATA_URL_KEY).cloned())
+        .or_else(|| persisted_thumbnail_src(asset))
         .unwrap_or_default()
 }
 
 pub(crate) fn asset_display_src(asset: &ImageAssetRef) -> String {
+    persisted_thumbnail_src(asset)
+        .or_else(|| asset.data_url.clone())
+        .or_else(|| runtime_asset_object_url(&asset.id))
+        .or_else(|| asset.remote_url.clone())
+        .unwrap_or_default()
+}
+
+fn persisted_thumbnail_src(asset: &ImageAssetRef) -> Option<String> {
     asset
         .metadata
         .get(THUMBNAIL_DATA_URL_KEY)
+        .filter(|value| is_embedded_asset_data_url(value))
         .cloned()
-        .or_else(|| asset.data_url.clone())
-        .or_else(|| asset.remote_url.clone())
-        .unwrap_or_default()
 }
 
 pub(crate) fn bytes_to_data_url(bytes: &[u8], mime_type: &str) -> String {
@@ -124,26 +105,10 @@ pub(crate) fn decode_browser_data_url(data_url: &str) -> Result<(String, Vec<u8>
 
 pub(crate) async fn load_html_image(src: &str) -> Result<HtmlImageElement, String> {
     let image = HtmlImageElement::new().map_err(|error| format!("{error:?}"))?;
-    let image_for_promise = image.clone();
-    let promise = js_sys::Promise::new(&mut |resolve, reject| {
-        let onload = Closure::<dyn FnMut()>::once(move || {
-            let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
-        });
-        let onerror = Closure::<dyn FnMut()>::once(move || {
-            let _ = reject.call1(
-                &wasm_bindgen::JsValue::NULL,
-                &wasm_bindgen::JsValue::from_str("图片载入失败"),
-            );
-        });
-        image_for_promise.set_onload(Some(onload.as_ref().unchecked_ref()));
-        image_for_promise.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-        onload.forget();
-        onerror.forget();
-    });
     image.set_src(src);
-    JsFuture::from(promise)
+    JsFuture::from(image.decode())
         .await
-        .map_err(|error| format!("{error:?}"))?;
+        .map_err(|error| format!("图片载入失败：{error:?}"))?;
     Ok(image)
 }
 
@@ -211,10 +176,11 @@ pub(crate) async fn thumbnail_data_url_from_asset(
     let width = image.natural_width().max(1);
     let height = image.natural_height().max(1);
     let longest = width.max(height).max(1);
-    if longest <= max_edge {
+    // Blob/远程 URL 仅在当前页面或云端有效，不能写进可持久化的缩略图元数据。
+    if longest <= max_edge && is_embedded_asset_data_url(&source) {
         return Ok(source);
     }
-    let scale = max_edge as f64 / longest as f64;
+    let scale = (max_edge as f64 / longest as f64).min(1.0);
     let target_width = ((width as f64 * scale).round() as u32).max(1);
     let target_height = ((height as f64 * scale).round() as u32).max(1);
 
@@ -441,7 +407,13 @@ pub(crate) async fn collect_backup_payloads(
         .await
         .map_err(|error| format!("读取本地图片失败：{error}"))?;
     for asset in &state.assets {
-        if payloads.contains_key(&asset.id) || asset.data_url.is_some() {
+        if payloads.contains_key(&asset.id)
+            || asset
+                .data_url
+                .as_deref()
+                .map(is_embedded_asset_data_url)
+                .unwrap_or(false)
+        {
             continue;
         }
         let Some(remote_url) = asset.remote_url.as_deref() else {
@@ -499,8 +471,11 @@ pub(crate) fn download_backup_bytes(bytes: &[u8], file_name: &str) -> Result<(),
     let url = web_sys::Url::create_object_url_with_blob(&blob)
         .map_err(|error| format!("创建备份下载地址失败：{error:?}"))?;
     let result = download_image_from_src(&url, file_name);
-    web_sys::Url::revoke_object_url(&url)
-        .map_err(|error| format!("释放备份下载地址失败：{error:?}"))?;
+    // 浏览器需要在点击事件之后继续读取 Blob；同步 revoke 在部分浏览器会取消下载。
+    spawn_local(async move {
+        gloo_timers::future::TimeoutFuture::new(0).await;
+        let _ = web_sys::Url::revoke_object_url(&url);
+    });
     result
 }
 
@@ -538,27 +513,7 @@ pub(crate) async fn import_file_list(files: FileList) -> Result<Vec<ImageAssetRe
 }
 
 pub(crate) async fn load_image_dimensions(data_url: &str) -> Result<(u32, u32), String> {
-    let image = HtmlImageElement::new().map_err(|error| format!("{error:?}"))?;
-    let promise = js_sys::Promise::new(&mut |resolve, reject| {
-        let image_for_load = image.clone();
-        let onload = Closure::<dyn FnMut()>::once(move || {
-            let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
-        });
-        let onerror = Closure::<dyn FnMut()>::once(move || {
-            let _ = reject.call1(
-                &wasm_bindgen::JsValue::NULL,
-                &wasm_bindgen::JsValue::from_str("图片尺寸读取失败"),
-            );
-        });
-        image_for_load.set_onload(Some(onload.as_ref().unchecked_ref()));
-        image_for_load.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-        onload.forget();
-        onerror.forget();
-    });
-    image.set_src(data_url);
-    JsFuture::from(promise)
-        .await
-        .map_err(|error| format!("{error:?}"))?;
+    let image = load_html_image(data_url).await?;
     Ok((image.natural_width(), image.natural_height()))
 }
 

@@ -580,6 +580,7 @@ fn merge_backup(
     )
 }
 
+#[allow(clippy::type_complexity)]
 fn import_session_backup(
     local: &LocalAppState,
     mut imported: LocalAppState,
@@ -910,20 +911,6 @@ mod tests {
 
     #[test]
     fn session_backup_only_contains_selected_thread_dependencies() {
-        let mut source = LocalAppState::default();
-        source.threads = vec![
-            test_thread("project", "项目 A"),
-            test_thread("other", "其他"),
-        ];
-        source.tasks = vec![
-            test_task(
-                "project-task",
-                "project",
-                &["cross-reference", "project-source", "theme-background"],
-                true,
-            ),
-            test_task("other-task", "other", &[], false),
-        ];
         let mut hidden_source =
             test_scoped_asset("project-source", b"source", Some("project-task"), None);
         hidden_source
@@ -940,31 +927,51 @@ mod tests {
         transparent_result
             .metadata
             .insert("local_background_result_index".into(), "0".into());
-        source.assets = vec![
-            test_scoped_asset("project-output", b"project", Some("project-task"), None),
-            hidden_source,
-            transparent_result,
-            test_scoped_asset("unused-reference", b"unused", None, Some("project")),
-            test_scoped_asset("cross-reference", b"cross", Some("other-task"), None),
-            test_scoped_asset("other-output", b"other", Some("other-task"), None),
-        ];
         let mut theme_background = test_scoped_asset("theme-background", b"theme", None, None);
         theme_background.metadata.insert(
             THEME_BACKGROUND_ROLE_KEY.into(),
             THEME_BACKGROUND_ROLE.into(),
         );
-        source.assets.push(theme_background);
-        source.preferences.appearance.custom_background.asset_id = Some("theme-background".into());
-        source.preferences.appearance.custom_background.enabled = true;
-        source.configs.push(EncryptedApiConfig {
-            api_key_plaintext: Some("secret".into()),
-            ..crate::providers::default_config(mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID)
-        });
-        source.tombstones.push(SyncTombstone {
-            entity_kind: SyncEntityKind::Thread,
-            entity_id: "deleted".into(),
-            deleted_at: now_rfc3339(),
-        });
+        let mut preferences = AppPreferences::default();
+        preferences.appearance.custom_background.asset_id = Some("theme-background".into());
+        preferences.appearance.custom_background.enabled = true;
+        let source = LocalAppState {
+            configs: vec![EncryptedApiConfig {
+                api_key_plaintext: Some("secret".into()),
+                ..crate::providers::default_config(
+                    mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
+                )
+            }],
+            tasks: vec![
+                test_task(
+                    "project-task",
+                    "project",
+                    &["cross-reference", "project-source", "theme-background"],
+                    true,
+                ),
+                test_task("other-task", "other", &[], false),
+            ],
+            threads: vec![
+                test_thread("project", "项目 A"),
+                test_thread("other", "其他"),
+            ],
+            assets: vec![
+                test_scoped_asset("project-output", b"project", Some("project-task"), None),
+                hidden_source,
+                transparent_result,
+                test_scoped_asset("unused-reference", b"unused", None, Some("project")),
+                test_scoped_asset("cross-reference", b"cross", Some("other-task"), None),
+                test_scoped_asset("other-output", b"other", Some("other-task"), None),
+                theme_background,
+            ],
+            preferences,
+            tombstones: vec![SyncTombstone {
+                entity_kind: SyncEntityKind::Thread,
+                entity_id: "deleted".into(),
+                deleted_at: now_rfc3339(),
+            }],
+            ..Default::default()
+        };
 
         let prepared = prepare_session_backup(&source, "project").unwrap();
         let asset_ids = prepared
@@ -1064,24 +1071,30 @@ mod tests {
 
     #[test]
     fn session_import_creates_independent_copy_and_can_repeat() {
-        let mut source = LocalAppState::default();
-        source.threads = vec![test_thread("project", "项目 A")];
-        source.tasks = vec![test_task("project-task", "project", &["reference"], true)];
-        source.assets = vec![
-            test_scoped_asset("reference", b"reference", None, Some("project")),
-            test_scoped_asset("output", b"output", Some("project-task"), None),
-        ];
+        let mut source = LocalAppState {
+            threads: vec![test_thread("project", "项目 A")],
+            tasks: vec![test_task("project-task", "project", &["reference"], true)],
+            assets: vec![
+                test_scoped_asset("reference", b"reference", None, Some("project")),
+                test_scoped_asset("output", b"output", Some("project-task"), None),
+            ],
+            ..Default::default()
+        };
         source.assets[0].remote_object_key = Some("users/old/reference".into());
         source.assets[0].remote_url = Some("/api/assets/reference".into());
         let prepared = prepare_session_backup(&source, "project").unwrap();
         let zip = build_session_backup(prepared, &HashMap::new()).unwrap();
 
-        let mut local = LocalAppState::default();
-        local.threads = vec![test_thread("project", "项目 A")];
-        local.configs.push(EncryptedApiConfig {
-            api_key_plaintext: Some("local-secret".into()),
-            ..crate::providers::default_config(mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID)
-        });
+        let mut local = LocalAppState {
+            threads: vec![test_thread("project", "项目 A")],
+            configs: vec![EncryptedApiConfig {
+                api_key_plaintext: Some("local-secret".into()),
+                ..crate::providers::default_config(
+                    mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
+                )
+            }],
+            ..Default::default()
+        };
         local.preferences.clear_prompt_after_submit = true;
         local.tombstones.push(SyncTombstone {
             entity_kind: SyncEntityKind::Thread,

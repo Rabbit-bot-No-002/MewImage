@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 
-use leptos::prelude::*;
+use leptos::{prelude::*, task::spawn_local};
 use mew_image_shared::{EncryptedApiConfig, clamp_size, now_rfc3339};
 use web_sys::{DragEvent, FileList, MouseEvent};
 
 use crate::storage::save_generation_queue_mode;
 
 use crate::app::{
-    asset_display_src, background_mode_label, cycle_background_mode,
+    MAX_ACTIVE_GENERATION_TASKS, asset_display_src, background_mode_label, cycle_background_mode,
     derived::AppDerived,
-    is_openai_image_config,
+    ensure_asset_display_sources_loaded, is_openai_image_config,
     models::{ConfirmPopoverKind, ConfirmPopoverState},
     state::{ComposerState, UiState, WorkspaceState},
     thread_display_name, transparent_background_enabled,
@@ -81,6 +81,22 @@ pub(crate) fn WorkspaceMain(
     let reference_assets = derived.reference_assets;
     let continuation_asset = derived.continuation_asset;
     let dimension_reference_assets = derived.dimension_reference_assets;
+
+    Effect::new(move |_| {
+        let missing_source_ids = reference_assets
+            .get()
+            .into_iter()
+            .filter(|asset| asset_display_src(asset).is_empty())
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>();
+        if missing_source_ids.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            let _ =
+                ensure_asset_display_sources_loaded(workspace.assets, &missing_source_ids).await;
+        });
+    });
 
     view! {
                 <div class="workspace-main">
@@ -776,7 +792,14 @@ pub(crate) fn WorkspaceMain(
                         }.into_any()
                     } else {
                         view! {
-                            <button class="button generation-submit-button" on:click=generate>
+                            <button
+                                class="button generation-submit-button"
+                                disabled=move || {
+                                    active_generation_ids.with(HashSet::len)
+                                        >= MAX_ACTIVE_GENERATION_TASKS
+                                }
+                                on:click=generate
+                            >
                                 <span class="generation-submit-label">"开始生成"</span>
                             </button>
                         }.into_any()
@@ -805,8 +828,12 @@ pub(crate) fn WorkspaceMain(
                         </div>
                         <div class="preview-strip">
                             <For
-                                each=move || reference_assets.get()
-                                key=|asset| asset.id.clone()
+                                each=move || {
+                                    // Object URL 存在于运行时缓存，直接追踪资产信号才能响应缓存装载。
+                                    workspace.assets.track();
+                                    reference_assets.get()
+                                }
+                                key=|asset| (asset.id.clone(), asset_display_src(asset))
                                 children=move |asset| {
                                     let asset_id = asset.id.clone();
                                     let src = asset_display_src(&asset);

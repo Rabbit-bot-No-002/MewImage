@@ -9,19 +9,36 @@ pub(crate) fn resolve_dimensions(
     custom_height: u32,
     references: &[ImageAssetRef],
 ) -> (u32, u32) {
+    let reference_size = references
+        .iter()
+        .find_map(|asset| asset.width.zip(asset.height));
+    resolve_dimensions_from_reference_size(
+        mode,
+        group,
+        ratio,
+        custom_ratio,
+        custom_width,
+        custom_height,
+        reference_size,
+    )
+}
+
+pub(crate) fn resolve_dimensions_from_reference_size(
+    mode: &str,
+    group: &str,
+    ratio: &str,
+    custom_ratio: &str,
+    custom_width: u32,
+    custom_height: u32,
+    reference_size: Option<(u32, u32)>,
+) -> (u32, u32) {
     if mode == "custom" {
         let result = clamp_size(custom_width, custom_height);
         return (result.width, result.height);
     }
     if mode == "auto" {
-        if let Some(reference) = references
-            .iter()
-            .find(|asset| asset.width.is_some() && asset.height.is_some())
-        {
-            let result = clamp_size(
-                reference.width.unwrap_or(1024),
-                reference.height.unwrap_or(1024),
-            );
+        if let Some((width, height)) = reference_size {
+            let result = clamp_size(width, height);
             return (result.width, result.height);
         }
         return (1024, 1024);

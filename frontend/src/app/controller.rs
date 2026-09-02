@@ -22,97 +22,39 @@ pub(super) fn AppController() -> impl IntoView {
     let ComposerState {
         draft_prompt,
         draft_prompt_ref,
+        status_text,
         ..
     } = composer;
-    let PersistenceState {
-        workspace_persist_scheduled,
-        workspace_persist_inflight,
-        workspace_persist_pending,
-        ui_persist_scheduled,
-        ui_persist_inflight,
-        ui_persist_pending,
-        payload_write_queue,
-        payload_delete_queue,
-        payload_flush_scheduled,
-        payload_flush_inflight,
-        payload_flush_pending,
-    } = persistence;
-    let persist_state = {
-        let tasks = tasks;
-        let threads = threads;
-        let assets = assets;
-        let checkpoint = checkpoint;
-        let tombstones = tombstones;
-        move || {
-            request_workspace_persist(
-                tasks,
-                threads,
-                assets,
-                checkpoint,
-                tombstones,
-                workspace_persist_scheduled,
-                workspace_persist_inflight,
-                workspace_persist_pending,
-            );
-        }
+    let persist_state = move || {
+        request_workspace_persist(tasks, threads, assets, checkpoint, tombstones, persistence);
     };
-    let persist_ui_state = {
-        let configs = configs;
-        let preferences = preferences;
-        move || {
-            request_ui_state_persist(
-                configs,
-                preferences,
-                ui_persist_scheduled,
-                ui_persist_inflight,
-                ui_persist_pending,
-            );
-        }
-    };
-    let enqueue_payload_writes = {
-        move |payloads: Vec<(String, String)>| {
-            if payloads.is_empty() {
-                return;
-            }
-            payload_write_queue.update(|queued| {
-                for (asset_id, data_url) in payloads {
-                    payload_delete_queue.update(|deletes| {
-                        deletes.remove(&asset_id);
-                    });
-                    queued.insert(asset_id, data_url);
-                }
-            });
-            request_payload_flush(
-                payload_write_queue,
-                payload_delete_queue,
-                payload_flush_scheduled,
-                payload_flush_inflight,
-                payload_flush_pending,
-            );
-        }
+    let persist_ui_state = move || {
+        request_ui_state_persist(configs, preferences, persistence);
     };
     let enqueue_payload_deletes = {
         move |asset_ids: Vec<String>| {
-            if asset_ids.is_empty() {
+            if asset_ids.is_empty()
+                || !persistence
+                    .local_state_status
+                    .with_untracked(LocalStateLoadStatus::is_ready)
+            {
                 return;
             }
-            payload_write_queue.update(|queued| {
+            // 元数据删除后这些 URL 已不再可达，无需等待 IndexedDB 删除重试才释放内存。
+            for asset_id in &asset_ids {
+                revoke_asset_object_url(asset_id);
+            }
+            persistence.payload_write_queue.update(|queued| {
                 for asset_id in &asset_ids {
                     queued.remove(asset_id);
                 }
             });
-            payload_delete_queue.update(|queued| {
+            persistence.payload_delete_queue.update(|queued| {
                 for asset_id in asset_ids {
                     queued.insert(asset_id);
                 }
             });
-            request_payload_flush(
-                payload_write_queue,
-                payload_delete_queue,
-                payload_flush_scheduled,
-                payload_flush_inflight,
-                payload_flush_pending,
-            );
+            request_payload_flush(persistence, status_text);
         }
     };
 
@@ -288,11 +230,11 @@ pub(super) fn AppController() -> impl IntoView {
             .unwrap_or_else(|| draft_prompt.get_untracked());
         draft_prompt.set(value.clone());
         threads.update(|items| {
-            if let Some(thread) = items.iter_mut().find(|thread| thread.id == thread_id) {
-                if thread.draft_prompt != value {
-                    thread.draft_prompt = value;
-                    thread.updated_at = now_rfc3339();
-                }
+            if let Some(thread) = items.iter_mut().find(|thread| thread.id == thread_id)
+                && thread.draft_prompt != value
+            {
+                thread.draft_prompt = value;
+                thread.updated_at = now_rfc3339();
             }
         });
     };
@@ -324,7 +266,6 @@ pub(super) fn AppController() -> impl IntoView {
     ) = build_data_actions(
         persist_state,
         persist_ui_state,
-        enqueue_payload_writes,
         enqueue_payload_deletes,
         commit_current_thread_draft,
     );
@@ -348,7 +289,6 @@ pub(super) fn AppController() -> impl IntoView {
         open_text_popover,
     ) = build_workspace_actions(
         persist_state,
-        enqueue_payload_writes,
         enqueue_payload_deletes,
         commit_current_thread_draft,
         build_preview_panel_state,
@@ -358,11 +298,7 @@ pub(super) fn AppController() -> impl IntoView {
         build_appearance_actions(persist_state, persist_ui_state, enqueue_payload_deletes);
 
     let (run_generation, rerun_task, cancel_generation, cancel_all_generations) =
-        build_generation_actions(
-            persist_state,
-            enqueue_payload_writes,
-            commit_current_thread_draft,
-        );
+        build_generation_actions(persist_state, commit_current_thread_draft);
     let generate = move |_| run_generation();
 
     let (
@@ -398,9 +334,58 @@ pub(super) fn AppController() -> impl IntoView {
         cancel_all_generations,
     );
 
+    let local_state_status = persistence.local_state_status;
+    let reload_after_load_failure = move |_| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.location().reload();
+        }
+    };
+
     view! {
         <ThemeBackdrop />
-        <div class="shell shell-single">
+        <Show when=move || {
+            !local_state_status.with(LocalStateLoadStatus::is_ready)
+        }>
+            <div class="local-state-gate" role="alertdialog" aria-modal="true">
+                <div class="local-state-gate-card">
+                    <span class="material-symbols-rounded" aria-hidden="true">
+                        {move || match local_state_status.get() {
+                            LocalStateLoadStatus::Failed(_) => "database_off",
+                            LocalStateLoadStatus::Loading | LocalStateLoadStatus::Ready => "database",
+                        }}
+                    </span>
+                    <h2>
+                        {move || match local_state_status.get() {
+                            LocalStateLoadStatus::Failed(_) => "本地数据暂时无法读取",
+                            LocalStateLoadStatus::Loading | LocalStateLoadStatus::Ready => "正在恢复本地工作区",
+                        }}
+                    </h2>
+                    <p>
+                        {move || match local_state_status.get() {
+                            LocalStateLoadStatus::Failed(error) => format!(
+                                "为避免空数据覆盖原工作区，当前页面已停止写入。请关闭其他 MewImage 页面后刷新重试。错误：{error}"
+                            ),
+                            LocalStateLoadStatus::Loading | LocalStateLoadStatus::Ready => {
+                                "正在读取会话、任务和图片索引，请稍候……".into()
+                            }
+                        }}
+                    </p>
+                    <Show when=move || matches!(
+                        local_state_status.get(),
+                        LocalStateLoadStatus::Failed(_)
+                    )>
+                        <button class="button primary" on:click=reload_after_load_failure>
+                            <span class="material-symbols-rounded" aria-hidden="true">"refresh"</span>
+                            "刷新重试"
+                        </button>
+                    </Show>
+                </div>
+            </div>
+        </Show>
+        <div
+            class="shell shell-single"
+            inert=move || !local_state_status.with(LocalStateLoadStatus::is_ready)
+        >
             <TopBar persist_ui_state=persist_ui_state />
             <SettingsOverlay
                 add_config=add_config

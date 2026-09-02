@@ -6,6 +6,109 @@ struct PreparedGeneratedImage {
     local_background_error: Option<String>,
 }
 
+fn submitted_reference_ids(
+    assets: &[ImageAssetRef],
+    selected_ids: &[String],
+    continuation_asset_id: Option<&str>,
+) -> Vec<String> {
+    let mut ordered_ids = Vec::with_capacity(MAX_GENERATION_REFERENCE_ASSETS);
+    let mut seen_ids = HashSet::new();
+    let candidates = continuation_asset_id
+        .into_iter()
+        .chain(selected_ids.iter().map(String::as_str));
+
+    for asset_id in candidates {
+        if ordered_ids.len() >= MAX_GENERATION_REFERENCE_ASSETS || !seen_ids.insert(asset_id) {
+            continue;
+        }
+        let is_usable = assets.iter().any(|asset| {
+            asset.id == asset_id
+                && !asset.metadata.contains_key("mask_base_asset_id")
+                && !is_theme_background(asset)
+        });
+        if is_usable {
+            ordered_ids.push(asset_id.to_string());
+        }
+    }
+    ordered_ids
+}
+
+fn generation_byte_budget(device_memory_gib: Option<f64>) -> u64 {
+    let Some(device_memory_gib) =
+        device_memory_gib.filter(|value| value.is_finite() && *value > 0.0)
+    else {
+        return DEFAULT_ACTIVE_GENERATION_BYTE_BUDGET;
+    };
+    ((device_memory_gib * 64.0 * 1024.0 * 1024.0).round() as u64).clamp(
+        MIN_ACTIVE_GENERATION_BYTE_BUDGET,
+        MAX_ACTIVE_GENERATION_BYTE_BUDGET,
+    )
+}
+
+fn browser_generation_byte_budget() -> u64 {
+    let device_memory_gib = web_sys::window()
+        .and_then(|window| {
+            Reflect::get(
+                window.navigator().as_ref(),
+                &wasm_bindgen::JsValue::from_str("deviceMemory"),
+            )
+            .ok()
+        })
+        .and_then(|value| value.as_f64());
+    generation_byte_budget(device_memory_gib)
+}
+
+fn estimated_generation_task_bytes(
+    assets: &[ImageAssetRef],
+    reference_ids: &[String],
+    width: u32,
+    height: u32,
+    count: u32,
+) -> u64 {
+    let mut seen_ids = HashSet::new();
+    let reference_bytes = reference_ids
+        .iter()
+        .filter(|asset_id| seen_ids.insert(asset_id.as_str()))
+        .filter_map(|asset_id| assets.iter().find(|asset| asset.id == *asset_id))
+        .map(|asset| asset.byte_len)
+        .fold(0_u64, u64::saturating_add);
+    let output_bytes = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4)
+        .saturating_mul(u64::from(count.max(1)));
+    // 参考图会在 Blob/Base64/重编码间短暂并存，结果也包含解码与保存缓冲。
+    reference_bytes
+        .saturating_mul(2)
+        .saturating_add(output_bytes.saturating_mul(2))
+        .saturating_add(GENERATION_TASK_FIXED_BYTE_OVERHEAD)
+}
+
+fn try_reserve_generation_bytes(
+    runtimes: &mut HashMap<String, ActiveGenerationRuntime>,
+    task_id: &str,
+    requested_bytes: u64,
+    budget_bytes: u64,
+) -> bool {
+    let reserved_bytes = runtimes
+        .values()
+        .map(|runtime| runtime.reserved_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let Some(runtime) = runtimes.get_mut(task_id) else {
+        return false;
+    };
+    if runtime.reserved_bytes > 0 {
+        return true;
+    }
+    if reserved_bytes.saturating_add(requested_bytes) > budget_bytes {
+        runtime.progress_label = "等待浏览器内存预算".into();
+        return false;
+    }
+    runtime.reserved_bytes = requested_bytes;
+    runtime.progress_label = "正在加载参考图".into();
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn prepare_generated_image(
     image: &mew_image_shared::GeneratedImageResult,
     result_index: usize,
@@ -143,9 +246,12 @@ async fn add_generated_thumbnail(asset: &mut ImageAssetRef) {
     }
 }
 
+fn generation_provider_allowed(provider_kind: ProviderKind, user_status: Option<&str>) -> bool {
+    provider_kind != ProviderKind::CustomHttp || user_status == Some("approved")
+}
+
 pub(crate) fn build_generation_actions(
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
-    enqueue_payload_writes: impl Fn(Vec<(String, String)>) + Copy + Send + Sync + 'static,
     commit_current_thread_draft: impl Fn() + Copy + Send + Sync + 'static,
 ) -> (
     impl Fn() + Copy + Send + Sync + 'static,
@@ -155,7 +261,9 @@ pub(crate) fn build_generation_actions(
 ) {
     let workspace = expect_context::<WorkspaceState>();
     let composer = expect_context::<ComposerState>();
+    let account = expect_context::<AccountState>();
     let ui = expect_context::<UiState>();
+    let persistence = expect_context::<PersistenceState>();
     let derived = expect_context::<AppDerived>();
     let configs = workspace.configs;
     let tasks = workspace.tasks;
@@ -188,9 +296,17 @@ pub(crate) fn build_generation_actions(
     let show_settings = ui.show_settings;
     let gallery_page = ui.gallery_page;
     let current_config = derived.current_config;
+    let auth_user = account.auth_user;
 
     let run_generation = move || {
         let queued_submission = queue_mode_enabled.get_untracked();
+        let active_count = active_generation_ids.with_untracked(HashSet::len);
+        if active_count >= MAX_ACTIVE_GENERATION_TASKS {
+            status_text.set(format!(
+                "当前已有 {MAX_ACTIVE_GENERATION_TASKS} 个活动任务，请等待完成或停止部分任务后再提交。"
+            ));
+            return;
+        }
         if !queued_submission && foreground_generation_task_id.get_untracked().is_some() {
             status_text.set("当前普通生成任务尚未结束，请等待完成或先停止任务。".into());
             return;
@@ -199,6 +315,16 @@ pub(crate) fn build_generation_actions(
             status_text.set("请先在设置中准备一个服务商配置。".into());
             return;
         };
+        let provider_allowed = auth_user.with_untracked(|user| {
+            generation_provider_allowed(
+                config.provider_kind,
+                user.as_ref().map(|user| user.status.as_str()),
+            )
+        });
+        if !provider_allowed {
+            status_text.set("CustomHttp 仅限已审批账号".into());
+            return;
+        }
         if config
             .api_key_plaintext
             .clone()
@@ -235,35 +361,41 @@ pub(crate) fn build_generation_actions(
             .unwrap_or_else(ProviderTemplate::builtin_openai);
         commit_current_thread_draft();
         let selected_ids = selected_reference_ids.get_untracked();
-        let mut references = selected_reference_assets(&assets.get_untracked(), &selected_ids);
-        references.truncate(16);
-        if let Some(asset_id) = continuation_asset_id.get_untracked() {
-            if let Some(asset) = assets
-                .get_untracked()
-                .iter()
-                .find(|asset| {
-                    asset.id == asset_id && !asset.metadata.contains_key("mask_base_asset_id")
-                })
-                .cloned()
-            {
-                references.retain(|item| item.id != asset.id);
-                references.insert(0, asset);
-                references.truncate(16);
-            }
-        }
-        let (resolved_width, resolved_height) = resolve_dimensions(
+        let continuation_id = continuation_asset_id.get_untracked();
+        let submitted_reference_ids = assets.with_untracked(|items| {
+            submitted_reference_ids(items, &selected_ids, continuation_id.as_deref())
+        });
+        let reference_size = assets.with_untracked(|items| {
+            submitted_reference_ids.iter().find_map(|asset_id| {
+                items
+                    .iter()
+                    .find(|asset| asset.id == *asset_id)
+                    .and_then(|asset| asset.width.zip(asset.height))
+            })
+        });
+        let (resolved_width, resolved_height) = resolve_dimensions_from_reference_size(
             resolution_mode.get_untracked().as_str(),
             resolution_group.get_untracked().as_str(),
             aspect_ratio.get_untracked().as_str(),
             effective_custom_aspect_ratio.get_untracked().as_str(),
             custom_width.get_untracked(),
             custom_height.get_untracked(),
-            &references,
+            reference_size,
         );
         custom_width.set(resolved_width);
         custom_height.set(resolved_height);
         let quality_value = quality.get_untracked();
         let count_value = count.get_untracked();
+        let task_estimated_bytes = assets.with_untracked(|items| {
+            estimated_generation_task_bytes(
+                items,
+                &submitted_reference_ids,
+                resolved_width,
+                resolved_height,
+                count_value,
+            )
+        });
+        let generation_byte_budget = browser_generation_byte_budget();
         let Ok(abort_controller) = web_sys::AbortController::new() else {
             status_text.set("当前浏览器无法创建请求中止控制器。".into());
             return;
@@ -271,10 +403,7 @@ pub(crate) fn build_generation_actions(
         let abort_signal = abort_controller.signal();
 
         let task_id = new_id();
-        let mut dependency_asset_ids = selected_ids.iter().cloned().collect::<HashSet<_>>();
-        if let Some(asset_id) = continuation_asset_id.get_untracked() {
-            dependency_asset_ids.insert(asset_id);
-        }
+        let dependency_asset_ids = submitted_reference_ids.iter().cloned().collect();
         generation_runtimes.update(|items| {
             items.insert(
                 task_id.clone(),
@@ -282,7 +411,8 @@ pub(crate) fn build_generation_actions(
                     abort_controller,
                     dependency_asset_ids,
                     thread_id: thread_id.clone(),
-                    progress_label: "正在加载参考图".into(),
+                    progress_label: "等待浏览器资源".into(),
+                    reserved_bytes: 0,
                 },
             );
         });
@@ -320,7 +450,7 @@ pub(crate) fn build_generation_actions(
                 config_id: config.id.clone(),
                 prompt: prompt.clone(),
                 requested_model: config.model.clone(),
-                reference_asset_ids: selected_ids.clone(),
+                reference_asset_ids: submitted_reference_ids.clone(),
                 generation_settings: Some(GenerationSettingsSnapshot {
                     width: resolved_width,
                     height: resolved_height,
@@ -357,10 +487,10 @@ pub(crate) fn build_generation_actions(
         let threads_signal = threads;
         let tombstones_signal = tombstones;
         let persist = persist_state;
-        let selected_ids_for_request = selected_ids.clone();
-        let continuation_asset_id_for_request = continuation_asset_id.get_untracked();
+        let reference_ids_for_request = submitted_reference_ids;
         spawn_local(async move {
             let finish_runtime = || {
+                // 删除运行时记录即释放该任务持有的浏览器字节预算。
                 generation_runtimes_signal.update(|items| {
                     items.remove(&task_id);
                 });
@@ -405,12 +535,52 @@ pub(crate) fn build_generation_actions(
                 true
             };
 
-            let mut required_asset_ids = selected_ids_for_request.clone();
-            if let Some(asset_id) = continuation_asset_id_for_request.clone() {
-                required_asset_ids.push(asset_id);
+            if task_estimated_bytes > generation_byte_budget {
+                let error = format!(
+                    "该任务预计需要 {} 浏览器内存，超过当前设备单任务预算 {}。请减少参考图、输出数量或分辨率。",
+                    format_byte_size(task_estimated_bytes),
+                    format_byte_size(generation_byte_budget),
+                );
+                tasks_signal.update(|items| {
+                    if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
+                        task.status = TaskStatus::Failed;
+                        task.updated_at = now_rfc3339();
+                        task.error_message = Some(error.clone());
+                    }
+                });
+                persist();
+                let remaining = finish_runtime();
+                status_signal.set(if remaining == 0 {
+                    format!("生成未开始：{error}")
+                } else {
+                    format!("生成未开始：{error}；仍有 {remaining} 个任务等待结果。")
+                });
+                play_generation_notification(false);
+                return;
             }
+
+            // 等待卡可以先展示，但获得预算前不加载或克隆参考图原文件。
+            loop {
+                if finish_cancelled() {
+                    return;
+                }
+                let mut acquired = false;
+                generation_runtimes_signal.update(|items| {
+                    acquired = try_reserve_generation_bytes(
+                        items,
+                        &task_id,
+                        task_estimated_bytes,
+                        generation_byte_budget,
+                    );
+                });
+                if acquired {
+                    break;
+                }
+                gloo_timers::future::TimeoutFuture::new(200).await;
+            }
+
             let payload_result =
-                ensure_asset_payloads_loaded(assets_signal, &required_asset_ids).await;
+                ensure_asset_payloads_loaded(assets_signal, &reference_ids_for_request).await;
             if finish_cancelled() {
                 return;
             }
@@ -433,23 +603,7 @@ pub(crate) fn build_generation_actions(
                 return;
             }
             let references = assets_signal.with_untracked(|items| {
-                let mut references = selected_reference_assets(items, &selected_ids_for_request);
-                references.truncate(16);
-                if let Some(asset_id) = continuation_asset_id_for_request.clone() {
-                    if let Some(asset) = items
-                        .iter()
-                        .find(|asset| {
-                            asset.id == asset_id
-                                && !asset.metadata.contains_key("mask_base_asset_id")
-                        })
-                        .cloned()
-                    {
-                        references.retain(|item| item.id != asset.id);
-                        references.insert(0, asset);
-                        references.truncate(16);
-                    }
-                }
-                references
+                selected_reference_assets(items, &reference_ids_for_request)
             });
             generation_runtimes_signal.update(|items| {
                 if let Some(runtime) = items.get_mut(&task_id) {
@@ -469,11 +623,22 @@ pub(crate) fn build_generation_actions(
             trim_asset_payload_cache(assets_signal);
             let generation_result =
                 generate_with_strategy(&template, &config, &request, Some(&abort_signal)).await;
-            if finish_cancelled() {
+            // 请求结束后立即释放其中克隆的参考图 payload，给结果解码和本地保存腾出空间。
+            drop(request);
+            if cancelled_generation_ids_signal.with_untracked(|items| items.contains(&task_id)) {
+                if let Ok(execution) = &generation_result {
+                    crate::providers::remove_proxy_generation_jobs(
+                        execution.pending_proxy_poll_urls.clone(),
+                    );
+                }
+                let _ = finish_cancelled();
                 return;
             }
             match generation_result {
-                Ok((result, used_proxy)) => {
+                Ok(execution) => {
+                    let mut result = execution.result;
+                    let used_proxy = execution.used_proxy;
+                    let pending_proxy_poll_urls = execution.pending_proxy_poll_urls;
                     let upstream_result_count = result.images.len();
                     let mut produced_assets = Vec::new();
                     let mut visible_asset_ids = Vec::new();
@@ -531,7 +696,11 @@ pub(crate) fn build_generation_actions(
                             gloo_timers::future::TimeoutFuture::new(0).await;
                         }
                     }
-                    if finish_cancelled() {
+                    if cancelled_generation_ids_signal
+                        .with_untracked(|items| items.contains(&task_id))
+                    {
+                        crate::providers::remove_proxy_generation_jobs(pending_proxy_poll_urls);
+                        let _ = finish_cancelled();
                         return;
                     }
                     if produced_assets.is_empty() {
@@ -562,15 +731,18 @@ pub(crate) fn build_generation_actions(
                             "上游结果未能落成本地可用图片，可能是网络、尺寸或响应异常导致。"
                                 .to_string()
                         };
+                        let mut diagnostic_result = Some(result);
                         tasks_signal.update(|items| {
                             if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
                                 task.status = TaskStatus::Failed;
                                 task.updated_at = now_rfc3339();
-                                task.result = Some(result.clone());
+                                task.result = diagnostic_result.take();
                                 task.error_message = Some(error.clone());
+                                strip_task_payloads(std::slice::from_mut(task));
                             }
                         });
                         persist();
+                        crate::providers::remove_proxy_generation_jobs(pending_proxy_poll_urls);
                         let remaining = finish_runtime();
                         status_signal.set(if remaining == 0 {
                             format!("生成失败：{error}")
@@ -587,11 +759,82 @@ pub(crate) fn build_generation_actions(
                         .unwrap_or((resolved_width, resolved_height));
                     let first_generated_id = visible_asset_ids.first().cloned();
                     let produced_payloads = asset_payload_pairs(&produced_assets);
+                    for asset in &mut produced_assets {
+                        asset.data_url = None;
+                    }
                     let produced_asset_ids = produced_assets
                         .iter()
                         .map(|asset| asset.id.clone())
                         .collect::<Vec<_>>();
-                    enqueue_payload_writes(produced_payloads);
+                    result.parameter_snapshot.actual_width = Some(actual_width);
+                    result.parameter_snapshot.actual_height = Some(actual_height);
+                    for image in &mut result.images {
+                        image.url = None;
+                        image.data_url = None;
+                    }
+                    result.raw_response_json = None;
+
+                    // 结果未落盘前任务始终保持 Running；空间释放后会自动恢复保存，
+                    // 避免一次临时配额错误把已经生成的图片永久标记为失败。
+                    const SAVE_RETRY_DELAYS_MS: [u32; 7] =
+                        [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+                    let mut save_failures = 0_usize;
+                    loop {
+                        if cancelled_generation_ids_signal
+                            .with_untracked(|items| items.contains(&task_id))
+                        {
+                            crate::providers::remove_proxy_generation_jobs(pending_proxy_poll_urls);
+                            let _ = finish_cancelled();
+                            return;
+                        }
+                        match apply_asset_payload_changes(&produced_payloads, &[]).await {
+                            Ok(()) => break,
+                            Err(error) => {
+                                save_failures = save_failures.saturating_add(1);
+                                let retry_delay = SAVE_RETRY_DELAYS_MS[save_failures
+                                    .saturating_sub(1)
+                                    .min(SAVE_RETRY_DELAYS_MS.len() - 1)];
+                                let progress_label =
+                                    format!("结果已生成，等待本地保存（重试 {save_failures}）");
+                                generation_runtimes_signal.update(|items| {
+                                    if let Some(runtime) = items.get_mut(&task_id) {
+                                        runtime.progress_label = progress_label.clone();
+                                    }
+                                });
+                                if !queued_submission {
+                                    status_signal.set(format!(
+                                        "{progress_label}：{error}。可释放浏览器存储空间，任务会自动继续。"
+                                    ));
+                                }
+
+                                // 分段等待，使“停止任务”无需等满 30 秒退避周期。
+                                let mut remaining_delay = retry_delay;
+                                while remaining_delay > 0 {
+                                    let slice = remaining_delay.min(250);
+                                    gloo_timers::future::TimeoutFuture::new(slice).await;
+                                    remaining_delay -= slice;
+                                    if cancelled_generation_ids_signal
+                                        .with_untracked(|items| items.contains(&task_id))
+                                    {
+                                        crate::providers::remove_proxy_generation_jobs(
+                                            pending_proxy_poll_urls,
+                                        );
+                                        let _ = finish_cancelled();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if cancelled_generation_ids_signal
+                        .with_untracked(|items| items.contains(&task_id))
+                    {
+                        let _ = apply_asset_payload_changes(&[], &produced_asset_ids).await;
+                        crate::providers::remove_proxy_generation_jobs(pending_proxy_poll_urls);
+                        let _ = finish_cancelled();
+                        return;
+                    }
+                    drop(produced_payloads);
                     assets_signal.update(|items| {
                         items.extend(produced_assets);
                         touch_and_trim_asset_payload_cache(items, &produced_asset_ids, false);
@@ -600,20 +843,30 @@ pub(crate) fn build_generation_actions(
                         .then(|| local_background_errors.join("；"));
                     tasks_signal.update(|items| {
                         if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
-                            let mut result = result;
-                            result.parameter_snapshot.actual_width = Some(actual_width);
-                            result.parameter_snapshot.actual_height = Some(actual_height);
                             task.status = TaskStatus::Succeeded;
                             task.updated_at = now_rfc3339();
                             task.result = Some(result);
                             task.error_message = local_background_error_message.clone();
-                            strip_successful_task_payloads(std::slice::from_mut(task));
+                            strip_task_payloads(std::slice::from_mut(task));
                         }
                     });
                     if !queued_submission {
                         continuation_signal.set(first_generated_id);
                     }
                     persist();
+                    // 原图和元数据使用两个独立事务；必须等包含成功任务的工作区修订真正落盘，
+                    // 才能确认删除服务端结果，避免崩溃窗口留下无法恢复的孤儿 Blob。
+                    if !pending_proxy_poll_urls.is_empty()
+                        && let Some(revision) = requested_workspace_persist_revision(persistence)
+                    {
+                        spawn_local(async move {
+                            if wait_for_workspace_persist_revision(persistence, revision).await {
+                                crate::providers::remove_proxy_generation_jobs(
+                                    pending_proxy_poll_urls,
+                                );
+                            }
+                        });
+                    }
                     let completion_message =
                         if local_background && !local_background_errors.is_empty() {
                             let mut detail = local_background_errors.join("；");
@@ -800,4 +1053,107 @@ pub(crate) fn build_generation_actions(
         cancel_generation,
         cancel_all_generations,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn test_asset(id: &str, byte_len: u64) -> ImageAssetRef {
+        ImageAssetRef {
+            id: id.into(),
+            sha256: format!("sha-{id}"),
+            mime_type: "image/png".into(),
+            byte_len,
+            width: Some(1),
+            height: Some(1),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+            data_url: None,
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn submitted_references_prioritize_continuation_filter_and_cap() {
+        let mut assets = (0..18)
+            .map(|index| test_asset(&format!("asset-{index}"), 1))
+            .collect::<Vec<_>>();
+        let mut mask = test_asset("mask", 1);
+        mask.metadata
+            .insert("mask_base_asset_id".into(), "asset-0".into());
+        let mut background = test_asset("background", 1);
+        background.metadata.insert(
+            THEME_BACKGROUND_ROLE_KEY.into(),
+            THEME_BACKGROUND_ROLE.into(),
+        );
+        assets.extend([mask, background]);
+
+        let mut selected_ids = vec!["missing".into(), "mask".into(), "background".into()];
+        selected_ids.extend((0..18).map(|index| format!("asset-{index}")));
+        selected_ids.push("asset-5".into());
+        let submitted = submitted_reference_ids(&assets, &selected_ids, Some("asset-5"));
+
+        assert_eq!(submitted.len(), MAX_GENERATION_REFERENCE_ASSETS);
+        assert_eq!(submitted.first().map(String::as_str), Some("asset-5"));
+        assert_eq!(
+            submitted
+                .iter()
+                .filter(|id| id.as_str() == "asset-5")
+                .count(),
+            1
+        );
+        assert!(
+            !submitted
+                .iter()
+                .any(|id| matches!(id.as_str(), "missing" | "mask" | "background"))
+        );
+    }
+
+    #[test]
+    fn byte_budget_uses_device_memory_and_clamps_extremes() {
+        assert_eq!(
+            generation_byte_budget(None),
+            DEFAULT_ACTIVE_GENERATION_BYTE_BUDGET
+        );
+        assert_eq!(
+            generation_byte_budget(Some(1.0)),
+            MIN_ACTIVE_GENERATION_BYTE_BUDGET
+        );
+        assert_eq!(generation_byte_budget(Some(4.0)), 256 * 1024 * 1024);
+        assert_eq!(
+            generation_byte_budget(Some(32.0)),
+            MAX_ACTIVE_GENERATION_BYTE_BUDGET
+        );
+    }
+
+    #[test]
+    fn task_estimate_deduplicates_references_and_includes_output_buffer() {
+        let assets = vec![test_asset("asset-a", 10), test_asset("asset-b", 20)];
+        let references = vec!["asset-a".into(), "asset-b".into(), "asset-a".into()];
+
+        assert_eq!(
+            estimated_generation_task_bytes(&assets, &references, 100, 50, 2),
+            GENERATION_TASK_FIXED_BYTE_OVERHEAD + (10 + 20) * 2 + 100 * 50 * 4 * 2 * 2
+        );
+    }
+
+    #[test]
+    fn custom_http_requires_an_approved_account() {
+        assert!(!generation_provider_allowed(ProviderKind::CustomHttp, None));
+        assert!(!generation_provider_allowed(
+            ProviderKind::CustomHttp,
+            Some("pending")
+        ));
+        assert!(generation_provider_allowed(
+            ProviderKind::CustomHttp,
+            Some("approved")
+        ));
+        assert!(generation_provider_allowed(ProviderKind::OpenAiImage, None));
+    }
 }

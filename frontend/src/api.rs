@@ -12,10 +12,23 @@ fn normalized_path(path: &str) -> String {
     }
 }
 
+fn url_host(hostname: &str) -> String {
+    if hostname.contains(':') && !hostname.starts_with('[') {
+        format!("[{hostname}]")
+    } else {
+        hostname.to_string()
+    }
+}
+
+fn is_local_hostname(hostname: &str) -> bool {
+    matches!(hostname, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
 fn local_backend_candidates(path: &str, scheme: &str, hostname: &str) -> Vec<String> {
     let mut values = Vec::new();
     let normalized = normalized_path(path);
     if !hostname.is_empty() {
+        let hostname = url_host(hostname);
         push_unique(
             &mut values,
             format!("{scheme}://{hostname}:3000{normalized}"),
@@ -48,15 +61,16 @@ pub fn api_candidates(path: &str) -> Vec<String> {
     } else {
         "http"
     };
-    let is_local_host = matches!(hostname.as_str(), "localhost" | "127.0.0.1");
+    let is_local_host = is_local_hostname(&hostname);
 
     if is_http {
         if is_local_host && port != "3000" {
             values.extend(local_backend_candidates(&normalized, scheme, &hostname));
-            if let Ok(origin) = location.origin() {
-                if !origin.is_empty() && origin != "null" {
-                    push_unique(&mut values, format!("{origin}{normalized}"));
-                }
+            if let Ok(origin) = location.origin()
+                && !origin.is_empty()
+                && origin != "null"
+            {
+                push_unique(&mut values, format!("{origin}{normalized}"));
             }
         } else if let Ok(origin) = location.origin() {
             if !origin.is_empty() && origin != "null" {
@@ -78,4 +92,19 @@ pub fn api_url(path: &str) -> String {
         .into_iter()
         .next()
         .unwrap_or_else(|| normalized_path(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_loopback_is_treated_as_local_and_formatted_for_urls() {
+        assert!(is_local_hostname("::1"));
+        assert!(is_local_hostname("[::1]"));
+        assert_eq!(
+            local_backend_candidates("/api/health", "http", "::1")[0],
+            "http://[::1]:3000/api/health"
+        );
+    }
 }

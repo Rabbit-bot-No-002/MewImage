@@ -1,10 +1,10 @@
-use leptos::prelude::*;
+use leptos::{prelude::*, task::spawn_local};
 use mew_image_shared::DEFAULT_FAVORITE_FOLDER_ID;
 use web_sys::MouseEvent;
 
 use crate::app::{
     derived::AppDerived,
-    first_displayable_generated_asset,
+    ensure_asset_display_sources_loaded, first_displayable_generated_asset,
     state::{UiState, WorkspaceState},
 };
 
@@ -35,6 +35,24 @@ pub(crate) fn FavoritesOverlay(
     let paged_favorite_gallery_entries = derived.paged_favorite_gallery_entries;
     let favorite_gallery_entries = derived.favorite_gallery_entries;
     let favorite_page_count = derived.favorite_page_count;
+
+    Effect::new(move |_| {
+        if !show_favorites_panel.get() {
+            return;
+        }
+        let missing_source_ids = paged_favorite_gallery_entries
+            .get()
+            .into_iter()
+            .filter(|item| item.src.as_deref().unwrap_or_default().is_empty())
+            .filter_map(|item| item.asset_id)
+            .collect::<Vec<_>>();
+        if missing_source_ids.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            let _ = ensure_asset_display_sources_loaded(assets, &missing_source_ids).await;
+        });
+    });
 
     view! {
             {move || if show_favorites_panel.get() {

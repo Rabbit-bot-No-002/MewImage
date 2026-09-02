@@ -292,10 +292,10 @@ pub(crate) fn build_preview_actions(
             }
         });
         preview_panel_state.update(|state| {
-            if let Some(state) = state.as_mut() {
-                if state.task_id == task_id {
-                    state.favorite = true;
-                }
+            if let Some(state) = state.as_mut()
+                && state.task_id == task_id
+            {
+                state.favorite = true;
             }
         });
         favorite_folder_picker.set(None);
@@ -350,10 +350,10 @@ pub(crate) fn build_preview_actions(
             });
         }
         preview_panel_state.update(|state| {
-            if let Some(state) = state.as_mut() {
-                if state.task_id == task_id {
-                    state.favorite = false;
-                }
+            if let Some(state) = state.as_mut()
+                && state.task_id == task_id
+            {
+                state.favorite = false;
             }
         });
         favorite_folder_picker.set(None);

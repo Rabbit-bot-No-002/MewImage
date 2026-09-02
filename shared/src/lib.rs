@@ -719,7 +719,8 @@ pub fn extract_gemini_generation_result(
             revised_prompt,
             duration_ms: None,
         },
-        raw_response_json: Some(response_json),
+        // 图片 Base64 已提取到 images；成功结果不再重复保留完整上游 JSON。
+        raw_response_json: None,
     })
 }
 
@@ -1130,7 +1131,8 @@ pub fn extract_nano_banana_result(
             revised_prompt,
             duration_ms: None,
         },
-        raw_response_json: Some(response_json),
+        // 图片 Base64 已提取到 images；成功结果不再重复保留完整上游 JSON。
+        raw_response_json: None,
     })
 }
 

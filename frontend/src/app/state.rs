@@ -18,6 +18,19 @@ use super::{
     system_prefers_dark,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LocalStateLoadStatus {
+    Loading,
+    Ready,
+    Failed(String),
+}
+
+impl LocalStateLoadStatus {
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct WorkspaceState {
     pub(crate) configs: RwSignal<Vec<EncryptedApiConfig>>,
@@ -38,6 +51,8 @@ pub(crate) struct ActiveGenerationRuntime {
     pub(crate) dependency_asset_ids: HashSet<String>,
     pub(crate) thread_id: String,
     pub(crate) progress_label: String,
+    /// 只有真正开始加载参考图后才占用预算；等待中的任务保持为 0。
+    pub(crate) reserved_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -141,6 +156,9 @@ pub(crate) struct UiState {
 
 #[derive(Clone, Copy)]
 pub(crate) struct PersistenceState {
+    pub(crate) local_state_status: RwSignal<LocalStateLoadStatus>,
+    pub(crate) workspace_persist_requested_revision: RwSignal<u64>,
+    pub(crate) workspace_persist_completed_revision: RwSignal<u64>,
     pub(crate) workspace_persist_scheduled: RwSignal<bool>,
     pub(crate) workspace_persist_inflight: RwSignal<bool>,
     pub(crate) workspace_persist_pending: RwSignal<bool>,
@@ -152,6 +170,7 @@ pub(crate) struct PersistenceState {
     pub(crate) payload_flush_scheduled: RwSignal<bool>,
     pub(crate) payload_flush_inflight: RwSignal<bool>,
     pub(crate) payload_flush_pending: RwSignal<bool>,
+    pub(crate) payload_flush_failures: RwSignal<u8>,
 }
 
 pub(crate) struct AppState {
@@ -277,6 +296,9 @@ impl AppState {
             floating_tip_token: RwSignal::new(0),
         };
         let persistence = PersistenceState {
+            local_state_status: RwSignal::new(LocalStateLoadStatus::Loading),
+            workspace_persist_requested_revision: RwSignal::new(0),
+            workspace_persist_completed_revision: RwSignal::new(0),
             workspace_persist_scheduled: RwSignal::new(false),
             workspace_persist_inflight: RwSignal::new(false),
             workspace_persist_pending: RwSignal::new(false),
@@ -288,6 +310,7 @@ impl AppState {
             payload_flush_scheduled: RwSignal::new(false),
             payload_flush_inflight: RwSignal::new(false),
             payload_flush_pending: RwSignal::new(false),
+            payload_flush_failures: RwSignal::new(0),
         };
 
         Self {

@@ -7,7 +7,7 @@ use crate::app::state::UiState;
 use super::common::MaterialSymbolIcon;
 use crate::app::{
     asset_full_preview_src, asset_src, copy_image_from_src, download_file_name_for_asset,
-    download_file_name_for_src, download_image_from_src,
+    download_image_from_src, ensure_asset_display_sources_loaded,
 };
 
 #[component]
@@ -83,6 +83,7 @@ pub(crate) fn ContextMenuOverlay(
 ) -> impl IntoView {
     let workspace = expect_context::<crate::app::state::WorkspaceState>();
     let context_menu_state = expect_context::<UiState>().context_menu_state;
+    let status_text = expect_context::<crate::app::state::ComposerState>().status_text;
     let assets = workspace.assets;
 
     view! {
@@ -91,21 +92,10 @@ pub(crate) fn ContextMenuOverlay(
             let y = menu.y;
             let task_id = menu.task_id.clone();
             let asset_id = menu.asset_id.clone();
-            let copy_src = assets.with(|items| {
-                items.iter()
-                    .find(|asset| asset.id == asset_id)
-                    .map(asset_src)
-                    .unwrap_or_default()
-            });
-            let download_src = copy_src.clone();
-            let download_name = assets.with(|items| {
-                items.iter()
-                    .find(|asset| asset.id == asset_id)
-                    .map(download_file_name_for_asset)
-                    .unwrap_or_else(|| download_file_name_for_src(&download_src))
-            });
             let edit_task_id = task_id.clone();
             let edit_asset_id = asset_id.clone();
+            let copy_asset_id = asset_id.clone();
+            let download_asset_id = asset_id.clone();
             view! {
                 <div class="context-menu-layer" on:click=move |_| context_menu_state.set(None)>
                     <div
@@ -114,15 +104,59 @@ pub(crate) fn ContextMenuOverlay(
                         on:click=move |ev: MouseEvent| ev.stop_propagation()
                     >
                         <button class="button ghost context-item" on:click=move |_| {
-                            let src = copy_src.clone();
                             context_menu_state.set(None);
+                            let asset_id = copy_asset_id.clone();
                             spawn_local(async move {
-                                let _ = copy_image_from_src(&src).await;
+                                if let Err(error) = ensure_asset_display_sources_loaded(
+                                    assets,
+                                    std::slice::from_ref(&asset_id),
+                                )
+                                .await
+                                {
+                                    status_text.set(format!("复制图片失败：{error}"));
+                                    return;
+                                }
+                                let src = assets.with_untracked(|items| {
+                                    items
+                                        .iter()
+                                        .find(|asset| asset.id == asset_id)
+                                        .map(asset_src)
+                                        .unwrap_or_default()
+                                });
+                                if !src.is_empty()
+                                    && let Err(error) = copy_image_from_src(&src).await
+                                {
+                                    status_text.set(format!("复制图片失败：{error}"));
+                                }
                             });
                         }>"复制"</button>
                         <button class="button ghost context-item" on:click=move |_| {
-                            let _ = download_image_from_src(&download_src, &download_name);
                             context_menu_state.set(None);
+                            let asset_id = download_asset_id.clone();
+                            spawn_local(async move {
+                                if let Err(error) = ensure_asset_display_sources_loaded(
+                                    assets,
+                                    std::slice::from_ref(&asset_id),
+                                )
+                                .await
+                                {
+                                    status_text.set(format!("下载图片失败：{error}"));
+                                    return;
+                                }
+                                let source = assets.with_untracked(|items| {
+                                    items
+                                        .iter()
+                                        .find(|asset| asset.id == asset_id)
+                                        .map(|asset| {
+                                            (asset_src(asset), download_file_name_for_asset(asset))
+                                        })
+                                });
+                                if let Some((src, file_name)) = source.filter(|(src, _)| !src.is_empty())
+                                    && let Err(error) = download_image_from_src(&src, &file_name)
+                                {
+                                    status_text.set(format!("下载图片失败：{error}"));
+                                }
+                            });
                         }>"下载"</button>
                         <button class="button ghost context-item" on:click=move |_| {
                             edit_output_asset(edit_task_id.clone(), edit_asset_id.clone());
@@ -140,13 +174,15 @@ pub(crate) fn ReferenceMenuOverlay(
     delete_asset: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
     let composer = expect_context::<crate::app::state::ComposerState>();
-    let derived = expect_context::<crate::app::derived::AppDerived>();
+    let workspace = expect_context::<crate::app::state::WorkspaceState>();
     let reference_menu_asset_id = composer.reference_menu_asset_id;
     let selected_reference_ids = composer.selected_reference_ids;
-    let current_reference_menu_asset = derived.current_reference_menu_asset;
+    let assets = workspace.assets;
 
     view! {
-        {move || current_reference_menu_asset.get().map(|asset| {
+        {move || reference_menu_asset_id.get().and_then(|asset_id| {
+            assets.with(|items| items.iter().find(|asset| asset.id == asset_id).cloned())
+        }).map(|asset| {
             let delete_asset_id = asset.id.clone();
             let toggle_reference_id = asset.id.clone();
             let toggle_reference_label_id = asset.id.clone();

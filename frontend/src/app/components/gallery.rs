@@ -4,7 +4,7 @@ use web_sys::MouseEvent;
 
 use crate::app::{
     derived::AppDerived,
-    ensure_asset_payloads_loaded, first_displayable_generated_asset,
+    ensure_asset_display_sources_loaded, first_displayable_generated_asset,
     models::{ConfirmPopoverKind, ConfirmPopoverState, ContextMenuState},
     state::{ComposerState, UiState, WorkspaceState},
 };
@@ -33,6 +33,21 @@ pub(crate) fn GallerySidebar(
     let gallery_entries = derived.gallery_entries;
     let paged_gallery_entries = derived.paged_gallery_entries;
     let gallery_page_count = derived.gallery_page_count;
+
+    Effect::new(move |_| {
+        let missing_source_ids = paged_gallery_entries
+            .get()
+            .into_iter()
+            .filter(|item| item.src.as_deref().unwrap_or_default().is_empty())
+            .filter_map(|item| item.asset_id)
+            .collect::<Vec<_>>();
+        if missing_source_ids.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            let _ = ensure_asset_display_sources_loaded(assets, &missing_source_ids).await;
+        });
+    });
 
     view! {
                 <aside class="panel gallery-sidebar">
@@ -132,7 +147,7 @@ pub(crate) fn GallerySidebar(
                                                                 let assets_signal = assets;
                                                                 let preload_asset_id = asset_id.clone();
                                                                 spawn_local(async move {
-                                                                    let _ = ensure_asset_payloads_loaded(
+                                                                    let _ = ensure_asset_display_sources_loaded(
                                                                         assets_signal,
                                                                         &[preload_asset_id],
                                                                     )

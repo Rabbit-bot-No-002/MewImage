@@ -4,7 +4,6 @@ use super::super::*;
 pub(crate) fn build_data_actions(
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
     persist_ui_state: impl Fn() + Copy + Send + Sync + 'static,
-    enqueue_payload_writes: impl Fn(Vec<(String, String)>) + Copy + Send + Sync + 'static,
     enqueue_payload_deletes: impl Fn(Vec<String>) + Copy + Send + Sync + 'static,
     commit_current_thread_draft: impl Fn() + Copy + Send + Sync + 'static,
 ) -> (
@@ -232,6 +231,23 @@ pub(crate) fn build_data_actions(
                     let imported_payload_map =
                         imported.payloads.iter().cloned().collect::<HashMap<_, _>>();
                     merge_asset_payloads(&mut imported.state.assets, &imported_payload_map);
+                    if let Err(error) = apply_asset_payload_changes(&imported.payloads, &[]).await {
+                        let imported_payload_ids = imported
+                            .payloads
+                            .iter()
+                            .map(|(asset_id, _)| asset_id.clone())
+                            .collect::<Vec<_>>();
+                        // 导入器只返回新 ID 的 payload，因此可以安全清理已成功的前序批次。
+                        let _ = apply_asset_payload_changes(&[], &imported_payload_ids).await;
+                        data_management_message.set(Some(format!(
+                            "导入失败：图片原文件未能写入浏览器存储：{error}。现有工作区未被修改。"
+                        )));
+                        data_management_busy.set(false);
+                        return;
+                    }
+                    for asset in &mut imported.state.assets {
+                        asset.data_url = None;
+                    }
                     reconcile_task_integrity(
                         &mut imported.state.tasks,
                         &imported.state.assets,
@@ -277,7 +293,6 @@ pub(crate) fn build_data_actions(
                         checkpoint,
                         tombstones,
                     );
-                    enqueue_payload_writes(imported.payloads);
                     persist_state();
                     persist_ui_state();
                     if is_session_backup {
@@ -399,10 +414,8 @@ pub(crate) fn build_data_actions(
         }
         spawn_local(async move {
             let mut errors = Vec::new();
-            if clear_workspace {
-                if let Err(error) = clear_asset_payloads().await {
-                    errors.push(format!("清除图片失败：{error}"));
-                }
+            if clear_workspace && let Err(error) = clear_asset_payloads().await {
+                errors.push(format!("清除图片失败：{error}"));
             }
             data_management_message.set(Some(if errors.is_empty() {
                 "所选本地数据已清除，云端数据未受影响。".into()
