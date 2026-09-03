@@ -103,16 +103,19 @@ MEW_TRUSTED_PROXY_CIDRS=反向代理所在的精确IP或CIDR
 
 只有当 MewImage 后端端口无法绕过反向代理直接从公网访问时，才能开启 `MEW_TRUST_PROXY_HEADERS`，并且必须用 `MEW_TRUSTED_PROXY_CIDRS` 限定真实反向代理；反向代理还必须主动覆盖 `X-Real-IP` 和 `X-Forwarded-For`，不得原样透传客户端提交的同名请求头。其他连接提交的转发头会被忽略。
 
-容器使用固定的非 root 用户 `10001:10001`。Linux 或 NAS 在首次启动前必须先准备可写的数据目录；从旧版 root 容器升级时，先执行 `docker compose down`，再做一次递归权限迁移：
+容器使用固定的非 root 用户 `10001:10001`。Linux 或 NAS 在首次启动前必须主动创建可写的数据目录，不能依赖 Docker 自动创建 `./data`，否则该目录通常会属于 `root:root`。从旧版 root 容器升级时，也必须先执行 `docker compose down`，再做一次递归权限迁移：
 
 ```bash
 chmod 600 ./.env
-mkdir -p ./data
+sudo mkdir -p ./data/assets ./data/.tmp
 sudo chown -R 10001:10001 ./data
-sudo chmod 750 ./data
+sudo find ./data -type d -exec chmod 750 {} \;
+sudo find ./data -type f -exec chmod 600 {} \;
 ```
 
 Windows 和 macOS Docker Desktop 的 bind mount 通常不需要手工修改 UID/GID；如果启动日志提示 `/data` 无写入权限，再检查目录共享和 ACL。
+
+如果容器反复重启且日志出现 `Permission denied (os error 13)`，OpenResty/Nginx 的 `502 Bad Gateway` 只是后端未能启动的连带结果。按上面的命令修正实际挂载到 `/data` 的宿主机目录后重新启动即可，不要把应用改回 root 用户。SELinux 主机还需为 bind mount 添加私有标签 `./data:/data:rw,Z`；CIFS、NFS 或 NAS 共享则需要在共享 ACL 或挂载参数中授予 UID/GID `10001` 写权限。
 
 确认配置和目录权限后启动：
 

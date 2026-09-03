@@ -15,6 +15,7 @@ use std::{
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Context;
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
@@ -102,6 +103,7 @@ const PROXY_TEMP_FILE_TTL: StdDuration = StdDuration::from_secs(45 * 60);
 const S3_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const S3_OPERATION_ATTEMPT_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60);
 const S3_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
+const DOCKER_DATA_PERMISSION_HINT: &str = "Docker Compose 默认以 UID:GID 10001:10001 运行；请在部署目录停止容器后执行 `sudo chown -R 10001:10001 ./data`，并确认该目录允许所有者读写。";
 const REGISTRATION_DEVICE_COOKIE: &str = "mew_registration_device";
 const OPENAI_EDIT_IMAGE_FIELD: &str = "image[]";
 static PROXY_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -193,8 +195,19 @@ async fn main() -> anyhow::Result<()> {
     let db = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(db_options)
-        .await?;
-    init_db(&db).await?;
+        .await
+        .with_context(|| {
+            format!(
+                "无法打开 SQLite 数据库 `{}`。{DOCKER_DATA_PERMISSION_HINT}",
+                config.database_url
+            )
+        })?;
+    init_db(&db).await.with_context(|| {
+        format!(
+            "初始化 SQLite 数据结构失败。数据库位置：`{}`。{DOCKER_DATA_PERMISSION_HINT}",
+            config.database_url
+        )
+    })?;
 
     let s3 = build_s3_client(&config).await?;
     let dummy_password_hash = hash_password("MewImage dummy password verification")
@@ -235,7 +248,12 @@ async fn main() -> anyhow::Result<()> {
     let session_store = SqliteStore::new(state.db.clone())
         .with_table_name("mew_image_sessions")
         .map_err(anyhow::Error::msg)?;
-    session_store.migrate().await?;
+    session_store.migrate().await.with_context(|| {
+        format!(
+            "初始化 SQLite 会话表失败。数据库位置：`{}`。{DOCKER_DATA_PERMISSION_HINT}",
+            config.database_url
+        )
+    })?;
     let session_cleanup_task = tokio::spawn(
         session_store
             .clone()
@@ -414,11 +432,15 @@ fn proxy_temp_dir() -> &'static PathBuf {
 
 async fn prepare_proxy_temp_dir() -> anyhow::Result<()> {
     let directory = proxy_temp_dir();
-    tokio::fs::create_dir_all(directory).await?;
+    tokio::fs::create_dir_all(directory)
+        .await
+        .with_context(|| writable_path_context("创建代理临时目录", directory))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
+        tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .await
+            .with_context(|| writable_path_context("设置代理临时目录权限", directory))?;
     }
     cleanup_stale_proxy_temp_dirs().await;
     Ok(())
@@ -463,16 +485,26 @@ fn ensure_sqlite_parent_dir(database_url: &str) -> anyhow::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| writable_path_context("创建 SQLite 数据目录", parent))?;
     }
     Ok(())
 }
 
 fn ensure_asset_store_ready(config: &AppConfig) -> anyhow::Result<()> {
     if config.asset_store == AssetStoreKind::Local {
-        std::fs::create_dir_all(&config.local_asset_dir)?;
+        std::fs::create_dir_all(&config.local_asset_dir).with_context(|| {
+            writable_path_context("创建本地图片资源目录", FsPath::new(&config.local_asset_dir))
+        })?;
     }
     Ok(())
+}
+
+fn writable_path_context(action: &str, path: &FsPath) -> String {
+    format!(
+        "{action} `{}` 失败。{DOCKER_DATA_PERMISSION_HINT}",
+        path.display()
+    )
 }
 
 async fn build_s3_client(config: &AppConfig) -> anyhow::Result<Option<S3Client>> {

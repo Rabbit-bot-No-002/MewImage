@@ -16,7 +16,7 @@ use mew_image_shared::{
 use serde_json::json;
 
 use crate::api::api_candidates;
-use crate::app::{blob_from_bytes, reencode_asset_bytes, strip_task_payloads};
+use crate::app::{blob_from_bytes, reencode_asset_bytes, sha256_hex, strip_task_payloads};
 use crate::crypto::{decrypt_secret, encrypt_secret};
 
 const PROMPT_REWRITE_GUARD_PREFIX: &str =
@@ -797,19 +797,32 @@ async fn prepare_transport_assets(assets: &[ImageAssetRef]) -> Result<Vec<Transp
 async fn prepare_transport_asset(asset: &ImageAssetRef) -> Result<TransportAsset, String> {
     let (bytes, mime_type, width, height) =
         reencode_asset_bytes(asset, "image/webp", Some(0.9)).await?;
+    let meta = transport_asset_meta(asset, &bytes, &mime_type, width, height);
+    Ok(TransportAsset {
+        meta,
+        bytes,
+        mime_type,
+    })
+}
+
+fn transport_asset_meta(
+    asset: &ImageAssetRef,
+    bytes: &[u8],
+    mime_type: &str,
+    width: u32,
+    height: u32,
+) -> ImageAssetRef {
     let mut meta = asset.clone();
-    meta.mime_type = mime_type.clone();
+    // 参考图在传输前会重新编码，完整性元数据必须对应实际发送的字节。
+    meta.sha256 = sha256_hex(bytes);
+    meta.mime_type = mime_type.to_string();
     meta.byte_len = bytes.len() as u64;
     meta.width = Some(width);
     meta.height = Some(height);
     meta.data_url = None;
     meta.remote_object_key = None;
     meta.remote_url = None;
-    Ok(TransportAsset {
-        meta,
-        bytes,
-        mime_type,
-    })
+    meta
 }
 
 fn mime_extension(mime_type: &str) -> &'static str {
@@ -1227,6 +1240,26 @@ mod tests {
             completed,
             ProxyGenerationSubmission::Completed(result) if result == expected
         ));
+    }
+
+    #[test]
+    fn transport_metadata_hashes_the_reencoded_bytes() {
+        let source = test_reference_asset(
+            Some("data:image/png;base64,AA=="),
+            Some("https://example.test/reference.png"),
+        );
+        let bytes = b"reencoded-webp";
+
+        let meta = transport_asset_meta(&source, bytes, "image/webp", 640, 480);
+
+        assert_eq!(meta.id, source.id);
+        assert_eq!(meta.sha256, sha256_hex(bytes));
+        assert_eq!(meta.mime_type, "image/webp");
+        assert_eq!(meta.byte_len, bytes.len() as u64);
+        assert_eq!((meta.width, meta.height), (Some(640), Some(480)));
+        assert!(meta.data_url.is_none());
+        assert!(meta.remote_object_key.is_none());
+        assert!(meta.remote_url.is_none());
     }
 
     #[test]
