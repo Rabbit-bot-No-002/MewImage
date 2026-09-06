@@ -555,6 +555,7 @@ mod tests {
             favorite,
             favorite_folder_id: favorite.then(|| DEFAULT_FAVORITE_FOLDER_ID.into()),
             detached_from_thread: false,
+            source_gallery_template_id: None,
             status: TaskStatus::Succeeded,
             error_message: None,
             created_at: "2026-01-01T00:00:00+00:00".into(),

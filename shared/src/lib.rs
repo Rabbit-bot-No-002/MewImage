@@ -1400,10 +1400,116 @@ pub struct LocalTaskRecord {
     pub favorite_folder_id: Option<String>,
     #[serde(default)]
     pub detached_from_thread: bool,
+    /// 模板广场收藏生成的本地快照来源；旧任务缺少该字段时按普通任务处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_gallery_template_id: Option<String>,
     pub status: TaskStatus,
     pub error_message: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryTemplateStatus {
+    #[default]
+    Draft,
+    Published,
+    Archived,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryAssetRole {
+    Preview,
+    Reference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryAsset {
+    pub id: String,
+    pub role: GalleryAssetRole,
+    pub sha256: String,
+    pub mime_type: String,
+    pub byte_len: u64,
+    pub width: u32,
+    pub height: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryTemplate {
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub generation_settings: GenerationSettingsSnapshot,
+    pub recommended_provider_kind: ProviderKind,
+    pub recommended_model: String,
+    pub preview_assets: Vec<GalleryAsset>,
+    pub reference_assets: Vec<GalleryAsset>,
+    pub status: GalleryTemplateStatus,
+    pub like_count: u64,
+    pub liked_by_viewer: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryTemplateListResponse {
+    pub items: Vec<GalleryTemplate>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryTagSummary {
+    pub name: String,
+    pub template_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryTemplateUpsertRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub title: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub generation_settings: GenerationSettingsSnapshot,
+    pub recommended_provider_kind: ProviderKind,
+    pub recommended_model: String,
+    #[serde(default)]
+    pub preview_asset_ids: Vec<String>,
+    #[serde(default)]
+    pub reference_asset_ids: Vec<String>,
+    pub status: GalleryTemplateStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryLikeResponse {
+    pub template_id: String,
+    pub like_count: u64,
+    pub liked: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryImportMode {
+    #[default]
+    Merge,
+    Replace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryImportResponse {
+    pub imported_template_count: usize,
+    pub imported_asset_count: usize,
+    pub mode: GalleryImportMode,
 }
 
 /// 成功任务的图片本体由 ImageAssetRef 管理，任务中只保留结果数量和参数快照。
@@ -2362,6 +2468,7 @@ mod tests {
             favorite: false,
             favorite_folder_id: None,
             detached_from_thread: false,
+            source_gallery_template_id: None,
             status: TaskStatus::Failed,
             error_message: None,
             created_at: "2026-01-01T00:00:00+00:00".into(),
@@ -2420,6 +2527,7 @@ mod tests {
             favorite: true,
             favorite_folder_id: Some(DEFAULT_FAVORITE_FOLDER_ID.into()),
             detached_from_thread: true,
+            source_gallery_template_id: None,
             status: TaskStatus::Succeeded,
             error_message: None,
             created_at: "2026-01-01T00:00:00+00:00".into(),
@@ -2492,6 +2600,7 @@ mod tests {
             favorite: false,
             favorite_folder_id: None,
             detached_from_thread: false,
+            source_gallery_template_id: None,
             status: TaskStatus::Failed,
             error_message: None,
             created_at: "2026-01-01T00:00:00+00:00".into(),
@@ -2716,6 +2825,7 @@ mod tests {
             favorite: false,
             favorite_folder_id: None,
             detached_from_thread: false,
+            source_gallery_template_id: None,
             status: TaskStatus::Succeeded,
             error_message: None,
             created_at: now_rfc3339(),

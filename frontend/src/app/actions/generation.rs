@@ -467,6 +467,7 @@ pub(crate) fn build_generation_actions(
                 favorite: false,
                 favorite_folder_id: None,
                 detached_from_thread: false,
+                source_gallery_template_id: None,
                 status: TaskStatus::Running,
                 error_message: None,
                 created_at: now_rfc3339(),

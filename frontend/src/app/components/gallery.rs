@@ -116,7 +116,10 @@ pub(crate) fn GallerySidebar(
                                             .unwrap_or_else(|| "等待结果".into())
                                     });
                                     view! {
-                                        <article class="card gallery-card-compact">
+                                        <article
+                                            class="card gallery-card-compact"
+                                            class:is-failed=item_status == TaskStatus::Failed
+                                        >
                                             {if item_status == TaskStatus::Running {
                                                 view! {
                                                     <button
@@ -174,7 +177,12 @@ pub(crate) fn GallerySidebar(
                                             <div class="card-body stack compact-card-body">
                                                 <p class="gallery-card-title">{item.prompt.clone()}</p>
                                                 {error_message.map(|error| view! {
-                                                    <span class="status gallery-failure-summary">{format!("失败：{error}")}</span>
+                                                    <span
+                                                        class="status gallery-failure-summary"
+                                                        title=error.clone()
+                                                    >
+                                                        {format!("失败：{error}")}
+                                                    </span>
                                                 })}
                                                 {
                                                     let meta_label =
