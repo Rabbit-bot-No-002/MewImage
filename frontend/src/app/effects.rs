@@ -127,6 +127,8 @@ pub(crate) fn install_app_effects() {
             }
             if ui.show_config_switcher.get_untracked() {
                 ui.show_config_switcher.set(false);
+                event.prevent_default();
+                event.stop_immediate_propagation();
                 return;
             }
             if ui.preview_state.get_untracked().is_none() {
@@ -148,6 +150,8 @@ pub(crate) fn install_app_effects() {
                 ui.preview_dragging.set(false);
                 ui.context_menu_state.set(None);
             }
+            event.prevent_default();
+            event.stop_immediate_propagation();
         });
         let _ =
             window.add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref());

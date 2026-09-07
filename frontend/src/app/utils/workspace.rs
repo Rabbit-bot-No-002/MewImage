@@ -477,6 +477,7 @@ pub(crate) fn thread_reference_assets(
         asset.source_task_id.is_none()
             && asset.metadata.get("thread_id").map(String::as_str) == Some(thread_id)
             && !asset.metadata.contains_key("mask_base_asset_id")
+            && !asset.metadata.contains_key(FAVORITE_ARCHIVE_ASSET_KEY)
             && !is_theme_background(asset)
     }) {
         if included_ids.insert(asset.id.clone()) {
@@ -689,6 +690,11 @@ mod tests {
             ),
             test_task("other", "thread-2", false, &["other-reference"]),
         ];
+        let mut archived_favorite_reference =
+            test_asset("archived-favorite", None, Some("thread-1"));
+        archived_favorite_reference
+            .metadata
+            .insert(FAVORITE_ARCHIVE_ASSET_KEY.into(), "true".into());
         let assets = vec![
             test_asset("selected", None, Some("thread-1")),
             test_asset("historical", None, None),
@@ -697,6 +703,7 @@ mod tests {
             test_asset("unused-result", Some("current"), None),
             test_asset("other-reference", None, Some("thread-2")),
             test_asset("other-upload", None, Some("thread-2")),
+            archived_favorite_reference,
         ];
 
         let references = thread_reference_assets(&assets, &tasks, "thread-1", &["selected".into()]);

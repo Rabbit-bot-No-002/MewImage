@@ -205,6 +205,33 @@ trunk serve --open
 
 - 推荐优先通过后端地址 `http://127.0.0.1:3000` 使用完整功能。
 - 如果只打开静态文件或只开 `trunk serve`，纯本地 UI 可以运行，但某些代理相关能力会受限。
+- 若要让本地后端访问同一台电脑上的明文图像上游，请先停止后端，再根据系统在启动后端的同一个终端中设置以下临时环境变量。
+
+Windows PowerShell：
+
+```powershell
+$env:MEW_ALLOW_HTTP_UPSTREAM = "true"
+$env:MEW_ALLOW_LOOPBACK_UPSTREAM = "true"
+cargo run -p mew-image-backend
+```
+
+Linux/macOS Bash 或 Zsh：
+
+```bash
+export MEW_ALLOW_HTTP_UPSTREAM=true
+export MEW_ALLOW_LOOPBACK_UPSTREAM=true
+cargo run -p mew-image-backend
+```
+
+Linux/macOS 也可以只对本次启动设置变量：
+
+```bash
+MEW_ALLOW_HTTP_UPSTREAM=true \
+MEW_ALLOW_LOOPBACK_UPSTREAM=true \
+cargo run -p mew-image-backend
+```
+
+该开发开关只允许显式的 `127.0.0.1`、`::1`、`localhost` 和 `localhost.localdomain`，且仅在 MewImage 后端自身监听环回地址时生效；`10.x`、`172.16–31.x`、`192.168.x` 等局域网地址仍会被拒绝。默认 Docker 监听 `0.0.0.0:3000`，因此该开关不会放宽容器部署。直接执行 `cargo run` 不会自动读取项目根目录的 `.env`，使用上述命令最可靠。测试结束后可关闭当前终端；PowerShell 也可执行 `Remove-Item Env:MEW_ALLOW_LOOPBACK_UPSTREAM, Env:MEW_ALLOW_HTTP_UPSTREAM`，Bash/Zsh 可执行 `unset MEW_ALLOW_LOOPBACK_UPSTREAM MEW_ALLOW_HTTP_UPSTREAM` 清除临时变量。
 
 
 ### 账号规则

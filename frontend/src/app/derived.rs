@@ -68,7 +68,7 @@ impl AppDerived {
             let mut visible = workspace.tasks.with(|task_list| {
                 task_list
                     .iter()
-                    .filter(|task| task.thread_id == thread_id)
+                    .filter(|task| task.thread_id == thread_id && !task.detached_from_thread)
                     .cloned()
                     .collect::<Vec<_>>()
             });

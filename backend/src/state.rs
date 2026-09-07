@@ -73,6 +73,7 @@ pub struct AppConfig {
     pub trusted_provider_hosts: Vec<String>,
     pub enforce_provider_host_whitelist: bool,
     pub allow_insecure_upstreams: bool,
+    pub allow_loopback_upstreams: bool,
     pub enable_guest_proxy: bool,
     pub guest_generation_concurrency: u32,
     pub guest_image_concurrency: u32,
@@ -184,6 +185,11 @@ impl AppConfig {
                 .or_else(|_| std::env::var("MEW_ALLOW_HTTP_UPSTREAMS"))
                 .or_else(|_| std::env::var("MEW_IMAGE_ALLOW_HTTP_UPSTREAM"))
                 .or_else(|_| std::env::var("MEW_IMAGE_ALLOW_INSECURE_UPSTREAMS"))
+                .map(|value| value == "true")
+                .unwrap_or(false),
+            allow_loopback_upstreams: std::env::var("MEW_ALLOW_LOOPBACK_UPSTREAM")
+                .or_else(|_| std::env::var("MEW_ALLOW_LOOPBACK_UPSTREAMS"))
+                .or_else(|_| std::env::var("MEW_IMAGE_ALLOW_LOOPBACK_UPSTREAM"))
                 .map(|value| value == "true")
                 .unwrap_or(false),
             enable_guest_proxy: env_value("MEW_GUEST_PROXY", "MEW_IMAGE_ENABLE_GUEST_PROXY")

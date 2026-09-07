@@ -2345,7 +2345,7 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 }
 
 .template-card-body p,
-.template-detail-content > p {
+.template-detail-header > p {
   margin: 0;
   color: var(--muted);
 }
@@ -2680,7 +2680,6 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 }
 
 .template-card-preview img,
-.template-detail-gallery img,
 .template-editor-asset-grid img {
   width: 100%;
   height: 100%;
@@ -2878,56 +2877,202 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 
 .template-detail {
   position: relative;
-  width: min(1180px, calc(100vw - 32px));
-  max-height: calc(100vh - 48px);
-  overflow: auto;
+  width: min(1320px, calc(100vw - 48px));
+  height: min(820px, calc(100vh - 48px));
+  height: min(820px, calc(100dvh - 48px));
+  min-height: 0;
+  overflow: hidden;
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
-  gap: 22px;
+  grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.72fr);
+  gap: 0;
+  padding: 0;
 }
 
 .template-modal-close {
   position: absolute;
-  right: 12px;
-  top: 12px;
+  top: 14px;
+  right: 14px;
   z-index: 3;
 }
 
-.template-detail-gallery {
+.template-detail-visual {
+  min-width: 0;
+  min-height: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 18px;
+  border-right: 1px solid rgba(var(--primary-rgb), 0.16);
+  background:
+    radial-gradient(circle at 18% 16%, rgba(var(--primary-rgb), 0.13), transparent 34%),
+    radial-gradient(circle at 82% 86%, rgba(var(--secondary-rgb), 0.12), transparent 32%),
+    var(--input-bg, var(--panel-strong));
+}
+
+.template-detail-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(var(--primary-rgb), 0.15);
+  border-radius: 20px;
+  background: rgba(var(--primary-rgb), 0.035);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+}
+
+.template-detail-stage > img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  object-fit: contain;
+}
+
+.template-detail-empty-preview {
+  display: grid;
+  place-items: center;
   gap: 8px;
-  align-content: start;
+  color: var(--muted);
 }
 
-.template-detail-gallery img {
-  max-height: 520px;
-  border-radius: 16px;
+.template-detail-empty-preview .material-symbols-rounded {
+  font-size: 44px;
 }
 
-.template-detail-gallery img:first-child:nth-last-child(1),
-.template-detail-gallery img:first-child:nth-last-child(3) {
-  grid-column: 1 / -1;
+.template-detail-preview-count {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 5px 9px;
+  border: 1px solid rgba(var(--primary-rgb), 0.18);
+  border-radius: 999px;
+  color: var(--text);
+  background: var(--panel-strong);
+  box-shadow: 0 8px 20px rgba(var(--primary-rgb), 0.14);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.template-detail-thumbnails {
+  min-width: 0;
+  min-height: 68px;
+  overflow-x: auto;
+  display: flex;
+  justify-content: center;
+  gap: 9px;
+  padding: 2px;
+  scrollbar-width: thin;
+}
+
+.template-detail-thumbnail {
+  flex: 0 0 64px;
+  width: 64px;
+  height: 64px;
+  overflow: hidden;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 12px;
+  background: rgba(var(--primary-rgb), 0.08);
+  opacity: 0.66;
+  cursor: pointer;
+  transition: opacity 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+
+.template-detail-thumbnail:hover,
+.template-detail-thumbnail.is-active {
+  border-color: var(--primary);
+  opacity: 1;
+  transform: translateY(-1px);
+}
+
+.template-detail-thumbnail img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.template-detail-content {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  gap: 14px;
+  padding: 26px;
+  overscroll-behavior: contain;
+}
+
+.template-detail-header {
+  min-width: 0;
+  gap: 8px;
+}
+
+.template-detail-content h2 {
+  margin-top: 5px;
+  padding-right: 36px;
+}
+
+.template-detail-header > p {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 1.55;
+}
+
+.template-detail-header .template-card-tags {
+  min-width: 0;
+  overflow-x: auto;
+  flex-wrap: nowrap;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
+}
+
+.template-detail-header .tag {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .template-prompt-box {
   position: relative;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   padding: 14px;
   border: 1px solid rgba(var(--primary-rgb), 0.2);
   border-radius: 16px;
   background: rgba(var(--primary-rgb), 0.06);
 }
 
+.template-prompt-box > strong {
+  padding-right: 56px;
+}
+
 .template-prompt-box p {
-  max-height: 240px;
+  min-height: 0;
+  flex: 1;
   overflow: auto;
+  margin: 12px 0 0;
+  padding-right: 3px;
+  line-height: 1.6;
   white-space: pre-wrap;
 }
 
-.template-prompt-box .button {
+.template-prompt-copy {
   position: absolute;
-  right: 8px;
-  top: 8px;
+  top: 7px;
+  right: 9px;
+}
+
+.template-detail-fixed-info {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
 }
 
 .template-parameters {
@@ -2943,13 +3088,17 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 }
 
 .template-reference-strip > div {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(48px, 1fr));
+  min-width: 0;
+  overflow-x: auto;
+  display: flex;
   gap: 7px;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
 }
 
 .template-reference-strip img {
-  width: 100%;
+  width: 52px;
+  flex: 0 0 52px;
   aspect-ratio: 1;
   object-fit: cover;
   border-radius: 10px;
@@ -2985,6 +3134,12 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 .template-parameters dd {
   margin: 4px 0 0;
   overflow-wrap: anywhere;
+}
+
+.template-detail-actions {
+  width: 100%;
+  align-self: end;
+  flex-wrap: nowrap;
 }
 
 .template-editor {
@@ -3100,8 +3255,7 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
     justify-content: flex-end;
   }
 
-  .template-plaza-hero,
-  .template-detail {
+  .template-plaza-hero {
     grid-template-columns: 1fr;
   }
 
@@ -3129,6 +3283,16 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 
   .template-tag-options {
     grid-template-columns: 1fr;
+  }
+
+  .template-detail {
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(220px, 40%) minmax(0, 1fr);
+  }
+
+  .template-detail-visual {
+    border-right: 0;
+    border-bottom: 1px solid rgba(var(--primary-rgb), 0.16);
   }
 }
 
@@ -3183,6 +3347,34 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
   .template-detail-backdrop,
   .template-editor-backdrop {
     padding: 8px;
+  }
+
+  .template-detail {
+    width: calc(100vw - 16px);
+    height: calc(100vh - 16px);
+    height: calc(100dvh - 16px);
+    grid-template-rows: minmax(180px, 35%) minmax(0, 1fr);
+  }
+
+  .template-detail-visual {
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .template-detail-stage {
+    border-radius: 14px;
+  }
+
+  .template-detail-content {
+    padding: 18px;
+  }
+
+  .template-detail .template-parameters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .template-detail-thumbnails {
+    justify-content: flex-start;
   }
 
   .template-editor-asset-grid {
@@ -4628,7 +4820,8 @@ body[data-visual-theme="aurora"][data-background-layer="above-decorations"] .gal
   white-space: nowrap;
 }
 
-.folder-picker-item:hover {
+.folder-picker-item:hover,
+.folder-picker-item.is-active {
   border-color: rgba(var(--primary-rgb), 0.45);
   background: rgba(var(--primary-rgb), 0.14);
 }
@@ -5693,6 +5886,47 @@ body[data-visual-theme][data-color-scheme] .preview-sidebar .button.ghost.previe
   border: 0;
   background: transparent;
   box-shadow: none;
+}
+
+/* 提示词复制是框内辅助操作，不应继承主题按钮的实体边框。 */
+body[data-visual-theme][data-color-scheme] .template-prompt-box .button.ghost.template-prompt-copy {
+  min-width: 0;
+  min-height: 26px;
+  gap: 3px;
+  padding: 3px 5px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  box-shadow: none;
+  font-size: 11px;
+}
+
+body[data-visual-theme][data-color-scheme] .template-prompt-box .button.ghost.template-prompt-copy .app-icon {
+  width: 15px;
+  height: 15px;
+  font-size: 15px;
+}
+
+body[data-visual-theme][data-color-scheme] .template-prompt-box .button.ghost.template-prompt-copy:hover,
+body[data-visual-theme][data-color-scheme] .template-prompt-box .button.ghost.template-prompt-copy:focus-visible {
+  border: 0;
+  color: var(--text);
+  background: rgba(var(--primary-rgb), 0.1);
+  box-shadow: none;
+}
+
+body[data-visual-theme][data-color-scheme] .button.ghost.template-favorite-button.is-active {
+  color: var(--primary-strong);
+  border-color: rgba(var(--primary-rgb), 0.46);
+  background: linear-gradient(135deg, rgba(var(--primary-rgb), 0.2), rgba(var(--secondary-rgb), 0.14));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+
+body[data-visual-theme][data-color-scheme] .button.ghost.template-favorite-button.is-active:hover,
+body[data-visual-theme][data-color-scheme] .button.ghost.template-favorite-button.is-active:focus-visible {
+  border-color: rgba(var(--primary-rgb), 0.62);
+  background: linear-gradient(135deg, rgba(var(--primary-rgb), 0.28), rgba(var(--secondary-rgb), 0.2));
 }
 
 /* Windows 原生下拉弹层需要字面深色作为提示，变量和继承色常会被 UA 忽略。 */

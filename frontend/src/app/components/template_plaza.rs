@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use gloo_file::{File, futures::read_as_bytes};
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
-use leptos::{prelude::*, task::spawn_local};
+use leptos::{ev, leptos_dom::helpers::window_event_listener, prelude::*, task::spawn_local};
 use mew_image_shared::{
     DEFAULT_FAVORITE_FOLDER_ID, GalleryAsset, GalleryAssetRole, GalleryImportMode,
     GalleryImportResponse, GalleryLikeResponse, GalleryTagSummary, GalleryTemplate,
@@ -16,11 +16,12 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, BlobPropertyBag, Event, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement,
+    MouseEvent,
 };
 
 use crate::app::{
     FAVORITE_ARCHIVE_ASSET_KEY, asset_src, bytes_to_data_url, ensure_asset_display_sources_loaded,
-    load_html_image, sha256_hex,
+    favorite_folder_picker_style, load_html_image, normalized_favorite_folders, sha256_hex,
     state::{AccountState, ComposerState, MainView, UiState, WorkspaceState},
 };
 use crate::{api::api_url, storage::apply_asset_payload_changes};
@@ -36,6 +37,13 @@ const UNCATEGORIZED_TAG_CATEGORY: &str = "未分类";
 struct GalleryTagGroup {
     name: String,
     tags: Vec<GalleryTagSummary>,
+}
+
+#[derive(Clone)]
+struct TemplateFavoritePickerState {
+    template: GalleryTemplate,
+    x: f64,
+    y: f64,
 }
 
 #[derive(Clone)]
@@ -96,9 +104,13 @@ pub(crate) fn TemplatePlaza(
     let tag_search = RwSignal::new(String::new());
     let selected_tag_category = RwSignal::new(None::<String>);
     let selected_template = RwSignal::new(None::<GalleryTemplate>);
+    let detail_preview_index = RwSignal::new(0usize);
+    let template_favorite_picker = RwSignal::new(None::<TemplateFavoritePickerState>);
+    let pending_template_favorites = RwSignal::new(HashSet::<String>::new());
     let request_revision = RwSignal::new(0u64);
     let reload_trigger = RwSignal::new(0u64);
     let editor = RwSignal::new(None::<TemplateEditorDraft>);
+    let editor_delete_confirm = RwSignal::new(false);
     let editor_busy = RwSignal::new(false);
     let import_input = NodeRef::<leptos::html::Input>::new();
     let export_confirm = RwSignal::new(false);
@@ -180,12 +192,62 @@ pub(crate) fn TemplatePlaza(
                 ))
                 .await
                 {
-                    Ok(template) => selected_template.set(Some(template)),
+                    Ok(template) => {
+                        detail_preview_index.set(0);
+                        selected_template.set(Some(template));
+                    }
                     Err(error) => message.set(Some(error)),
                 }
             }
         });
     });
+
+    let escape_listener = window_event_listener(ev::keydown, move |event| {
+        if event.key() != "Escape" {
+            return;
+        }
+
+        // 只关闭当前最上层界面，避免一次 Escape 同时穿透多个弹层。
+        let handled = if editor_delete_confirm.get_untracked() {
+            editor_delete_confirm.set(false);
+            true
+        } else if template_favorite_picker.get_untracked().is_some() {
+            template_favorite_picker.set(None);
+            true
+        } else if replace_confirm_stage.get_untracked() > 0 {
+            replace_confirm_stage.set(0);
+            true
+        } else if export_confirm.get_untracked() {
+            export_confirm.set(false);
+            true
+        } else if editor.get_untracked().is_some() {
+            editor.set(None);
+            true
+        } else if selected_template.get_untracked().is_some() {
+            selected_template.set(None);
+            detail_preview_index.set(0);
+            update_template_url(None);
+            true
+        } else if show_tag_picker.get_untracked() {
+            show_tag_picker.set(false);
+            true
+        } else if show_sort_picker.get_untracked() {
+            show_sort_picker.set(false);
+            true
+        } else if message.get_untracked().is_some() {
+            message.set(None);
+            true
+        } else {
+            false
+        };
+
+        if handled {
+            event.prevent_default();
+            event.stop_propagation();
+            event.stop_immediate_propagation();
+        }
+    });
+    on_cleanup(move || escape_listener.remove());
 
     Effect::new(move |_| {
         let Some(task_id) = ui.gallery_template_draft_task_id.get() else {
@@ -200,10 +262,14 @@ pub(crate) fn TemplatePlaza(
 
     let open_template = move |template: GalleryTemplate| {
         update_template_url(Some(&template.id));
+        template_favorite_picker.set(None);
+        detail_preview_index.set(0);
         selected_template.set(Some(template));
     };
     let close_template = move |_| {
+        template_favorite_picker.set(None);
         selected_template.set(None);
+        detail_preview_index.set(0);
         update_template_url(None);
     };
     let toggle_tag = move |tag: String| {
@@ -346,7 +412,13 @@ pub(crate) fn TemplatePlaza(
     };
 
     let favorite_template =
-        move |template: GalleryTemplate| {
+        move |template: GalleryTemplate, favorite_folder_id: String| {
+            let favorite_folder_name =
+                normalized_favorite_folders(workspace.preferences.get_untracked().favorite_folders)
+                    .into_iter()
+                    .find(|folder| folder.id == favorite_folder_id)
+                    .map(|folder| folder.name)
+                    .unwrap_or_else(|| "默认收藏夹".into());
             let existing_task_id = workspace.tasks.with_untracked(|tasks| {
                 tasks
                     .iter()
@@ -356,23 +428,41 @@ pub(crate) fn TemplatePlaza(
                     .map(|task| task.id.clone())
             });
             if let Some(existing_task_id) = existing_task_id {
-                let favorite_folder_id = workspace.preferences.with_untracked(|preferences| {
-                    preferences
-                        .active_favorite_folder_id
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_FAVORITE_FOLDER_ID.into())
-                });
                 workspace.tasks.update(|tasks| {
                     if let Some(task) = tasks.iter_mut().find(|task| task.id == existing_task_id) {
                         task.favorite = true;
                         task.favorite_folder_id = Some(favorite_folder_id);
+                        task.detached_from_thread = true;
                         task.updated_at = now_rfc3339();
                     }
                 });
+                workspace.threads.update(|threads| {
+                    for thread in threads {
+                        let previous_len = thread.task_ids.len();
+                        thread
+                            .task_ids
+                            .retain(|task_id| task_id != &existing_task_id);
+                        if thread.task_ids.len() != previous_len {
+                            thread.updated_at = now_rfc3339();
+                        }
+                    }
+                });
                 persist_state();
-                message.set(Some("该模板的本地快照已恢复到收藏夹。".into()));
+                message.set(Some(format!(
+                    "该模板的本地快照已收藏到“{favorite_folder_name}”。"
+                )));
                 return;
             }
+            if pending_template_favorites
+                .with_untracked(|template_ids| template_ids.contains(&template.id))
+            {
+                message.set(Some("该模板正在保存到收藏夹，请稍候。".into()));
+                return;
+            }
+            let pending_template_id = template.id.clone();
+            pending_template_favorites.update(|template_ids| {
+                template_ids.insert(pending_template_id.clone());
+            });
             spawn_local(async move {
                 message.set(Some("正在创建可离线使用的收藏快照……".into()));
                 let task_id = new_id();
@@ -387,6 +477,9 @@ pub(crate) fn TemplatePlaza(
                 {
                     Ok(value) => value,
                     Err(error) => {
+                        pending_template_favorites.update(|template_ids| {
+                            template_ids.remove(&pending_template_id);
+                        });
                         message.set(Some(error));
                         return;
                     }
@@ -397,6 +490,9 @@ pub(crate) fn TemplatePlaza(
                     {
                         Ok(value) => value,
                         Err(error) => {
+                            pending_template_favorites.update(|template_ids| {
+                                template_ids.remove(&pending_template_id);
+                            });
                             message.set(Some(error));
                             return;
                         }
@@ -408,6 +504,9 @@ pub(crate) fn TemplatePlaza(
                     .collect::<Vec<_>>();
                 if let Err(error) = apply_asset_payload_changes(&preview_payloads, &[]).await {
                     let _ = apply_asset_payload_changes(&[], &payload_ids).await;
+                    pending_template_favorites.update(|template_ids| {
+                        template_ids.remove(&pending_template_id);
+                    });
                     message.set(Some(format!("收藏图片保存失败：{error}")));
                     return;
                 }
@@ -421,12 +520,6 @@ pub(crate) fn TemplatePlaza(
                     .assets
                     .update(|assets| assets.extend(preview_assets));
                 let now = now_rfc3339();
-                let favorite_folder_id = workspace.preferences.with_untracked(|preferences| {
-                    preferences
-                        .active_favorite_folder_id
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_FAVORITE_FOLDER_ID.into())
-                });
                 workspace.tasks.update(|tasks| {
                     tasks.push(LocalTaskRecord {
                         id: task_id,
@@ -462,17 +555,66 @@ pub(crate) fn TemplatePlaza(
                     })
                 });
                 persist_state();
+                pending_template_favorites.update(|template_ids| {
+                    template_ids.remove(&pending_template_id);
+                });
                 message.set(Some(format!(
-                    "已将“{}”收藏为本地独立快照。",
-                    template.title
+                    "已将“{}”收藏到“{favorite_folder_name}”。",
+                    template.title,
                 )));
             });
         };
 
+    let cancel_template_favorite = move |template_id: String, template_title: String| {
+        let mut cancelled_task_id = None;
+        workspace.tasks.update(|tasks| {
+            let Some(task) = tasks.iter_mut().find(|task| {
+                task.favorite
+                    && task.source_gallery_template_id.as_deref() == Some(template_id.as_str())
+            }) else {
+                return;
+            };
+            task.favorite = false;
+            task.favorite_folder_id = None;
+            // 模板快照不能像普通生成任务一样回到当前会话，否则会污染结果画廊。
+            task.detached_from_thread = true;
+            task.updated_at = now_rfc3339();
+            cancelled_task_id = Some(task.id.clone());
+        });
+        if let Some(cancelled_task_id) = cancelled_task_id {
+            workspace.threads.update(|threads| {
+                for thread in threads {
+                    let previous_len = thread.task_ids.len();
+                    thread
+                        .task_ids
+                        .retain(|task_id| task_id != &cancelled_task_id);
+                    if thread.task_ids.len() != previous_len {
+                        thread.updated_at = now_rfc3339();
+                    }
+                }
+            });
+            persist_state();
+            message.set(Some(format!("已取消收藏“{template_title}”。")));
+        }
+        template_favorite_picker.set(None);
+    };
+
+    let open_template_favorite_picker = move |template: GalleryTemplate, event: MouseEvent| {
+        event.stop_propagation();
+        ui.favorite_folder_picker.set(None);
+        template_favorite_picker.set(Some(TemplateFavoritePickerState {
+            template,
+            x: f64::from(event.client_x()),
+            y: f64::from(event.client_y()),
+        }));
+    };
+
     let new_editor = move |_| {
+        editor_delete_confirm.set(false);
         editor.set(Some(default_editor_draft(workspace, composer)));
     };
     let edit_template = move |template: GalleryTemplate| {
+        editor_delete_confirm.set(false);
         editor.set(Some(TemplateEditorDraft::from_template(template)));
     };
     let export_templates = move || {
@@ -701,6 +843,17 @@ pub(crate) fn TemplatePlaza(
                     let use_value = template.clone();
                     let favorite_value = template.clone();
                     let edit_value = template.clone();
+                    let favorite_template_id = template.id.clone();
+                    let pending_template_id = template.id.clone();
+                    let is_favorite = Memo::new(move |_| {
+                        workspace.tasks.with(|tasks| {
+                            is_gallery_template_favorite(tasks, &favorite_template_id)
+                        })
+                    });
+                    let favorite_pending = Memo::new(move |_| {
+                        pending_template_favorites
+                            .with(|template_ids| template_ids.contains(&pending_template_id))
+                    });
                     let like_label = format_compact_like_count(template.like_count);
                     let like_title = format!("点赞（{}）", template.like_count);
                     view! {
@@ -733,7 +886,17 @@ pub(crate) fn TemplatePlaza(
                                     <button class="button ghost icon-button" title="复制分享链接" on:click=move |_| share_template(&share_id, message)>
                                         <MaterialSymbolIcon name="share" filled=false />
                                     </button>
-                                    <button class="button ghost icon-button" title="收藏到工作台" aria-label="收藏到工作台" on:click=move |_| favorite_template(favorite_value.clone())><MaterialSymbolIcon name="star" filled=false /></button>
+                                    <button
+                                        class="button ghost icon-button template-favorite-button"
+                                        class:is-active=move || is_favorite.get()
+                                        title=move || if is_favorite.get() { "管理收藏" } else { "选择收藏夹" }
+                                        aria-label=move || if is_favorite.get() { "管理收藏" } else { "选择收藏夹" }
+                                        aria-pressed=move || is_favorite.get()
+                                        disabled=move || favorite_pending.get()
+                                        on:click=move |event: MouseEvent| open_template_favorite_picker(favorite_value.clone(), event)
+                                    >
+                                        {move || view! { <MaterialSymbolIcon name="star" filled=is_favorite.get() /> }}
+                                    </button>
                                     <button class="button primary" on:click=move |_| use_template(use_value.clone())>"使用模板"</button>
                                 </div>
                             </div>
@@ -756,38 +919,146 @@ pub(crate) fn TemplatePlaza(
             </div>
         })}
 
+        {move || template_favorite_picker.get().map(|picker| {
+            let style = favorite_folder_picker_style(picker.x, picker.y);
+            let current_folder_id = workspace.tasks.with_untracked(|tasks| {
+                tasks
+                    .iter()
+                    .find(|task| {
+                        task.favorite
+                            && task.source_gallery_template_id.as_deref()
+                                == Some(picker.template.id.as_str())
+                    })
+                    .map(|task| {
+                        task.favorite_folder_id
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_FAVORITE_FOLDER_ID.into())
+                    })
+            });
+            let picker_title = if current_folder_id.is_some() { "移动到" } else { "收藏到" };
+            let folders = normalized_favorite_folders(
+                workspace.preferences.get_untracked().favorite_folders,
+            );
+            let is_favorite = current_folder_id.is_some();
+            let cancel_template_id = picker.template.id.clone();
+            let cancel_template_title = picker.template.title.clone();
+            view! {
+                <>
+                    <button class="folder-picker-dismiss" aria-label="关闭收藏文件夹选择" on:click=move |_| template_favorite_picker.set(None)></button>
+                    <div class="folder-picker-popover template-folder-picker" style=style>
+                        <strong>{picker_title}</strong>
+                        {folders.into_iter().filter(|folder| {
+                            !is_favorite || current_folder_id.as_deref() != Some(folder.id.as_str())
+                        }).map(|folder| {
+                            let folder_id = folder.id;
+                            let target_template = picker.template.clone();
+                            view! {
+                                <button
+                                    class="folder-picker-item"
+                                    on:click=move |_| {
+                                        template_favorite_picker.set(None);
+                                        favorite_template(target_template.clone(), folder_id.clone());
+                                    }
+                                >
+                                    <MaterialSymbolIcon name="folder" filled=false />
+                                    <span>{folder.name}</span>
+                                </button>
+                            }
+                        }).collect_view()}
+                        {if is_favorite {
+                            view! {
+                                <button class="folder-picker-item folder-picker-cancel" on:click=move |_| {
+                                    cancel_template_favorite(cancel_template_id.clone(), cancel_template_title.clone());
+                                }>
+                                    <MaterialSymbolIcon name="star" filled=false />
+                                    <span>"取消收藏"</span>
+                                </button>
+                            }.into_any()
+                        } else {
+                            ().into_any()
+                        }}
+                    </div>
+                </>
+            }
+        })}
+
         {move || selected_template.get().map(|template| {
             let like_id = template.id.clone(); let liked = template.liked_by_viewer;
             let use_value = template.clone(); let favorite_value = template.clone(); let prompt = template.prompt.clone();
+            let like_label = format_compact_like_count(template.like_count);
+            let like_title = format!("点赞（{}）", template.like_count);
+            let is_favorite = workspace.tasks.with(|tasks| {
+                is_gallery_template_favorite(tasks, &template.id)
+            });
+            let favorite_pending = pending_template_favorites
+                .with(|template_ids| template_ids.contains(&template.id));
+            let preview_count = template.preview_assets.len();
+            let active_preview_index = if preview_count == 0 {
+                0
+            } else {
+                detail_preview_index.get().min(preview_count - 1)
+            };
             view! { <div class="modal-backdrop template-detail-backdrop" on:click=close_template>
-                <article class="panel template-detail" on:click=move |event| event.stop_propagation()>
-                    <button class="button ghost icon-button template-modal-close" on:click=close_template><MaterialSymbolIcon name="close" filled=false /></button>
-                    <div class="template-detail-gallery">{template.preview_assets.iter().map(|asset| view! { <img src=gallery_asset_url(asset) alt=template.title.clone() /> }).collect_view()}</div>
-                    <div class="template-detail-content stack"><div><span class="template-plaza-kicker">"GALLERY TEMPLATE"</span><h2>{template.title.clone()}</h2></div>
-                        <p>{template.description.clone()}</p>
-                        <div class="template-card-tags">{template.tags.iter().map(|tag| view! {
-                            <span class="tag" title=tag.clone()>{gallery_tag_label(tag).to_string()}</span>
-                        }).collect_view()}</div>
-                        <div class="template-prompt-box"><strong>"提示词"</strong><p>{template.prompt.clone()}</p>
-                            <button class="button ghost" on:click=move |_| copy_text(prompt.clone(), message)><MaterialSymbolIcon name="content_copy" filled=false />"复制"</button>
+                <article class="panel template-detail" role="dialog" aria-modal="true" aria-labelledby="template-detail-title" on:click=move |event| event.stop_propagation()>
+                    <section class="template-detail-visual" aria-label="模板结果预览">
+                        <div class="template-detail-stage">
+                            {template.preview_assets.get(active_preview_index).map(|asset| view! {
+                                <img src=gallery_asset_url(asset) alt=format!("{} 的结果预览", template.title) />
+                            }.into_any()).unwrap_or_else(|| view! {
+                                <div class="template-detail-empty-preview"><MaterialSymbolIcon name="image" filled=false /><span>"暂无结果预览"</span></div>
+                            }.into_any())}
+                            <Show when={move || preview_count > 1}>
+                                <span class="template-detail-preview-count">{format!("{} / {}", active_preview_index + 1, preview_count)}</span>
+                            </Show>
                         </div>
-                        {if template.reference_assets.is_empty() {
-                            ().into_any()
-                        } else {
-                            view! { <div class="template-reference-strip"><strong>"参考图"</strong><div>{template.reference_assets.iter().map(|asset| view! { <img src=gallery_thumbnail_url(asset) alt="模板参考图" loading="lazy" /> }).collect_view()}</div></div> }.into_any()
-                        }}
-                        <dl class="template-parameters"><div><dt>"推荐模型"</dt><dd>{template.recommended_model.clone()}</dd></div><div><dt>"尺寸"</dt><dd>{format!("{} × {}", template.generation_settings.width, template.generation_settings.height)}</dd></div><div><dt>"质量"</dt><dd>{template.generation_settings.quality.clone().unwrap_or_else(|| "自动".into())}</dd></div><div><dt>"参考图"</dt><dd>{format!("{} 张", template.reference_assets.len())}</dd></div></dl>
-                        <div class="template-detail-actions"><button class="button ghost" class:is-active=liked on:click=move |_| toggle_like(like_id.clone(), liked)><MaterialSymbolIcon name="favorite" filled=liked />{template.like_count}</button>
-                            <button class="button secondary" on:click=move |_| share_template(&template.id, message)><MaterialSymbolIcon name="share" filled=false />"复制分享链接"</button>
-                            <button class="button secondary" on:click=move |_| favorite_template(favorite_value.clone())><MaterialSymbolIcon name="star" filled=false />"收藏到工作台"</button>
+                        <Show when={move || preview_count > 1}>
+                            <div class="template-detail-thumbnails" role="tablist" aria-label="切换结果预览">
+                                {template.preview_assets.iter().enumerate().map(|(index, asset)| view! {
+                                    <button
+                                        class="template-detail-thumbnail"
+                                        class:is-active=move || detail_preview_index.get() == index
+                                        aria-label=format!("查看第 {} 张结果图", index + 1)
+                                        aria-pressed=move || detail_preview_index.get() == index
+                                        on:click=move |_| detail_preview_index.set(index)
+                                    >
+                                        <img src=gallery_thumbnail_url(asset) alt="" loading="lazy" />
+                                    </button>
+                                }).collect_view()}
+                            </div>
+                        </Show>
+                    </section>
+                    <aside class="template-detail-content">
+                        <button class="button ghost icon-button template-modal-close" title="关闭详情" aria-label="关闭详情" on:click=close_template><MaterialSymbolIcon name="close" filled=false /></button>
+                        <header class="template-detail-header stack">
+                            <div><span class="template-plaza-kicker">"GALLERY TEMPLATE"</span><h2 id="template-detail-title">{template.title.clone()}</h2></div>
+                            <p>{template.description.clone()}</p>
+                            <div class="template-card-tags">{template.tags.iter().map(|tag| view! {
+                                <span class="tag" title=tag.clone()>{gallery_tag_label(tag).to_string()}</span>
+                            }).collect_view()}</div>
+                        </header>
+                        <div class="template-prompt-box"><strong>"提示词"</strong><p>{template.prompt.clone()}</p>
+                            <button class="button ghost template-prompt-copy" title="复制提示词" aria-label="复制提示词" on:click=move |_| copy_text(prompt.clone(), message)><MaterialSymbolIcon name="content_copy" filled=false />"复制"</button>
+                        </div>
+                        <div class="template-detail-fixed-info">
+                            {if template.reference_assets.is_empty() {
+                                ().into_any()
+                            } else {
+                                view! { <div class="template-reference-strip"><strong>"参考图"</strong><div>{template.reference_assets.iter().map(|asset| view! { <img src=gallery_thumbnail_url(asset) alt="模板参考图" loading="lazy" /> }).collect_view()}</div></div> }.into_any()
+                            }}
+                            <dl class="template-parameters"><div><dt>"推荐模型"</dt><dd>{template.recommended_model.clone()}</dd></div><div><dt>"尺寸"</dt><dd>{format!("{} × {}", template.generation_settings.width, template.generation_settings.height)}</dd></div><div><dt>"质量"</dt><dd>{template.generation_settings.quality.clone().unwrap_or_else(|| "自动".into())}</dd></div><div><dt>"参考图"</dt><dd>{format!("{} 张", template.reference_assets.len())}</dd></div></dl>
+                        </div>
+                        <div class="template-detail-actions template-card-actions">
+                            <button class="button ghost template-like-button" title=like_title aria-label=format!("点赞，当前 {} 赞", template.like_count) class:is-active=liked on:click=move |_| toggle_like(like_id.clone(), liked)><MaterialSymbolIcon name="favorite" filled=liked /><span>{like_label}</span></button>
+                            <button class="button ghost icon-button" title="复制分享链接" aria-label="复制分享链接" on:click=move |_| share_template(&template.id, message)><MaterialSymbolIcon name="share" filled=false /></button>
+                            <button class="button ghost icon-button template-favorite-button" class:is-active=is_favorite title=if is_favorite { "管理收藏" } else { "选择收藏夹" } aria-label=if is_favorite { "管理收藏" } else { "选择收藏夹" } aria-pressed=is_favorite disabled=favorite_pending on:click=move |event: MouseEvent| open_template_favorite_picker(favorite_value.clone(), event)><MaterialSymbolIcon name="star" filled=is_favorite /></button>
                             <button class="button primary" on:click=move |_| use_template(use_value.clone())>"使用模板"</button></div>
-                    </div>
+                    </aside>
                 </article>
             </div> }
         })}
 
         {move || editor.get().map(|draft| view! {
-            <TemplateEditor draft editor editor_busy message templates reload_trigger />
+            <TemplateEditor draft editor delete_confirm=editor_delete_confirm editor_busy message templates reload_trigger />
         })}
 
         <Show when=move || export_confirm.get()>
@@ -826,12 +1097,12 @@ pub(crate) fn TemplatePlaza(
 fn TemplateEditor(
     draft: TemplateEditorDraft,
     editor: RwSignal<Option<TemplateEditorDraft>>,
+    delete_confirm: RwSignal<bool>,
     editor_busy: RwSignal<bool>,
     message: RwSignal<Option<String>>,
     templates: RwSignal<Vec<GalleryTemplate>>,
     reload_trigger: RwSignal<u64>,
 ) -> impl IntoView {
-    let delete_confirm = RwSignal::new(false);
     let save = move |_| {
         let Some(draft) = editor.get_untracked() else {
             return;
@@ -871,6 +1142,7 @@ fn TemplateEditor(
                             }
                         });
                         reload_trigger.update(|value| *value = value.saturating_add(1));
+                        delete_confirm.set(false);
                         editor.set(None);
                     }
                     Err(error) => message.set(Some(error.to_string())),
@@ -885,7 +1157,7 @@ fn TemplateEditor(
     view! { <div class="modal-backdrop template-editor-backdrop">
         <section class="panel template-editor stack">
             <div class="row"><div><span class="template-plaza-kicker">"ADMIN EDITOR"</span><h2>{if draft.id.is_some() { "编辑模板" } else { "新建模板" }}</h2></div>
-                <button class="button ghost icon-button" on:click=move |_| editor.set(None)><MaterialSymbolIcon name="close" filled=false /></button></div>
+                <button class="button ghost icon-button" on:click=move |_| { delete_confirm.set(false); editor.set(None); }><MaterialSymbolIcon name="close" filled=false /></button></div>
             <label>"标题"<input class="text-input" prop:value=draft.title on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.title = event_target_value(&event) }) /></label>
             <label>"提示词"<textarea class="text-input template-editor-prompt" prop:value=draft.prompt on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.prompt = event_target_value(&event) }) /></label>
             <label>"说明"<textarea class="text-input" prop:value=draft.description on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.description = event_target_value(&event) }) /></label>
@@ -903,14 +1175,14 @@ fn TemplateEditor(
             <EditorAssets title="参考图（最多 16 张）" assets=draft.reference_assets editor role=GalleryAssetRole::Reference max=16 max_edge=REFERENCE_MAX_EDGE editor_busy message />
             <div class="row template-editor-actions">
                 {delete_id.get_value().map(|_| view! { <button class="button danger" disabled=move || editor_busy.get() on:click=move |_| delete_confirm.set(true)><MaterialSymbolIcon name="delete" filled=false />"删除模板"</button> })}
-                <span class="spacer"></span><button class="button ghost" on:click=move |_| editor.set(None)>"取消"</button><button class="button primary" disabled=move || editor_busy.get() on:click=save>"保存模板"</button>
+                <span class="spacer"></span><button class="button ghost" on:click=move |_| { delete_confirm.set(false); editor.set(None); }>"取消"</button><button class="button primary" disabled=move || editor_busy.get() on:click=save>"保存模板"</button>
             </div>
             <Show when=move || delete_confirm.get()>
                 <div class="template-inline-confirm">
                     <p>"确定删除这个模板吗？不再被其他模板引用的广场图片也会一并清理。"</p>
                     <div class="row"><button class="button ghost" on:click=move |_| delete_confirm.set(false)>"取消"</button>
                         {move || delete_id.get_value().map(|target_id| {
-                            view! { <button class="button danger" on:click=move |_| delete_admin_template(target_id.clone(), editor, templates, message, editor_busy, reload_trigger)>"确认删除"</button> }
+                            view! { <button class="button danger" on:click=move |_| { delete_confirm.set(false); delete_admin_template(target_id.clone(), editor, templates, message, editor_busy, reload_trigger); }>"确认删除"</button> }
                         })}
                     </div>
                 </div>
@@ -1565,6 +1837,12 @@ fn format_count_with_decimal_unit(count: u64, unit: u64, suffix: &str) -> String
     }
 }
 
+fn is_gallery_template_favorite(tasks: &[LocalTaskRecord], template_id: &str) -> bool {
+    tasks.iter().any(|task| {
+        task.favorite && task.source_gallery_template_id.as_deref() == Some(template_id)
+    })
+}
+
 fn prompt_excerpt(prompt: &str) -> String {
     let mut value = prompt.chars().take(110).collect::<String>();
     if prompt.chars().count() > 110 {
@@ -1736,5 +2014,38 @@ mod tests {
         assert_eq!(format_compact_like_count(12_000), "1W2");
         assert_eq!(format_compact_like_count(999_999), "99W9");
         assert_eq!(format_compact_like_count(1_280_000), "128W");
+    }
+
+    #[test]
+    fn gallery_template_favorite_state_requires_matching_active_snapshot() {
+        let mut task = LocalTaskRecord {
+            id: "snapshot".into(),
+            thread_id: "thread".into(),
+            config_id: "config".into(),
+            prompt: "prompt".into(),
+            requested_model: "model".into(),
+            reference_asset_ids: Vec::new(),
+            generation_settings: None,
+            result: None,
+            favorite: true,
+            favorite_folder_id: Some(DEFAULT_FAVORITE_FOLDER_ID.into()),
+            detached_from_thread: true,
+            source_gallery_template_id: Some("template-1".into()),
+            status: TaskStatus::Succeeded,
+            error_message: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        assert!(is_gallery_template_favorite(
+            std::slice::from_ref(&task),
+            "template-1"
+        ));
+        assert!(!is_gallery_template_favorite(
+            std::slice::from_ref(&task),
+            "template-2"
+        ));
+        task.favorite = false;
+        assert!(!is_gallery_template_favorite(&[task], "template-1"));
     }
 }

@@ -4172,7 +4172,7 @@ fn resolve_upstream_target(
         .host_str()
         .ok_or_else(|| AppError::provider_target_blocked("当前上游地址缺少主机名。"))?
         .to_ascii_lowercase();
-    reject_unsafe_host(&host)?;
+    reject_unsafe_host(&host, loopback_upstream_allowed(&state.config, &host))?;
 
     let mut allowed_hosts = BTreeSet::new();
     match kind {
@@ -4201,10 +4201,40 @@ fn resolve_upstream_target(
     })
 }
 
-fn reject_unsafe_host(host: &str) -> Result<(), AppError> {
+fn loopback_upstream_allowed(config: &AppConfig, host: &str) -> bool {
+    config.allow_loopback_upstreams
+        && is_explicit_loopback_host(host)
+        && config
+            .listen_addr
+            .parse::<SocketAddr>()
+            .is_ok_and(|address| is_loopback_ip(address.ip()))
+}
+
+fn is_explicit_loopback_host(host: &str) -> bool {
+    if matches!(host, "localhost" | "localhost.localdomain") {
+        return true;
+    }
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .is_ok_and(is_loopback_ip)
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => ipv4.is_loopback(),
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback() || ipv6.to_ipv4_mapped().is_some_and(|ipv4| ipv4.is_loopback())
+        }
+    }
+}
+
+fn reject_unsafe_host(host: &str, allow_explicit_loopback: bool) -> Result<(), AppError> {
+    if allow_explicit_loopback && is_explicit_loopback_host(host) {
+        return Ok(());
+    }
     if matches!(host, "localhost" | "localhost.localdomain") {
         return Err(AppError::provider_target_blocked(
-            "不允许访问本机或内网地址。",
+            "不允许访问本机或内网地址；本机开发可同时开启 MEW_ALLOW_LOOPBACK_UPSTREAM 与 MEW_ALLOW_HTTP_UPSTREAM，并重启后端。",
         ));
     }
     if host.ends_with(".local") || host.ends_with(".internal") {
@@ -4215,6 +4245,11 @@ fn reject_unsafe_host(host: &str) -> Result<(), AppError> {
     if let Ok(ip) = host.parse::<IpAddr>()
         && is_private_ip(ip)
     {
+        if is_loopback_ip(ip) {
+            return Err(AppError::provider_target_blocked(
+                "不允许访问本机环回 IP；本机开发可同时开启 MEW_ALLOW_LOOPBACK_UPSTREAM 与 MEW_ALLOW_HTTP_UPSTREAM，并重启后端。",
+            ));
+        }
         return Err(AppError::provider_target_blocked(
             "不允许访问本机、私网或链路本地 IP。",
         ));
@@ -4296,7 +4331,8 @@ async fn prepare_upstream_request(
         .host_str()
         .ok_or_else(|| AppError::provider_target_blocked("上游地址缺少主机名。"))?
         .to_ascii_lowercase();
-    reject_unsafe_host(&host)?;
+    let allow_loopback_target = loopback_upstream_allowed(&state.config, &host);
+    reject_unsafe_host(&host, allow_loopback_target)?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| AppError::provider_target_blocked("无法确定上游端口。"))?;
@@ -4316,9 +4352,13 @@ async fn prepare_upstream_request(
     if addresses.is_empty() {
         return Err(AppError::bad_gateway("上游域名没有可用的解析地址。"));
     }
-    if addresses.iter().any(|address| is_private_ip(address.ip())) {
+    if !resolved_upstream_addresses_are_allowed(&addresses, allow_loopback_target) {
         return Err(AppError::provider_target_blocked(
-            "上游域名解析到了本机、私网、保留或链路本地地址。",
+            if allow_loopback_target {
+                "显式环回上游解析出了非环回地址，已拒绝连接。"
+            } else {
+                "上游域名解析到了本机、私网、保留或链路本地地址。"
+            },
         ));
     }
 
@@ -4338,6 +4378,16 @@ async fn prepare_upstream_request(
     };
     let client = builder.build().map_err(AppError::internal)?;
     Ok(PreparedUpstreamRequest { client, url })
+}
+
+fn resolved_upstream_addresses_are_allowed(
+    addresses: &[SocketAddr],
+    allow_loopback_target: bool,
+) -> bool {
+    if allow_loopback_target {
+        return addresses.iter().all(|address| is_loopback_ip(address.ip()));
+    }
+    addresses.iter().all(|address| !is_private_ip(address.ip()))
 }
 
 fn upstream_transport_error(label: &str, error: &reqwest::Error) -> AppError {
@@ -5383,7 +5433,7 @@ fn validate_remote_image_target(state: &AppState, url: &Url) -> Result<(), AppEr
         .host_str()
         .ok_or_else(|| AppError::provider_target_blocked("上游返回的图片地址缺少主机名。"))?
         .to_ascii_lowercase();
-    reject_unsafe_host(&host)?;
+    reject_unsafe_host(&host, loopback_upstream_allowed(&state.config, &host))?;
 
     let mut allowed_hosts = BTreeSet::new();
     for value in &state.config.trusted_provider_hosts {
@@ -5795,6 +5845,7 @@ mod tests {
             trusted_provider_hosts: Vec::new(),
             enforce_provider_host_whitelist: false,
             allow_insecure_upstreams: false,
+            allow_loopback_upstreams: false,
             enable_guest_proxy: true,
             guest_generation_concurrency: 4,
             guest_image_concurrency: 2,
@@ -6521,11 +6572,52 @@ mod tests {
 
     #[test]
     fn private_hosts_are_blocked() {
-        assert!(reject_unsafe_host("127.0.0.1").is_err());
-        assert!(reject_unsafe_host("10.0.0.8").is_err());
-        assert!(reject_unsafe_host("localhost").is_err());
-        assert!(reject_unsafe_host("service.internal").is_err());
-        assert!(reject_unsafe_host("api.openai.com").is_ok());
+        assert!(reject_unsafe_host("127.0.0.1", false).is_err());
+        assert!(reject_unsafe_host("10.0.0.8", false).is_err());
+        assert!(reject_unsafe_host("localhost", false).is_err());
+        assert!(reject_unsafe_host("service.internal", false).is_err());
+        assert!(reject_unsafe_host("api.openai.com", false).is_ok());
+    }
+
+    #[test]
+    fn loopback_override_only_allows_explicit_loopback_hosts() {
+        assert!(reject_unsafe_host("127.0.0.1", true).is_ok());
+        assert!(reject_unsafe_host("localhost", true).is_ok());
+        assert!(reject_unsafe_host("localhost.localdomain", true).is_ok());
+        assert!(reject_unsafe_host("[::1]", true).is_ok());
+        assert!(reject_unsafe_host("10.0.0.8", true).is_err());
+        assert!(reject_unsafe_host("service.internal", true).is_err());
+    }
+
+    #[test]
+    fn loopback_override_requires_a_loopback_listener() {
+        let mut config = test_config(String::new());
+        config.allow_loopback_upstreams = true;
+
+        assert!(loopback_upstream_allowed(&config, "127.0.0.1"));
+        assert!(loopback_upstream_allowed(&config, "localhost"));
+        assert!(!loopback_upstream_allowed(&config, "10.0.0.8"));
+
+        config.listen_addr = "0.0.0.0:3000".into();
+        assert!(!loopback_upstream_allowed(&config, "127.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_dns_results_must_all_remain_on_loopback() {
+        let loopback = [
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "[::1]:8080".parse::<SocketAddr>().unwrap(),
+        ];
+        assert!(resolved_upstream_addresses_are_allowed(&loopback, true));
+
+        let mixed = [
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "8.8.8.8:8080".parse::<SocketAddr>().unwrap(),
+        ];
+        assert!(!resolved_upstream_addresses_are_allowed(&mixed, true));
+
+        let private = ["10.0.0.8:8080".parse::<SocketAddr>().unwrap()];
+        assert!(!resolved_upstream_addresses_are_allowed(&private, true));
     }
 
     #[test]
@@ -6538,8 +6630,8 @@ mod tests {
 
     #[test]
     fn public_gateway_host_is_allowed_by_basic_safety_policy() {
-        assert!(reject_unsafe_host("api.cphone.vip").is_ok());
-        assert!(reject_unsafe_host("cdnoss.jounery.vip").is_ok());
+        assert!(reject_unsafe_host("api.cphone.vip", false).is_ok());
+        assert!(reject_unsafe_host("cdnoss.jounery.vip", false).is_ok());
     }
 
     #[test]
