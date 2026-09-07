@@ -30,6 +30,13 @@ use super::common::{MaterialSymbolIcon, PaginationControls};
 const PREVIEW_MAX_EDGE: u32 = 2_048;
 const REFERENCE_MAX_EDGE: u32 = 4_096;
 const TEMPLATE_IMAGE_QUALITY: f64 = 0.9;
+const UNCATEGORIZED_TAG_CATEGORY: &str = "未分类";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GalleryTagGroup {
+    name: String,
+    tags: Vec<GalleryTagSummary>,
+}
 
 #[derive(Clone)]
 struct TemplateEditorDraft {
@@ -85,12 +92,16 @@ pub(crate) fn TemplatePlaza(
     let loading = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
     let show_tag_picker = RwSignal::new(false);
+    let show_sort_picker = RwSignal::new(false);
+    let tag_search = RwSignal::new(String::new());
+    let selected_tag_category = RwSignal::new(None::<String>);
     let selected_template = RwSignal::new(None::<GalleryTemplate>);
     let request_revision = RwSignal::new(0u64);
     let reload_trigger = RwSignal::new(0u64);
     let editor = RwSignal::new(None::<TemplateEditorDraft>);
     let editor_busy = RwSignal::new(false);
     let import_input = NodeRef::<leptos::html::Input>::new();
+    let export_confirm = RwSignal::new(false);
     let replace_confirm_stage = RwSignal::new(0u8);
 
     let is_admin = Memo::new(move |_| {
@@ -154,6 +165,13 @@ pub(crate) fn TemplatePlaza(
         let _ = reload_trigger.get();
         spawn_local(async move {
             if let Ok(tags) = fetch_json::<Vec<GalleryTagSummary>>("/api/gallery/tags").await {
+                if selected_tag_category.get_untracked().is_none() {
+                    selected_tag_category.set(
+                        group_gallery_tags(&tags)
+                            .first()
+                            .map(|group| group.name.clone()),
+                    );
+                }
                 available_tags.set(tags);
             }
             if let Some(template_id) = template_id_from_location() {
@@ -457,7 +475,7 @@ pub(crate) fn TemplatePlaza(
     let edit_template = move |template: GalleryTemplate| {
         editor.set(Some(TemplateEditorDraft::from_template(template)));
     };
-    let export_templates = move |_| {
+    let export_templates = move || {
         spawn_local(async move {
             message.set(Some("正在导出模板广场……".into()));
             match Request::get(&api_url("/api/admin/gallery/export"))
@@ -537,9 +555,27 @@ pub(crate) fn TemplatePlaza(
         <main class="template-plaza stack">
             <section class="panel template-plaza-hero">
                 <div class="template-plaza-heading">
-                    <span class="template-plaza-kicker">"PROMPT ATLAS"</span>
                     <h2>"模板广场"</h2>
-                    <p>"从喜欢的结果出发，带上提示词、参数和参考图回到工作台继续创作。"</p>
+                    <Show when=move || is_admin.get()>
+                        <div class="template-admin-toolbar" aria-label="模板广场管理">
+                            <button class="button ghost icon-button template-admin-create" title="新建模板" aria-label="新建模板" on:click=new_editor>
+                                <MaterialSymbolIcon name="add" filled=false />
+                            </button>
+                            <button class="button ghost icon-button template-admin-export" title="导出全部模板" aria-label="导出全部模板" on:click=move |_| export_confirm.set(true)>
+                                <MaterialSymbolIcon name="download" filled=false />
+                            </button>
+                            <button class="button ghost icon-button template-admin-import" title="合并导入模板" aria-label="合并导入模板" on:click=move |_| {
+                                replace_confirm_stage.set(0);
+                                if let Some(input) = import_input.get() { input.click(); }
+                            }>
+                                <MaterialSymbolIcon name="upload" filled=false />
+                            </button>
+                            <button class="button ghost danger icon-button" title="全量替换模板" aria-label="全量替换模板" on:click=move |_| replace_confirm_stage.set(1)>
+                                <MaterialSymbolIcon name="sync" filled=false />
+                            </button>
+                            <input class="visually-hidden" node_ref=import_input type="file" accept=".zip,application/zip" on:change=import_archive />
+                        </div>
+                    </Show>
                 </div>
                 <div class="template-plaza-tools">
                     <label class="template-search">
@@ -547,52 +583,104 @@ pub(crate) fn TemplatePlaza(
                         <input type="search" placeholder="搜索标题、提示词或标签" prop:value=move || search.get()
                             on:input=move |event| { search.set(event_target_value(&event)); page.set(1); } />
                     </label>
+                    <div class="template-sort-filter">
+                        <button
+                            class="button secondary icon-button template-sort-button"
+                            title=move || if sort.get() == "popular" { "当前按最多点赞排序" } else { "当前按最新发布排序" }
+                            aria-label=move || if sort.get() == "popular" { "排序：最多点赞" } else { "排序：最新发布" }
+                            aria-expanded=move || show_sort_picker.get()
+                            on:click=move |_| {
+                                show_tag_picker.set(false);
+                                show_sort_picker.update(|value| *value = !*value);
+                            }
+                        >
+                            <MaterialSymbolIcon name="sort" filled=false />
+                        </button>
+                        <Show when=move || show_sort_picker.get()>
+                            <div class="template-sort-menu">
+                                <button class="template-sort-option" class:is-active=move || sort.get() == "latest"
+                                    on:click=move |_| { sort.set("latest".into()); page.set(1); show_sort_picker.set(false); }>
+                                    <MaterialSymbolIcon name="schedule" filled=false />
+                                    <span><strong>"最新发布"</strong><small>"优先查看最近更新的模板"</small></span>
+                                    <Show when=move || sort.get() == "latest"><MaterialSymbolIcon name="check" filled=false /></Show>
+                                </button>
+                                <button class="template-sort-option" class:is-active=move || sort.get() == "popular"
+                                    on:click=move |_| { sort.set("popular".into()); page.set(1); show_sort_picker.set(false); }>
+                                    <MaterialSymbolIcon name="favorite" filled=false />
+                                    <span><strong>"最多点赞"</strong><small>"优先查看大家喜欢的模板"</small></span>
+                                    <Show when=move || sort.get() == "popular"><MaterialSymbolIcon name="check" filled=false /></Show>
+                                </button>
+                            </div>
+                        </Show>
+                    </div>
                     <div class="template-tag-filter">
-                        <button class="button secondary" on:click=move |_| show_tag_picker.update(|value| *value = !*value)>
+                        <button class="button secondary" aria-expanded=move || show_tag_picker.get() on:click=move |_| {
+                            show_sort_picker.set(false);
+                            show_tag_picker.update(|value| *value = !*value);
+                        }>
                             <MaterialSymbolIcon name="filter_alt" filled=false />
                             {move || if selected_tags.get().is_empty() { "标签筛选".into() } else { format!("已选 {} 项", selected_tags.get().len()) }}
                         </button>
                         <Show when=move || show_tag_picker.get()>
                             <div class="template-tag-menu">
-                                <For each=move || available_tags.get() key=|tag| (tag.name.clone(), tag.template_count) children=move |tag| {
-                                    let tag_name = tag.name.clone();
-                                    let checked_name = tag.name.clone();
-                                    view! { <button class="template-tag-option" class:is-active=move || selected_tags.get().contains(&checked_name)
-                                        on:click=move |_| toggle_tag(tag_name.clone())>
-                                        <span>{tag.name}</span><small>{tag.template_count}</small>
-                                    </button> }
-                                } />
+                                <div class="template-tag-menu-header">
+                                    <label class="template-tag-search">
+                                        <MaterialSymbolIcon name="search" filled=false />
+                                        <input type="search" placeholder="搜索当前分类中的标签" prop:value=move || tag_search.get()
+                                            on:input=move |event| tag_search.set(event_target_value(&event)) />
+                                    </label>
+                                    <button class="button ghost" disabled=move || selected_tags.get().is_empty()
+                                        on:click=move |_| { selected_tags.set(Vec::new()); page.set(1); }>
+                                        "清空"
+                                    </button>
+                                </div>
+                                <div class="template-tag-browser">
+                                    <nav class="template-tag-categories" aria-label="标签分类">
+                                        <For each=move || group_gallery_tags(&available_tags.get()) key=|group| group.name.clone() children=move |group| {
+                                            let category_name = group.name.clone();
+                                            let checked_category = group.name.clone();
+                                            view! {
+                                                <button class="template-tag-category" class:is-active=move || selected_tag_category.get().as_deref() == Some(checked_category.as_str())
+                                                    on:click=move |_| { selected_tag_category.set(Some(category_name.clone())); tag_search.set(String::new()); }>
+                                                    <span>{group.name}</span><small>{group.tags.len()}</small>
+                                                </button>
+                                            }
+                                        } />
+                                    </nav>
+                                    <div class="template-tag-options">
+                                        <For each=move || visible_gallery_tags(
+                                            &available_tags.get(),
+                                            selected_tag_category.get().as_deref(),
+                                            &tag_search.get(),
+                                        ) key=|tag| (tag.name.clone(), tag.template_count) children=move |tag| {
+                                            let tag_name = tag.name.clone();
+                                            let checked_name = tag.name.clone();
+                                            view! { <button class="template-tag-option" class:is-active=move || selected_tags.get().contains(&checked_name)
+                                                on:click=move |_| toggle_tag(tag_name.clone())>
+                                                <span>{gallery_tag_label(&tag.name).to_string()}</span><small>{tag.template_count}</small>
+                                            </button> }
+                                        } />
+                                        <Show when=move || visible_gallery_tags(
+                                            &available_tags.get(),
+                                            selected_tag_category.get().as_deref(),
+                                            &tag_search.get(),
+                                        ).is_empty()>
+                                            <p class="template-tag-empty">"当前分类中没有匹配的标签"</p>
+                                        </Show>
+                                    </div>
+                                </div>
                             </div>
                         </Show>
                     </div>
-                    <select class="select-input template-sort" prop:value=move || sort.get()
-                        on:change=move |event| { sort.set(event_target_value(&event)); page.set(1); }>
-                        <option value="latest">"最新发布"</option>
-                        <option value="popular">"最多点赞"</option>
-                    </select>
                 </div>
                 <Show when=move || !selected_tags.get().is_empty()>
                     <div class="template-selected-tags">
                         <For each=move || selected_tags.get() key=|tag| tag.clone() children=move |tag| {
                             let remove_tag = tag.clone();
-                            view! { <button class="tag is-selected" on:click=move |_| toggle_tag(remove_tag.clone())>{format!("{tag} ×")}</button> }
+                            view! { <button class="tag is-selected" title=tag.clone() on:click=move |_| toggle_tag(remove_tag.clone())>{format!("{} ×", gallery_tag_breadcrumb(&tag))}</button> }
                         } />
                     </div>
                 </Show>
-                <Show when=move || is_admin.get()>
-                    <div class="template-admin-toolbar">
-                        <button class="button primary" on:click=new_editor><MaterialSymbolIcon name="add" filled=false />"新建模板"</button>
-                        <button class="button secondary" on:click=export_templates><MaterialSymbolIcon name="download" filled=false />"导出全部"</button>
-                        <button class="button secondary" on:click=move |_| { replace_confirm_stage.set(0); if let Some(input) = import_input.get() { input.click(); } }>
-                            <MaterialSymbolIcon name="upload" filled=false />"合并导入"
-                        </button>
-                        <button class="button danger" on:click=move |_| replace_confirm_stage.set(1)>
-                            <MaterialSymbolIcon name="sync" filled=false />"全量替换"
-                        </button>
-                        <input class="visually-hidden" node_ref=import_input type="file" accept=".zip,application/zip" on:change=import_archive />
-                    </div>
-                </Show>
-                {move || message.get().map(|message| view! { <p class="status template-message">{message}</p> })}
             </section>
 
             <Show when=move || loading.get()>
@@ -613,6 +701,8 @@ pub(crate) fn TemplatePlaza(
                     let use_value = template.clone();
                     let favorite_value = template.clone();
                     let edit_value = template.clone();
+                    let like_label = format_compact_like_count(template.like_count);
+                    let like_title = format!("点赞（{}）", template.like_count);
                     view! {
                         <article class="panel template-card">
                             <button class="template-card-preview" on:click=move |_| open_template(open_value.clone())>
@@ -621,13 +711,21 @@ pub(crate) fn TemplatePlaza(
                                 }.into_any()).unwrap_or_else(|| view! { <div class="template-empty-preview"><MaterialSymbolIcon name="image" filled=false /></div> }.into_any())}
                                 <span class="template-card-status">{status_label(template.status)}</span>
                             </button>
+                            {move || if is_admin.get() {
+                                let edit_target = edit_value.clone();
+                                view! { <button class="button ghost icon-button template-card-edit" title="编辑模板" aria-label="编辑模板" on:click=move |_| edit_template(edit_target.clone())>
+                                    <MaterialSymbolIcon name="edit" filled=false />
+                                </button> }.into_any()
+                            } else { ().into_any() }}
                             <div class="template-card-body">
                                 <div class="template-card-title-row"><h3>{template.title.clone()}</h3><span class="tag">{template.recommended_model.clone()}</span></div>
                                 <p>{prompt_excerpt(&template.prompt)}</p>
-                                <div class="template-card-tags">{template.tags.iter().map(|tag| view! { <span class="tag">{tag.clone()}</span> }).collect_view()}</div>
+                                <div class="template-card-tags">{template.tags.iter().map(|tag| view! {
+                                    <span class="tag" title=tag.clone()>{gallery_tag_label(tag).to_string()}</span>
+                                }).collect_view()}</div>
                                 <div class="template-card-actions">
-                                    <button class="button ghost" title="点赞" class:is-active=liked on:click=move |_| toggle_like(like_id.clone(), liked)>
-                                        <MaterialSymbolIcon name="favorite" filled=liked />{template.like_count}
+                                    <button class="button ghost template-like-button" title=like_title aria-label=format!("点赞，当前 {} 赞", template.like_count) class:is-active=liked on:click=move |_| toggle_like(like_id.clone(), liked)>
+                                        <MaterialSymbolIcon name="favorite" filled=liked /><span>{like_label}</span>
                                     </button>
                                     <button class="button ghost icon-button" title="复制提示词" on:click=move |_| copy_text(copy_prompt.clone(), message)>
                                         <MaterialSymbolIcon name="content_copy" filled=false />
@@ -635,12 +733,8 @@ pub(crate) fn TemplatePlaza(
                                     <button class="button ghost icon-button" title="复制分享链接" on:click=move |_| share_template(&share_id, message)>
                                         <MaterialSymbolIcon name="share" filled=false />
                                     </button>
-                                    <button class="button ghost" on:click=move |_| favorite_template(favorite_value.clone())><MaterialSymbolIcon name="star" filled=false />"收藏"</button>
+                                    <button class="button ghost icon-button" title="收藏到工作台" aria-label="收藏到工作台" on:click=move |_| favorite_template(favorite_value.clone())><MaterialSymbolIcon name="star" filled=false /></button>
                                     <button class="button primary" on:click=move |_| use_template(use_value.clone())>"使用模板"</button>
-                                    {move || if is_admin.get() {
-                                        let edit_target = edit_value.clone();
-                                        view! { <button class="button ghost icon-button" title="编辑模板" on:click=move |_| edit_template(edit_target.clone())><MaterialSymbolIcon name="edit" filled=false /></button> }.into_any()
-                                    } else { ().into_any() }}
                                 </div>
                             </div>
                         </article>
@@ -653,6 +747,15 @@ pub(crate) fn TemplatePlaza(
             <PaginationControls page=page page_count=page_count favorite=false />
         </main>
 
+        {move || message.get().map(|notice| view! {
+            <div class="template-plaza-notice" role="status" aria-live="polite">
+                <span>{notice}</span>
+                <button class="button ghost icon-button" title="关闭提示" aria-label="关闭提示" on:click=move |_| message.set(None)>
+                    <MaterialSymbolIcon name="close" filled=false />
+                </button>
+            </div>
+        })}
+
         {move || selected_template.get().map(|template| {
             let like_id = template.id.clone(); let liked = template.liked_by_viewer;
             let use_value = template.clone(); let favorite_value = template.clone(); let prompt = template.prompt.clone();
@@ -662,7 +765,9 @@ pub(crate) fn TemplatePlaza(
                     <div class="template-detail-gallery">{template.preview_assets.iter().map(|asset| view! { <img src=gallery_asset_url(asset) alt=template.title.clone() /> }).collect_view()}</div>
                     <div class="template-detail-content stack"><div><span class="template-plaza-kicker">"GALLERY TEMPLATE"</span><h2>{template.title.clone()}</h2></div>
                         <p>{template.description.clone()}</p>
-                        <div class="template-card-tags">{template.tags.iter().map(|tag| view! { <span class="tag">{tag.clone()}</span> }).collect_view()}</div>
+                        <div class="template-card-tags">{template.tags.iter().map(|tag| view! {
+                            <span class="tag" title=tag.clone()>{gallery_tag_label(tag).to_string()}</span>
+                        }).collect_view()}</div>
                         <div class="template-prompt-box"><strong>"提示词"</strong><p>{template.prompt.clone()}</p>
                             <button class="button ghost" on:click=move |_| copy_text(prompt.clone(), message)><MaterialSymbolIcon name="content_copy" filled=false />"复制"</button>
                         </div>
@@ -684,6 +789,22 @@ pub(crate) fn TemplatePlaza(
         {move || editor.get().map(|draft| view! {
             <TemplateEditor draft editor editor_busy message templates reload_trigger />
         })}
+
+        <Show when=move || export_confirm.get()>
+            <div class="modal-backdrop" on:click=move |_| export_confirm.set(false)>
+                <div class="panel confirm-dialog" on:click=move |event| event.stop_propagation()>
+                    <h3>"导出全部模板"</h3>
+                    <p>"将导出模板广场中的草稿、已发布和已归档模板，以及关联的预览图和参考图。是否继续？"</p>
+                    <div class="row">
+                        <button class="button ghost" on:click=move |_| export_confirm.set(false)>"取消"</button>
+                        <button class="button primary" on:click=move |_| {
+                            export_confirm.set(false);
+                            export_templates();
+                        }>"确认导出"</button>
+                    </div>
+                </div>
+            </div>
+        </Show>
 
         <Show when=move || { replace_confirm_stage.get() > 0 }>
             <div class="modal-backdrop" on:click=move |_| replace_confirm_stage.set(0)>
@@ -751,7 +872,6 @@ fn TemplateEditor(
                         });
                         reload_trigger.update(|value| *value = value.saturating_add(1));
                         editor.set(None);
-                        message.set(Some("模板已保存。".into()));
                     }
                     Err(error) => message.set(Some(error.to_string())),
                 },
@@ -769,7 +889,9 @@ fn TemplateEditor(
             <label>"标题"<input class="text-input" prop:value=draft.title on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.title = event_target_value(&event) }) /></label>
             <label>"提示词"<textarea class="text-input template-editor-prompt" prop:value=draft.prompt on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.prompt = event_target_value(&event) }) /></label>
             <label>"说明"<textarea class="text-input" prop:value=draft.description on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.description = event_target_value(&event) }) /></label>
-            <label>"标签（逗号分隔）"<input class="text-input" prop:value=draft.tags on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.tags = event_target_value(&event) }) /></label>
+            <label>"标签（逗号分隔）"<input class="text-input" placeholder="例如：风格/赛博朋克，构图/特写" prop:value=draft.tags on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.tags = event_target_value(&event) }) />
+                <small class="muted">"使用“分类/标签”归类；没有分类路径的旧标签会显示在“未分类”。"</small>
+            </label>
             <div class="template-editor-fields">
                 <label>"推荐服务商"<select class="select-input" prop:value=provider_kind_value(draft.recommended_provider_kind) on:change=move |event| editor.update(|draft| if let Some(draft) = draft { draft.recommended_provider_kind = parse_provider_kind(&event_target_value(&event)) })><option value="openai_image">"OpenAI Images"</option><option value="nano_banana">"Nano Banana"</option><option value="openai_compatible">"OpenAI 兼容"</option></select></label>
                 <label>"推荐模型"<input class="text-input" prop:value=draft.recommended_model on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.recommended_model = event_target_value(&event) }) /></label>
@@ -1333,6 +1455,116 @@ fn gallery_thumbnail_url(asset: &GalleryAsset) -> String {
         asset.id, asset.sha256
     ))
 }
+
+fn gallery_tag_parts(value: &str) -> (&str, &str) {
+    let Some((category, label)) = value.split_once('/') else {
+        return (UNCATEGORIZED_TAG_CATEGORY, value.trim());
+    };
+    let category = category.trim();
+    let label = label.trim();
+    if category.is_empty() || label.is_empty() {
+        (UNCATEGORIZED_TAG_CATEGORY, value.trim())
+    } else {
+        (category, label)
+    }
+}
+
+fn gallery_tag_label(value: &str) -> &str {
+    gallery_tag_parts(value).1
+}
+
+fn gallery_tag_breadcrumb(value: &str) -> String {
+    let (category, label) = gallery_tag_parts(value);
+    if category == UNCATEGORIZED_TAG_CATEGORY {
+        label.to_string()
+    } else {
+        format!("{category} · {label}")
+    }
+}
+
+fn group_gallery_tags(tags: &[GalleryTagSummary]) -> Vec<GalleryTagGroup> {
+    let mut grouped = BTreeMap::<String, Vec<GalleryTagSummary>>::new();
+    for tag in tags {
+        grouped
+            .entry(gallery_tag_parts(&tag.name).0.to_string())
+            .or_default()
+            .push(tag.clone());
+    }
+    let mut groups = grouped
+        .into_iter()
+        .map(|(name, mut tags)| {
+            tags.sort_by(|left, right| {
+                right
+                    .template_count
+                    .cmp(&left.template_count)
+                    .then_with(|| gallery_tag_label(&left.name).cmp(gallery_tag_label(&right.name)))
+            });
+            GalleryTagGroup { name, tags }
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        (left.name == UNCATEGORIZED_TAG_CATEGORY)
+            .cmp(&(right.name == UNCATEGORIZED_TAG_CATEGORY))
+            .then_with(|| right.tags.len().cmp(&left.tags.len()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    groups
+}
+
+fn visible_gallery_tags(
+    tags: &[GalleryTagSummary],
+    category: Option<&str>,
+    query: &str,
+) -> Vec<GalleryTagSummary> {
+    let Some(category) = category else {
+        return Vec::new();
+    };
+    let query = query.trim().to_lowercase();
+    let mut visible = tags
+        .iter()
+        .filter(|tag| gallery_tag_parts(&tag.name).0 == category)
+        .filter(|tag| {
+            query.is_empty()
+                || tag.name.to_lowercase().contains(&query)
+                || gallery_tag_label(&tag.name).to_lowercase().contains(&query)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    visible.sort_by(|left, right| {
+        right
+            .template_count
+            .cmp(&left.template_count)
+            .then_with(|| gallery_tag_label(&left.name).cmp(gallery_tag_label(&right.name)))
+    });
+    visible
+}
+
+fn format_compact_like_count(count: u64) -> String {
+    if count < 1_000 {
+        return count.to_string();
+    }
+    if count < 10_000 {
+        return format_count_with_decimal_unit(count, 1_000, "K");
+    }
+    if count < 1_000_000 {
+        return format_count_with_decimal_unit(count, 10_000, "W");
+    }
+    if count < 10_000_000 {
+        return format!("{}W", count / 10_000);
+    }
+    "999W+".into()
+}
+
+fn format_count_with_decimal_unit(count: u64, unit: u64, suffix: &str) -> String {
+    let whole = count / unit;
+    let decimal = count % unit / (unit / 10);
+    if decimal == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}{suffix}{decimal}")
+    }
+}
+
 fn prompt_excerpt(prompt: &str) -> String {
     let mut value = prompt.chars().take(110).collect::<String>();
     if prompt.chars().count() > 110 {
@@ -1451,4 +1683,58 @@ fn download_bytes(bytes: &[u8], mime: &str, file_name: &str) -> Result<(), Strin
     anchor.click();
     let _ = web_sys::Url::revoke_object_url(&url);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag(name: &str, template_count: u64) -> GalleryTagSummary {
+        GalleryTagSummary {
+            name: name.into(),
+            template_count,
+        }
+    }
+
+    #[test]
+    fn gallery_tags_are_grouped_by_category_path() {
+        let groups = group_gallery_tags(&[
+            tag("风格/赛博朋克", 3),
+            tag("构图/特写", 2),
+            tag("人像", 1),
+            tag("风格/写实", 5),
+        ]);
+
+        assert_eq!(groups[0].name, "风格");
+        assert_eq!(groups[0].tags[0].name, "风格/写实");
+        assert_eq!(
+            groups.last().map(|group| group.name.as_str()),
+            Some("未分类")
+        );
+        assert_eq!(gallery_tag_breadcrumb("风格/赛博朋克"), "风格 · 赛博朋克");
+    }
+
+    #[test]
+    fn tag_search_stays_inside_the_selected_category() {
+        let tags = [
+            tag("风格/写实", 4),
+            tag("构图/写实光影", 3),
+            tag("风格/水彩", 2),
+        ];
+
+        let visible = visible_gallery_tags(&tags, Some("风格"), "写实");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "风格/写实");
+    }
+
+    #[test]
+    fn like_count_uses_truncated_three_digit_abbreviations() {
+        assert_eq!(format_compact_like_count(999), "999");
+        assert_eq!(format_compact_like_count(1_200), "1K2");
+        assert_eq!(format_compact_like_count(1_280), "1K2");
+        assert_eq!(format_compact_like_count(1_300), "1K3");
+        assert_eq!(format_compact_like_count(12_000), "1W2");
+        assert_eq!(format_compact_like_count(999_999), "99W9");
+        assert_eq!(format_compact_like_count(1_280_000), "128W");
+    }
 }
