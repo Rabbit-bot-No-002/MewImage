@@ -8,5 +8,6 @@ pub(crate) mod overlays;
 pub(crate) mod popovers;
 pub(crate) mod preview;
 pub(crate) mod settings;
+pub(crate) mod template_plaza;
 pub(crate) mod top_bar;
 pub(crate) mod workspace;

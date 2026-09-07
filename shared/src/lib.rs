@@ -2542,6 +2542,19 @@ mod tests {
         let decoded: LocalTaskRecord = serde_json::from_value(value).unwrap();
 
         assert!(!decoded.detached_from_thread);
+        assert!(decoded.source_gallery_template_id.is_none());
+    }
+
+    #[test]
+    fn gallery_template_status_uses_stable_wire_values() {
+        assert_eq!(
+            serde_json::to_string(&GalleryTemplateStatus::Published).unwrap(),
+            "\"published\""
+        );
+        assert_eq!(
+            serde_json::from_str::<GalleryImportMode>("\"replace\"").unwrap(),
+            GalleryImportMode::Replace
+        );
     }
 
     #[test]

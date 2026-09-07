@@ -1,3 +1,4 @@
+mod gallery_templates;
 mod migrations;
 mod security_headers;
 mod state;
@@ -238,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
         ),
+        gallery_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(config.auth_hash_concurrency)),
         dummy_password_hash,
         guest_proxy_limits: Arc::new(GuestProxyLimits::default()),
@@ -266,6 +268,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cors_layer = build_cors_layer(&config)?;
     let max_upload_body_limit = usize::try_from(config.max_upload_bytes).unwrap_or(usize::MAX);
+    let gallery_archive_body_limit = usize::try_from(
+        config
+            .gallery_asset_quota_bytes
+            .saturating_add(8 * 1024 * 1024),
+    )
+    .unwrap_or(usize::MAX);
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -331,6 +339,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/images/fetch",
             post(fetch_image_via_proxy).layer(DefaultBodyLimit::max(IMAGE_FETCH_BODY_LIMIT)),
         )
+        .merge(gallery_templates::routes(
+            max_upload_body_limit,
+            gallery_archive_body_limit,
+        ))
         .fallback_service(
             ServeDir::new(&config.frontend_dist)
                 .precompressed_br()
@@ -600,6 +612,7 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     }
     migrate_users_table(db).await?;
     migrations::run_data_integrity_migrations(db).await?;
+    gallery_templates::init_db(db).await?;
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_single_admin ON users(role) WHERE role = 'admin'",
     )
@@ -4674,6 +4687,9 @@ async fn periodically_cleanup_expired_uploads(state: Arc<AppState>) {
         if let Err(error) = cleanup_local_staging_files(&state).await {
             warn!("local upload staging cleanup failed: {}", error.message);
         }
+        if let Err(error) = gallery_templates::cleanup_expired_staged_objects(&state).await {
+            warn!("gallery staging cleanup failed: {}", error.message);
+        }
         cleanup_stale_proxy_temp_dirs().await;
     }
 }
@@ -5800,6 +5816,8 @@ mod tests {
             user_asset_quota_count: 20_000,
             user_pending_upload_bytes: 256 * 1024 * 1024,
             user_pending_upload_count: 32,
+            gallery_asset_quota_bytes: 5 * 1024 * 1024 * 1024,
+            gallery_asset_quota_count: 20_000,
         }
     }
 
@@ -5830,6 +5848,7 @@ mod tests {
                     .map(|_| tokio::sync::Mutex::new(()))
                     .collect(),
             ),
+            gallery_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             auth_hash_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             dummy_password_hash: hash_password("dummy").unwrap(),
             guest_proxy_limits: Arc::new(GuestProxyLimits::default()),

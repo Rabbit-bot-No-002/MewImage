@@ -6,7 +6,7 @@ use crate::app::{
     derived::AppDerived,
     ensure_asset_display_sources_loaded, first_displayable_generated_asset,
     models::{ConfirmPopoverKind, ConfirmPopoverState, ContextMenuState},
-    state::{ComposerState, UiState, WorkspaceState},
+    state::{AccountState, ComposerState, MainView, UiState, WorkspaceState},
 };
 
 use super::common::{MaterialSymbolIcon, PaginationControls};
@@ -22,6 +22,7 @@ pub(crate) fn GallerySidebar(
 ) -> impl IntoView {
     let workspace = expect_context::<WorkspaceState>();
     let composer = expect_context::<ComposerState>();
+    let account = expect_context::<AccountState>();
     let ui = expect_context::<UiState>();
     let derived = expect_context::<AppDerived>();
     let tasks = workspace.tasks;
@@ -107,6 +108,7 @@ pub(crate) fn GallerySidebar(
                                     let context_task_id = task_id.clone();
                                     let context_asset_id = asset_id.clone();
                                     let cancel_task_id = task_id.clone();
+                                    let publish_task_id = task_id.clone();
                                     let item_status = item.status;
                                     let error_message = item.error_message.clone();
                                     let progress_label = generation_runtimes.with(|items| {
@@ -275,6 +277,28 @@ pub(crate) fn GallerySidebar(
                                                     } else {
                                                         ().into_any()
                                                     }}
+                                                    {move || if item_status == TaskStatus::Succeeded
+                                                        && account.auth_user.with(|user| user.as_ref().is_some_and(|user| user.status == "approved" && user.role == "admin"))
+                                                    {
+                                                        let target_task_id = publish_task_id.clone();
+                                                        view! {
+                                                            <button class="button ghost mini-action icon-action" title="发布到模板广场" on:click=move |_| {
+                                                                ui.gallery_template_draft_task_id.set(Some(target_task_id.clone()));
+                                                                ui.main_view.set(MainView::TemplatePlaza);
+                                                                if let Some(window) = web_sys::window()
+                                                                    && let Ok(history) = window.history()
+                                                                {
+                                                                    let _ = history.push_state_with_url(
+                                                                        &wasm_bindgen::JsValue::NULL,
+                                                                        "",
+                                                                        Some("/?view=templates"),
+                                                                    );
+                                                                }
+                                                            }>
+                                                                <MaterialSymbolIcon name="publish" filled=false />
+                                                            </button>
+                                                        }.into_any()
+                                                    } else { ().into_any() }}
                                                     <button class="button ghost danger mini-action icon-action" title="删除记录" on:click=move |ev: MouseEvent| delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64)><MaterialSymbolIcon name="delete" filled=false /></button>
                                                     </div> }.into_any()
                                                 }}

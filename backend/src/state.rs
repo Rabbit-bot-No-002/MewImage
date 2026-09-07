@@ -94,6 +94,8 @@ pub struct AppConfig {
     pub user_asset_quota_count: u64,
     pub user_pending_upload_bytes: u64,
     pub user_pending_upload_count: u64,
+    pub gallery_asset_quota_bytes: u64,
+    pub gallery_asset_quota_count: u64,
 }
 
 impl AppConfig {
@@ -290,6 +292,18 @@ impl AppConfig {
                 "MEW_IMAGE_USER_PENDING_UPLOAD_COUNT",
                 32,
             ),
+            gallery_asset_quota_bytes: parse_mib_or_bytes_env(
+                "MEW_GALLERY_ASSET_QUOTA_MIB",
+                "MEW_IMAGE_GALLERY_ASSET_QUOTA_MIB",
+                "MEW_GALLERY_ASSET_QUOTA_BYTES",
+                "MEW_IMAGE_GALLERY_ASSET_QUOTA_BYTES",
+                5 * 1024,
+            ),
+            gallery_asset_quota_count: parse_u64_env(
+                "MEW_GALLERY_ASSET_QUOTA_COUNT",
+                "MEW_IMAGE_GALLERY_ASSET_QUOTA_COUNT",
+                20_000,
+            ),
         })
     }
 }
@@ -306,6 +320,7 @@ pub struct AppState {
     pub generation_memory_budget: Arc<Semaphore>,
     pub generation_jobs: Arc<Mutex<HashMap<String, ProxyGenerationJob>>>,
     pub user_data_write_locks: Arc<Vec<Mutex<()>>>,
+    pub gallery_write_lock: Arc<Mutex<()>>,
     pub auth_hash_semaphore: Arc<Semaphore>,
     pub dummy_password_hash: String,
     pub guest_proxy_limits: Arc<GuestProxyLimits>,

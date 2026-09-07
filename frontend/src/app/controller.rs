@@ -31,6 +31,22 @@ pub(super) fn AppController() -> impl IntoView {
     let persist_ui_state = move || {
         request_ui_state_persist(configs, preferences, persistence);
     };
+    Effect::new(move |_| {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let popstate_handler = Closure::<dyn FnMut(Event)>::new(move |_| {
+            ui.main_view.set(MainView::from_location());
+        });
+        if window
+            .add_event_listener_with_callback("popstate", popstate_handler.as_ref().unchecked_ref())
+            .is_err()
+        {
+            return;
+        }
+        // 根控制器与页面同寿命，固定保留一个监听器不会随交互累积。
+        popstate_handler.forget();
+    });
     let enqueue_payload_deletes = {
         move |asset_ids: Vec<String>| {
             if asset_ids.is_empty()
@@ -428,6 +444,7 @@ pub(super) fn AppController() -> impl IntoView {
                 assign_favorite_folder=assign_favorite_folder
                 cancel_favorite_for_task=cancel_favorite_for_task
             />
+            <Show when=move || ui.main_view.get() == MainView::Workspace>
             <main class="workspace-layout">
                 <GallerySidebar
                     open_preview=open_preview
@@ -454,6 +471,11 @@ pub(super) fn AppController() -> impl IntoView {
                     update_current_config=update_current_config
                 />
             </main>
+            </Show>
+
+            <Show when=move || ui.main_view.get() == MainView::TemplatePlaza>
+                <TemplatePlaza persist_state=persist_state persist_ui_state=persist_ui_state />
+            </Show>
 
             <ReferenceMenuOverlay delete_asset=delete_asset />
 

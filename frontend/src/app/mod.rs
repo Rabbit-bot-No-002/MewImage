@@ -69,6 +69,7 @@ use components::overlays::{
 use components::popovers::GlobalPopovers;
 use components::preview::PreviewOverlay;
 use components::settings::SettingsOverlay;
+use components::template_plaza::TemplatePlaza;
 use components::top_bar::TopBar;
 use components::workspace::WorkspaceMain;
 use controller::AppController;

@@ -25,9 +25,53 @@ pub(crate) enum LocalStateLoadStatus {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MainView {
+    Workspace,
+    TemplatePlaza,
+}
+
+impl MainView {
+    pub(crate) fn from_location() -> Self {
+        let search = web_sys::window()
+            .and_then(|window| window.location().search().ok())
+            .unwrap_or_default();
+        main_view_from_search(&search)
+    }
+}
+
+fn main_view_from_search(search: &str) -> MainView {
+    if search
+        .trim_start_matches('?')
+        .split('&')
+        .any(|part| part == "view=templates")
+    {
+        MainView::TemplatePlaza
+    } else {
+        MainView::Workspace
+    }
+}
+
 impl LocalStateLoadStatus {
     pub(crate) fn is_ready(&self) -> bool {
         matches!(self, Self::Ready)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_deep_link_selects_plaza_view() {
+        assert_eq!(
+            main_view_from_search("?view=templates&template=123"),
+            MainView::TemplatePlaza
+        );
+        assert_eq!(
+            main_view_from_search("?view=workspace"),
+            MainView::Workspace
+        );
     }
 }
 
@@ -112,6 +156,8 @@ pub(crate) struct AccountState {
 
 #[derive(Clone, Copy)]
 pub(crate) struct UiState {
+    pub(crate) main_view: RwSignal<MainView>,
+    pub(crate) gallery_template_draft_task_id: RwSignal<Option<String>>,
     pub(crate) show_favorites_panel: RwSignal<bool>,
     pub(crate) favorite_folder_picker: RwSignal<Option<FavoriteFolderPickerState>>,
     pub(crate) text_popover: RwSignal<Option<TextPopoverState>>,
@@ -254,6 +300,8 @@ impl AppState {
             syncing: RwSignal::new(false),
         };
         let ui = UiState {
+            main_view: RwSignal::new(MainView::from_location()),
+            gallery_template_draft_task_id: RwSignal::new(None),
             show_favorites_panel: RwSignal::new(false),
             favorite_folder_picker: RwSignal::new(None),
             text_popover: RwSignal::new(None),

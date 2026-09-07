@@ -335,7 +335,7 @@ pub(crate) fn WorkspaceMain(
                         class="prompt-input"
                         prop:value=move || draft_prompt.get()
                         node_ref=draft_prompt_ref
-                        placeholder="输入你想要的画面，例如：软萌猫耳少女，奶油色光影，樱花飘落"
+                        placeholder="不知道做什么？去模板广场看看吧~"
                         on:input=move |ev| {
                             draft_prompt.set(event_target_value(&ev));
                         }
