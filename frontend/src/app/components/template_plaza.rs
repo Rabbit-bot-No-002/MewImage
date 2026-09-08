@@ -16,7 +16,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, BlobPropertyBag, Event, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement,
-    MouseEvent,
+    KeyboardEvent, MouseEvent,
 };
 
 use crate::app::{
@@ -93,6 +93,7 @@ pub(crate) fn TemplatePlaza(
     let available_tags = RwSignal::new(Vec::<GalleryTagSummary>::new());
     let selected_tags = RwSignal::new(Vec::<String>::new());
     let search = RwSignal::new(String::new());
+    let applied_filters = RwSignal::new((String::new(), Vec::<String>::new()));
     let sort = RwSignal::new("latest".to_string());
     let page = RwSignal::new(1usize);
     let total_pages = RwSignal::new(1usize);
@@ -123,11 +124,14 @@ pub(crate) fn TemplatePlaza(
                 .is_some_and(|user| user.status == "approved" && user.role == "admin")
         })
     });
+    let search_filters_dirty = Memo::new(move |_| {
+        normalized_gallery_search_filters(&search.get(), &selected_tags.get())
+            != applied_filters.get()
+    });
 
     Effect::new(move |_| {
         let _ = reload_trigger.get();
-        let query = search.get();
-        let tags = selected_tags.get();
+        let (query, tags) = applied_filters.get();
         let sort_value = sort.get();
         let requested_page = page.get();
         let admin = is_admin.get();
@@ -135,9 +139,6 @@ pub(crate) fn TemplatePlaza(
         request_revision.set(revision);
         loading.set(true);
         spawn_local(async move {
-            if !query.trim().is_empty() {
-                TimeoutFuture::new(300).await;
-            }
             if request_revision.get_untracked() != revision {
                 return;
             }
@@ -279,6 +280,21 @@ pub(crate) fn TemplatePlaza(
         detail_preview_index.set(0);
         update_template_url(None);
     };
+    let submit_search = move || {
+        let filters = normalized_gallery_search_filters(
+            &search.get_untracked(),
+            &selected_tags.get_untracked(),
+        );
+        show_tag_picker.set(false);
+        show_sort_picker.set(false);
+        if filters == applied_filters.get_untracked() && page.get_untracked() == 1 {
+            return;
+        }
+        batch(move || {
+            page.set(1);
+            applied_filters.set(filters);
+        });
+    };
     let toggle_tag = move |tag: String| {
         selected_tags.update(|items| {
             if let Some(index) = items.iter().position(|item| item == &tag) {
@@ -287,7 +303,6 @@ pub(crate) fn TemplatePlaza(
                 items.push(tag);
             }
         });
-        page.set(1);
     };
 
     let toggle_like = move |template_id: String, liked: bool| {
@@ -727,11 +742,30 @@ pub(crate) fn TemplatePlaza(
                     </Show>
                 </div>
                 <div class="template-plaza-tools">
-                    <label class="template-search">
-                        <MaterialSymbolIcon name="search" filled=false />
-                        <input type="search" placeholder="搜索标题、提示词或标签" prop:value=move || search.get()
-                            on:input=move |event| { search.set(event_target_value(&event)); page.set(1); } />
-                    </label>
+                    <div class="template-search">
+                        <input
+                            type="search"
+                            aria-label="搜索模板标题、提示词或标签"
+                            placeholder="搜索标题、提示词或标签"
+                            prop:value=move || search.get()
+                            on:input=move |event| search.set(event_target_value(&event))
+                            on:keydown=move |event: KeyboardEvent| {
+                                if event.key() == "Enter" {
+                                    event.prevent_default();
+                                    submit_search();
+                                }
+                            }
+                        />
+                        <button
+                            class="button primary icon-button template-search-submit"
+                            class:is-dirty=move || search_filters_dirty.get()
+                            title="搜索"
+                            aria-label="按当前文字和所选标签搜索"
+                            on:click=move |_| submit_search()
+                        >
+                            <MaterialSymbolIcon name="search" filled=false />
+                        </button>
+                    </div>
                     <div class="template-sort-filter">
                         <button
                             class="button secondary icon-button template-sort-button"
@@ -779,7 +813,7 @@ pub(crate) fn TemplatePlaza(
                                             on:input=move |event| tag_search.set(event_target_value(&event)) />
                                     </label>
                                     <button class="button ghost" disabled=move || selected_tags.get().is_empty()
-                                        on:click=move |_| { selected_tags.set(Vec::new()); page.set(1); }>
+                                        on:click=move |_| selected_tags.set(Vec::new())>
                                         "清空"
                                     </button>
                                 </div>
@@ -817,6 +851,12 @@ pub(crate) fn TemplatePlaza(
                                             <p class="template-tag-empty">"当前分类中没有匹配的标签"</p>
                                         </Show>
                                     </div>
+                                </div>
+                                <div class="template-tag-menu-actions">
+                                    <button class="button primary" on:click=move |_| submit_search()>
+                                        <MaterialSymbolIcon name="search" filled=false />
+                                        "按所选标签搜索"
+                                    </button>
                                 </div>
                             </div>
                         </Show>
@@ -1788,6 +1828,18 @@ fn gallery_tag_breadcrumb(value: &str) -> String {
     }
 }
 
+fn normalized_gallery_search_filters(query: &str, tags: &[String]) -> (String, Vec<String>) {
+    let mut normalized_tags = tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    normalized_tags.sort_unstable();
+    normalized_tags.dedup();
+    (query.trim().to_string(), normalized_tags)
+}
+
 fn group_gallery_tags(tags: &[GalleryTagSummary]) -> Vec<GalleryTagGroup> {
     let mut grouped = BTreeMap::<String, Vec<GalleryTagSummary>>::new();
     for tag in tags {
@@ -2037,6 +2089,17 @@ mod tests {
         let visible = visible_gallery_tags(&tags, Some("风格"), "写实");
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].name, "风格/写实");
+    }
+
+    #[test]
+    fn submitted_search_filters_trim_and_keep_multiple_unique_tags() {
+        let filters = normalized_gallery_search_filters(
+            "  星空少女  ",
+            &["风格/写实".into(), " 构图/特写 ".into(), "风格/写实".into()],
+        );
+
+        assert_eq!(filters.0, "星空少女");
+        assert_eq!(filters.1, ["构图/特写", "风格/写实"]);
     }
 
     #[test]

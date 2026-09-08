@@ -2371,7 +2371,7 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 13px;
+  padding: 4px 5px 4px 13px;
   border: 1px solid rgba(var(--primary-rgb), 0.2);
   border-radius: 15px;
   background: var(--input-bg, var(--panel-strong));
@@ -2386,6 +2386,25 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
   color: var(--text);
   background: transparent;
   font: inherit;
+}
+
+.template-search-submit.button.icon-button {
+  width: 36px;
+  min-width: 36px;
+  min-height: 34px;
+  border-radius: 11px;
+  font-size: 20px;
+  transition: transform 160ms ease, box-shadow 160ms ease, filter 160ms ease;
+}
+
+.template-search-submit.is-dirty {
+  box-shadow:
+    0 0 0 3px rgba(var(--primary-rgb), 0.13),
+    0 7px 18px rgba(var(--primary-rgb), 0.2);
+}
+
+.template-search-submit:hover {
+  transform: translateY(-1px);
 }
 
 .template-tag-filter,
@@ -2502,6 +2521,17 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
   max-height: min(420px, 55vh);
   display: grid;
   grid-template-columns: 180px minmax(0, 1fr);
+}
+
+.template-tag-menu-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 12px;
+  border-top: 1px solid rgba(var(--primary-rgb), 0.12);
+}
+
+.template-tag-menu-actions .button {
+  min-height: 36px;
 }
 
 .template-tag-categories,
