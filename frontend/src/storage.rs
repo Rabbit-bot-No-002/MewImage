@@ -1,8 +1,14 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use js_sys::{Array, Uint8Array};
-use mew_image_shared::{AppPreferences, EncryptedApiConfig, LocalAppState};
+use mew_image_shared::{
+    AppPreferences, EncryptedApiConfig, GeneratedImageResult, GenerationResult, ImageAssetRef,
+    LocalAppState, ParameterSnapshot, TaskStatus, now_rfc3339,
+};
 use rexie::{ObjectStore, Rexie, TransactionMode};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -19,10 +25,47 @@ const PREFERENCES_KEY: &str = "preferences_state";
 const TRUSTED_SYNC_KEY_PREFIX: &str = "mew-image-trusted-sync-key:";
 const API_KEY_SYNC_ENABLED_PREFIX: &str = "mew-image-api-key-sync-enabled:";
 const GENERATION_QUEUE_MODE_KEY: &str = "mew-image-generation-queue-mode";
+const GENERATION_STAGING_KEY_PREFIX: &str = "generation_staging:";
 const ASSET_WRITE_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 thread_local! {
     static ASSET_OBJECT_URLS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct GenerationStagingManifest {
+    pub task_id: String,
+    pub expected_count: u32,
+    pub assets: Vec<ImageAssetRef>,
+    pub finished: bool,
+    pub updated_at: String,
+}
+
+#[derive(Default)]
+struct GenerationStagingRecovery {
+    handled_task_ids: Vec<String>,
+    orphan_asset_ids: Vec<String>,
+}
+
+impl GenerationStagingManifest {
+    pub fn new(
+        task_id: String,
+        expected_count: u32,
+        assets: Vec<ImageAssetRef>,
+        finished: bool,
+    ) -> Self {
+        Self {
+            task_id,
+            expected_count,
+            assets,
+            finished,
+            updated_at: now_rfc3339(),
+        }
+    }
+}
+
+fn generation_staging_key(task_id: &str) -> String {
+    format!("{GENERATION_STAGING_KEY_PREFIX}{task_id}")
 }
 
 pub fn runtime_asset_object_url(asset_id: &str) -> Option<String> {
@@ -166,11 +209,20 @@ pub async fn load_snapshot() -> Result<LocalAppState, String> {
         state.preferences =
             serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())?;
     }
+    let recovery = recover_generation_staging(&db, &mut state).await?;
+    if !recovery.handled_task_ids.is_empty() {
+        save_workspace_snapshot_with_db(&db, &state).await?;
+        clear_generation_staging_entries(&db, &recovery).await?;
+    }
     Ok(state)
 }
 
 pub async fn save_workspace_snapshot(state: &LocalAppState) -> Result<(), String> {
     let db = open_db().await?;
+    save_workspace_snapshot_with_db(&db, state).await
+}
+
+async fn save_workspace_snapshot_with_db(db: &Rexie, state: &LocalAppState) -> Result<(), String> {
     let transaction = db
         .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
         .map_err(|error| error.to_string())?;
@@ -188,6 +240,182 @@ pub async fn save_workspace_snapshot(state: &LocalAppState) -> Result<(), String
         .done()
         .await
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn recover_generation_staging(
+    db: &Rexie,
+    state: &mut LocalAppState,
+) -> Result<GenerationStagingRecovery, String> {
+    let transaction = db
+        .transaction(&[STORE_NAME], TransactionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let mut manifests = Vec::new();
+    let staging_keys = store
+        .get_all_keys(None, None)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|key| key.as_string())
+        .filter(|key| key.starts_with(GENERATION_STAGING_KEY_PREFIX))
+        .collect::<Vec<_>>();
+    for staging_key in staging_keys {
+        let value = store
+            .get(JsValue::from_str(&staging_key))
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(value) = value {
+            manifests.push(
+                serde_wasm_bindgen::from_value::<GenerationStagingManifest>(value)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    Ok(apply_generation_staging_manifests(state, manifests))
+}
+
+fn apply_generation_staging_manifests(
+    state: &mut LocalAppState,
+    manifests: Vec<GenerationStagingManifest>,
+) -> GenerationStagingRecovery {
+    let mut retained_asset_ids = state
+        .assets
+        .iter()
+        .map(|asset| asset.id.clone())
+        .collect::<HashSet<_>>();
+    let mut recovery = GenerationStagingRecovery {
+        handled_task_ids: Vec::with_capacity(manifests.len()),
+        orphan_asset_ids: Vec::new(),
+    };
+    for manifest in manifests {
+        recovery.handled_task_ids.push(manifest.task_id.clone());
+        let Some(task) = state
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == manifest.task_id)
+        else {
+            recovery.orphan_asset_ids.extend(
+                manifest
+                    .assets
+                    .into_iter()
+                    .map(|asset| asset.id)
+                    .filter(|asset_id| !retained_asset_ids.contains(asset_id)),
+            );
+            continue;
+        };
+        if task.status != TaskStatus::Running || manifest.assets.is_empty() {
+            continue;
+        }
+        for asset in manifest.assets {
+            if !retained_asset_ids.insert(asset.id.clone()) {
+                continue;
+            }
+            state.assets.push(asset);
+        }
+        let total_assets = state
+            .assets
+            .iter()
+            .filter(|asset| asset.source_task_id.as_deref() == Some(task.id.as_str()))
+            .count();
+        if total_assets == 0 {
+            continue;
+        }
+        let mut parameter_snapshot = task
+            .generation_settings
+            .as_ref()
+            .map(|settings| ParameterSnapshot {
+                requested_width: Some(settings.width),
+                requested_height: Some(settings.height),
+                requested_quality: settings.quality.clone(),
+                ..ParameterSnapshot::default()
+            })
+            .unwrap_or_default();
+        if let Some((width, height)) = state
+            .assets
+            .iter()
+            .find(|asset| asset.source_task_id.as_deref() == Some(task.id.as_str()))
+            .and_then(|asset| asset.width.zip(asset.height))
+        {
+            parameter_snapshot.actual_width = Some(width);
+            parameter_snapshot.actual_height = Some(height);
+        }
+        task.result = Some(GenerationResult {
+            images: (0..total_assets)
+                .map(|_| GeneratedImageResult {
+                    url: None,
+                    data_url: None,
+                })
+                .collect(),
+            parameter_snapshot,
+            raw_response_json: None,
+        });
+        task.updated_at = now_rfc3339();
+        if manifest.finished {
+            task.status = TaskStatus::Succeeded;
+            task.error_message = None;
+        } else {
+            task.status = TaskStatus::Failed;
+            task.error_message = Some(format!(
+                "上次生成意外中断，已恢复 {total_assets}/{} 张已落盘结果。",
+                manifest.expected_count.max(total_assets as u32)
+            ));
+        }
+    }
+    recovery.orphan_asset_ids.sort_unstable();
+    recovery.orphan_asset_ids.dedup();
+    recovery
+}
+
+async fn clear_generation_staging_entries(
+    db: &Rexie,
+    recovery: &GenerationStagingRecovery,
+) -> Result<(), String> {
+    let transaction = db
+        .transaction(
+            &[STORE_NAME, ASSET_BLOB_STORE_NAME, ASSET_STORE_NAME],
+            TransactionMode::ReadWrite,
+        )
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let blob_store = transaction
+        .store(ASSET_BLOB_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let legacy_store = transaction
+        .store(ASSET_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    for task_id in &recovery.handled_task_ids {
+        store
+            .delete(JsValue::from_str(&generation_staging_key(task_id)))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    for asset_id in &recovery.orphan_asset_ids {
+        blob_store
+            .delete(JsValue::from_str(asset_id))
+            .await
+            .map_err(|error| error.to_string())?;
+        legacy_store
+            .delete(JsValue::from_str(asset_id))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    for asset_id in &recovery.orphan_asset_ids {
+        revoke_asset_object_url(asset_id);
+    }
     Ok(())
 }
 
@@ -251,6 +479,110 @@ pub async fn apply_asset_payload_changes(
             replace_cached_asset_blob(asset_id, blob);
         }
         batch_start = batch_end;
+    }
+    Ok(())
+}
+
+/// 提前把压缩后的 Data URL 转为 Blob；保存重试期间不再重复解码 Base64。
+pub fn prepare_generation_asset_blobs(
+    payload_writes: &[(String, String)],
+) -> Result<Vec<(String, Blob)>, String> {
+    payload_writes
+        .iter()
+        .map(|(asset_id, data_url)| data_url_to_blob(data_url).map(|blob| (asset_id.clone(), blob)))
+        .collect()
+}
+
+/// 将生成中的图片 Blob 与恢复清单放进同一事务；只有事务成功后才能确认服务端结果。
+pub async fn stage_generation_asset_blobs(
+    manifest: &GenerationStagingManifest,
+    prepared_writes: &[(String, Blob)],
+) -> Result<(), String> {
+    let db = open_db().await?;
+    let transaction = db
+        .transaction(
+            &[STORE_NAME, ASSET_BLOB_STORE_NAME, ASSET_STORE_NAME],
+            TransactionMode::ReadWrite,
+        )
+        .map_err(|error| error.to_string())?;
+    let state_store = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let blob_store = transaction
+        .store(ASSET_BLOB_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let legacy_store = transaction
+        .store(ASSET_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    for (asset_id, blob) in prepared_writes {
+        blob_store
+            .put(blob.as_ref(), Some(&JsValue::from_str(asset_id)))
+            .await
+            .map_err(|error| error.to_string())?;
+        legacy_store
+            .delete(JsValue::from_str(asset_id))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    state_store
+        .put(
+            &serde_wasm_bindgen::to_value(manifest).map_err(|error| error.to_string())?,
+            Some(&JsValue::from_str(&generation_staging_key(
+                &manifest.task_id,
+            ))),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    for (asset_id, blob) in prepared_writes {
+        replace_cached_asset_blob(asset_id, blob);
+    }
+    Ok(())
+}
+
+pub async fn clear_generation_staging(
+    task_id: &str,
+    payload_deletes: &[String],
+) -> Result<(), String> {
+    let db = open_db().await?;
+    let transaction = db
+        .transaction(
+            &[STORE_NAME, ASSET_BLOB_STORE_NAME, ASSET_STORE_NAME],
+            TransactionMode::ReadWrite,
+        )
+        .map_err(|error| error.to_string())?;
+    let state_store = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let blob_store = transaction
+        .store(ASSET_BLOB_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let legacy_store = transaction
+        .store(ASSET_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    state_store
+        .delete(JsValue::from_str(&generation_staging_key(task_id)))
+        .await
+        .map_err(|error| error.to_string())?;
+    for asset_id in payload_deletes {
+        blob_store
+            .delete(JsValue::from_str(asset_id))
+            .await
+            .map_err(|error| error.to_string())?;
+        legacy_store
+            .delete(JsValue::from_str(asset_id))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    for asset_id in payload_deletes {
+        revoke_asset_object_url(asset_id);
     }
     Ok(())
 }
@@ -540,4 +872,109 @@ async fn blob_to_data_url(blob: &Blob) -> Result<String, String> {
         blob.type_()
     };
     Ok(format!("data:{mime_type};base64,{}", BASE64.encode(bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use mew_image_shared::LocalTaskRecord;
+
+    use super::*;
+
+    fn running_task(id: &str) -> LocalTaskRecord {
+        LocalTaskRecord {
+            id: id.into(),
+            thread_id: "thread-1".into(),
+            config_id: "config-1".into(),
+            prompt: "test".into(),
+            requested_model: "gpt-image-2".into(),
+            reference_asset_ids: Vec::new(),
+            generation_settings: None,
+            result: None,
+            favorite: false,
+            favorite_folder_id: None,
+            detached_from_thread: false,
+            source_gallery_template_id: None,
+            status: TaskStatus::Running,
+            error_message: None,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+        }
+    }
+
+    fn staged_asset(id: &str, task_id: &str) -> ImageAssetRef {
+        ImageAssetRef {
+            id: id.into(),
+            sha256: format!("sha-{id}"),
+            mime_type: "image/webp".into(),
+            byte_len: 128,
+            width: Some(64),
+            height: Some(32),
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
+            data_url: None,
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: Some(task_id.into()),
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn staging_recovery_restores_complete_and_partial_tasks_and_marks_orphans() {
+        let mut state = LocalAppState {
+            tasks: vec![running_task("complete"), running_task("partial")],
+            ..LocalAppState::default()
+        };
+        let manifests = vec![
+            GenerationStagingManifest::new(
+                "complete".into(),
+                2,
+                vec![
+                    staged_asset("complete-1", "complete"),
+                    staged_asset("complete-2", "complete"),
+                ],
+                true,
+            ),
+            GenerationStagingManifest::new(
+                "partial".into(),
+                3,
+                vec![staged_asset("partial-1", "partial")],
+                false,
+            ),
+            GenerationStagingManifest::new(
+                "missing-task".into(),
+                1,
+                vec![staged_asset("orphan-1", "missing-task")],
+                false,
+            ),
+        ];
+
+        let recovery = apply_generation_staging_manifests(&mut state, manifests);
+
+        assert_eq!(recovery.handled_task_ids.len(), 3);
+        assert_eq!(recovery.orphan_asset_ids, ["orphan-1"]);
+        assert_eq!(state.assets.len(), 3);
+        let complete = state
+            .tasks
+            .iter()
+            .find(|task| task.id == "complete")
+            .unwrap();
+        assert_eq!(complete.status, TaskStatus::Succeeded);
+        assert_eq!(complete.result.as_ref().unwrap().images.len(), 2);
+        let partial = state
+            .tasks
+            .iter()
+            .find(|task| task.id == "partial")
+            .unwrap();
+        assert_eq!(partial.status, TaskStatus::Failed);
+        assert_eq!(partial.result.as_ref().unwrap().images.len(), 1);
+        assert!(
+            partial
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("1/3"))
+        );
+    }
 }

@@ -4,6 +4,7 @@ debug
 target
 frontend/dist
 frontend/dist-app
+/dist-app/
 # 本地后端运行时数据：SQLite、用户图片、模板广场原图和派生缩略图。
 /data/
 .env

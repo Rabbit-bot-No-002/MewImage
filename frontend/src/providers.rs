@@ -1,3 +1,5 @@
+use std::{cell::Cell, future::Future, pin::Pin, rc::Rc};
+
 use gloo_net::http::Request;
 use mew_image_shared::{
     BUILTIN_NANO_BANANA_TEMPLATE_ID, BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
@@ -16,7 +18,9 @@ use mew_image_shared::{
 use serde_json::json;
 
 use crate::api::api_candidates;
-use crate::app::{blob_from_bytes, reencode_asset_bytes, sha256_hex, strip_task_payloads};
+use crate::app::{
+    blob_from_bytes, decode_browser_data_url, reencode_asset_bytes, sha256_hex, strip_task_payloads,
+};
 use crate::crypto::{decrypt_secret, encrypt_secret};
 
 const PROMPT_REWRITE_GUARD_PREFIX: &str =
@@ -24,11 +28,88 @@ const PROMPT_REWRITE_GUARD_PREFIX: &str =
 const PROXY_GENERATION_POLL_INTERVAL_MS: u32 = 1_500;
 const MAX_PROXY_POLL_NETWORK_FAILURES: u8 = 5;
 
+type GenerationBudgetFuture = Pin<Box<dyn Future<Output = Result<(), String>>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProxyGenerationPhase {
+    LegacyProtected,
+    ServerQueued { release_budget: bool },
+    AwaitingUpstream,
+    ResultReady,
+    ReceivingResult,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProxyBudgetRequest {
+    LegacyFullTask,
+    Result { response_bytes: u64 },
+}
+
+#[derive(Clone)]
+pub(crate) struct GenerationLifecycle {
+    on_proxy_phase: Rc<dyn Fn(ProxyGenerationPhase)>,
+    wait_for_budget: Rc<dyn Fn(ProxyBudgetRequest) -> GenerationBudgetFuture>,
+    has_accumulated_results: Rc<Cell<bool>>,
+    accumulated_response_bytes: Rc<Cell<u64>>,
+}
+
+impl GenerationLifecycle {
+    pub(crate) fn new(
+        on_proxy_phase: impl Fn(ProxyGenerationPhase) + 'static,
+        wait_for_budget: impl Fn(ProxyBudgetRequest) -> GenerationBudgetFuture + 'static,
+    ) -> Self {
+        Self {
+            on_proxy_phase: Rc::new(on_proxy_phase),
+            wait_for_budget: Rc::new(wait_for_budget),
+            has_accumulated_results: Rc::new(Cell::new(false)),
+            accumulated_response_bytes: Rc::new(Cell::new(0)),
+        }
+    }
+
+    fn set_proxy_phase(&self, phase: ProxyGenerationPhase) {
+        (self.on_proxy_phase)(phase);
+    }
+
+    async fn reserve(&self, request: ProxyBudgetRequest) -> Result<(), String> {
+        (self.wait_for_budget)(request).await
+    }
+
+    fn retain_accumulated_results(&self) {
+        self.has_accumulated_results.set(true);
+    }
+
+    fn accumulate_response_bytes(&self, response_bytes: u64) -> u64 {
+        let total = self
+            .accumulated_response_bytes
+            .get()
+            .saturating_add(response_bytes);
+        self.accumulated_response_bytes.set(total);
+        total
+    }
+}
+
 #[derive(Clone)]
 struct TransportAsset {
     meta: ImageAssetRef,
     bytes: Vec<u8>,
     mime_type: String,
+}
+
+struct ProxyGenerationEndpoint {
+    submit_url: String,
+    supports_status_only: bool,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ProxyHealthCapabilities {
+    #[serde(default)]
+    proxy_generation_status_only: bool,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct ProxyHealthResponse {
+    #[serde(default)]
+    capabilities: ProxyHealthCapabilities,
 }
 
 enum ProxyGenerationSubmission {
@@ -77,6 +158,7 @@ impl GenerationResultAccumulator {
         self.pending_proxy_poll_urls
             .append(&mut execution.pending_proxy_poll_urls);
         let produced_count = execution.result.images.len();
+        compact_embedded_images_to_blobs(&mut execution.result.images);
         self.images.append(&mut execution.result.images);
         produced_count
     }
@@ -91,6 +173,25 @@ impl GenerationResultAccumulator {
             used_proxy: self.used_proxy,
             pending_proxy_poll_urls: self.pending_proxy_poll_urls,
         }
+    }
+}
+
+fn compact_embedded_images_to_blobs(images: &mut [mew_image_shared::GeneratedImageResult]) {
+    for image in images {
+        let Some(data_url) = image.data_url.as_deref() else {
+            continue;
+        };
+        let Ok((mime_type, bytes)) = decode_browser_data_url(data_url) else {
+            continue;
+        };
+        let Ok(blob) = blob_from_bytes(&bytes, &mime_type) else {
+            continue;
+        };
+        let Ok(object_url) = web_sys::Url::create_object_url_with_blob(&blob) else {
+            continue;
+        };
+        image.url = Some(object_url);
+        image.data_url = None;
     }
 }
 
@@ -143,6 +244,21 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
     }
     normalize_api_config(&mut config);
     config
+}
+
+pub(crate) fn generation_uses_proxy(
+    config: &EncryptedApiConfig,
+    has_reference_assets: bool,
+) -> bool {
+    if config.provider_kind == ProviderKind::NanoBanana {
+        return config.access_mode == ProviderAccessMode::Proxy;
+    }
+    if config.endpoint_mode == ProviderEndpointMode::ResponsesApi {
+        return config.access_mode != ProviderAccessMode::Direct;
+    }
+    has_reference_assets
+        || config.access_mode == ProviderAccessMode::Proxy
+        || (config.access_mode == ProviderAccessMode::Smart && config.known_requires_proxy)
 }
 
 pub async fn load_templates() -> Result<Vec<ProviderTemplate>, String> {
@@ -298,10 +414,12 @@ pub async fn generate_with_strategy(
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
     abort_signal: Option<&web_sys::AbortSignal>,
+    lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
     let requested_count = request.count.max(1);
     if requested_count <= 1 {
-        return generate_once_with_strategy(template, config, request, abort_signal).await;
+        return generate_once_with_strategy(template, config, request, abort_signal, lifecycle)
+            .await;
     }
 
     let mut accumulated = GenerationResultAccumulator::default();
@@ -322,9 +440,12 @@ pub async fn generate_with_strategy(
             remaining
         };
 
-        match generate_once_with_strategy(template, config, &next_request, abort_signal).await {
+        match generate_once_with_strategy(template, config, &next_request, abort_signal, lifecycle)
+            .await
+        {
             Ok(execution) => {
                 let produced_count = accumulated.push(execution);
+                lifecycle.retain_accumulated_results();
                 if produced_count == 0 {
                     break;
                 }
@@ -350,11 +471,12 @@ async fn generate_once_with_strategy(
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
     abort_signal: Option<&web_sys::AbortSignal>,
+    lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
     if config.provider_kind == ProviderKind::NanoBanana {
         return match config.access_mode {
             ProviderAccessMode::Proxy => {
-                proxy_generate(template, config, request, abort_signal).await
+                proxy_generate(template, config, request, abort_signal, lifecycle).await
             }
             ProviderAccessMode::Direct => direct_generate(template, config, request, abort_signal)
                 .await
@@ -372,18 +494,20 @@ async fn generate_once_with_strategy(
                 .await
                 .map(GenerationExecutionResult::direct),
             ProviderAccessMode::Proxy | ProviderAccessMode::Smart => {
-                proxy_generate(template, config, request, abort_signal).await
+                proxy_generate(template, config, request, abort_signal, lifecycle).await
             }
         };
     }
     if !request.reference_assets.is_empty() {
-        return proxy_generate(template, config, request, abort_signal).await;
+        return proxy_generate(template, config, request, abort_signal, lifecycle).await;
     }
     if matches!(config.access_mode, ProviderAccessMode::Smart) && config.known_requires_proxy {
-        return proxy_generate(template, config, request, abort_signal).await;
+        return proxy_generate(template, config, request, abort_signal, lifecycle).await;
     }
     match config.access_mode {
-        ProviderAccessMode::Proxy => proxy_generate(template, config, request, abort_signal).await,
+        ProviderAccessMode::Proxy => {
+            proxy_generate(template, config, request, abort_signal, lifecycle).await
+        }
         ProviderAccessMode::Direct => direct_generate(template, config, request, abort_signal)
             .await
             .map(GenerationExecutionResult::direct),
@@ -562,12 +686,19 @@ async fn proxy_generate(
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
     abort_signal: Option<&web_sys::AbortSignal>,
+    lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
     let config = config.clone();
     if config.api_key_plaintext.is_none() {
         return Err("代理模式也需要当前浏览器里已有 API Key。".into());
     }
-    let url = select_proxy_generation_endpoint(abort_signal).await?;
+    let endpoint = select_proxy_generation_endpoint(abort_signal).await?;
+    if !endpoint.supports_status_only {
+        lifecycle.set_proxy_phase(ProxyGenerationPhase::LegacyProtected);
+        lifecycle
+            .reserve(ProxyBudgetRequest::LegacyFullTask)
+            .await?;
+    }
     let reference_assets = prepare_transport_assets(&request.reference_assets).await?;
     let mut request_payload = request.clone();
     request_payload.reference_assets = Vec::new();
@@ -602,7 +733,7 @@ async fn proxy_generate(
         )
         .map_err(|error| format!("{error:?}"))?;
     }
-    let response = Request::post(&url)
+    let response = Request::post(&endpoint.submit_url)
         .abort_signal(abort_signal)
         .credentials(web_sys::RequestCredentials::Include)
         .body(form)
@@ -614,6 +745,8 @@ async fn proxy_generate(
                 "代理生成请求发送后未收到响应：{error}。为避免重复生成和计费，本次不会自动切换端点重试。"
             )
         })?;
+    // multipart 已被浏览器接管，尽早释放转码后的参考图字节。
+    drop(reference_assets);
     if !response.ok() {
         let body = response
             .text()
@@ -622,12 +755,27 @@ async fn proxy_generate(
         return Err(proxy_error_message(&body, "代理生成失败"));
     }
     let body = response.text().await.map_err(|error| error.to_string())?;
+    let synchronous_result = serde_json::from_str::<ProxyGenerationJobAccepted>(&body).is_err();
+    if synchronous_result && endpoint.supports_status_only {
+        // 升级期间若同源后端仍同步返回完整结果，也要在 JSON 解码前补领结果预算。
+        lifecycle.set_proxy_phase(ProxyGenerationPhase::ResultReady);
+        let response_bytes = lifecycle.accumulate_response_bytes(body.len() as u64);
+        lifecycle
+            .reserve(ProxyBudgetRequest::Result { response_bytes })
+            .await?;
+        lifecycle.set_proxy_phase(ProxyGenerationPhase::ReceivingResult);
+    }
     match parse_proxy_generation_submission(&body)? {
         ProxyGenerationSubmission::Completed(result) => {
             Ok(GenerationExecutionResult::proxied(result, None))
         }
         ProxyGenerationSubmission::Accepted(job_id) => {
-            poll_proxy_generation(&url, &job_id, abort_signal).await
+            if endpoint.supports_status_only {
+                lifecycle.set_proxy_phase(ProxyGenerationPhase::ServerQueued {
+                    release_budget: !lifecycle.has_accumulated_results.get(),
+                });
+            }
+            poll_proxy_generation(&endpoint, &job_id, abort_signal, lifecycle).await
         }
     }
 }
@@ -641,7 +789,7 @@ fn proxy_health_url(submit_url: &str) -> String {
 
 async fn select_proxy_generation_endpoint(
     abort_signal: Option<&web_sys::AbortSignal>,
-) -> Result<String, String> {
+) -> Result<ProxyGenerationEndpoint, String> {
     let mut errors = Vec::new();
     for submit_url in api_candidates("/api/providers/generate") {
         if abort_signal.is_some_and(web_sys::AbortSignal::aborted) {
@@ -654,7 +802,17 @@ async fn select_proxy_generation_endpoint(
             .send()
             .await
         {
-            Ok(response) if response.ok() => return Ok(submit_url),
+            Ok(response) if response.ok() => {
+                let supports_status_only = response
+                    .json::<ProxyHealthResponse>()
+                    .await
+                    .map(|health| health.capabilities.proxy_generation_status_only)
+                    .unwrap_or(false);
+                return Ok(ProxyGenerationEndpoint {
+                    submit_url,
+                    supports_status_only,
+                });
+            }
             Ok(response) => errors.push(format!("{health_url} -> HTTP {}", response.status())),
             Err(error) => errors.push(format!("{health_url} -> {error}")),
         }
@@ -680,11 +838,17 @@ fn parse_proxy_generation_submission(body: &str) -> Result<ProxyGenerationSubmis
 }
 
 async fn poll_proxy_generation(
-    submit_url: &str,
+    endpoint: &ProxyGenerationEndpoint,
     job_id: &str,
     abort_signal: Option<&web_sys::AbortSignal>,
+    lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
-    let poll_url = format!("{}/{}", submit_url.trim_end_matches('/'), job_id);
+    let poll_url = format!("{}/{}", endpoint.submit_url.trim_end_matches('/'), job_id);
+    let status_url = if endpoint.supports_status_only {
+        format!("{poll_url}?status_only=true")
+    } else {
+        poll_url.clone()
+    };
     let mut consecutive_network_failures = 0_u8;
     loop {
         if abort_signal.is_some_and(web_sys::AbortSignal::aborted) {
@@ -693,7 +857,7 @@ async fn poll_proxy_generation(
         }
         gloo_timers::future::TimeoutFuture::new(PROXY_GENERATION_POLL_INTERVAL_MS).await;
 
-        let response = Request::get(&poll_url)
+        let response = Request::get(&status_url)
             .abort_signal(abort_signal)
             .credentials(web_sys::RequestCredentials::Include)
             .send()
@@ -733,11 +897,43 @@ async fn poll_proxy_generation(
             }
         };
         match job.status {
-            ProxyGenerationJobStatus::Queued | ProxyGenerationJobStatus::Running => continue,
+            ProxyGenerationJobStatus::Queued => {
+                if endpoint.supports_status_only {
+                    lifecycle.set_proxy_phase(ProxyGenerationPhase::ServerQueued {
+                        release_budget: !lifecycle.has_accumulated_results.get(),
+                    });
+                }
+                continue;
+            }
+            ProxyGenerationJobStatus::Running => {
+                if endpoint.supports_status_only {
+                    lifecycle.set_proxy_phase(ProxyGenerationPhase::AwaitingUpstream);
+                }
+                continue;
+            }
             ProxyGenerationJobStatus::Succeeded => {
-                let Some(result) = job.result else {
-                    remove_proxy_generation_job(poll_url);
-                    return Err("代理任务缺少生成结果。".into());
+                let result = if endpoint.supports_status_only {
+                    lifecycle.set_proxy_phase(ProxyGenerationPhase::ResultReady);
+                    let response_bytes = lifecycle
+                        .accumulate_response_bytes(job.result_byte_len.unwrap_or_default());
+                    if let Err(error) = lifecycle
+                        .reserve(ProxyBudgetRequest::Result { response_bytes })
+                        .await
+                    {
+                        remove_proxy_generation_job(poll_url);
+                        return Err(error);
+                    }
+                    lifecycle.set_proxy_phase(ProxyGenerationPhase::ReceivingResult);
+                    match fetch_proxy_generation_result(&poll_url, abort_signal).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            remove_proxy_generation_job(poll_url);
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    job.result
+                        .ok_or_else(|| "代理任务缺少生成结果。".to_string())?
                 };
                 // 成功结果由调用方完成 IndexedDB 与任务状态持久化后再确认删除。
                 return Ok(GenerationExecutionResult::proxied(result, Some(poll_url)));
@@ -749,6 +945,33 @@ async fn poll_proxy_generation(
             }
         }
     }
+}
+
+async fn fetch_proxy_generation_result(
+    poll_url: &str,
+    abort_signal: Option<&web_sys::AbortSignal>,
+) -> Result<GenerationResult, String> {
+    let response = Request::get(poll_url)
+        .abort_signal(abort_signal)
+        .credentials(web_sys::RequestCredentials::Include)
+        .send()
+        .await
+        .map_err(|error| format!("领取代理生成结果失败：{error}"))?;
+    if !response.ok() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "领取代理生成结果失败".into());
+        return Err(proxy_error_message(&body, "领取代理生成结果失败"));
+    }
+    let job = response
+        .json::<ProxyGenerationJobResponse>()
+        .await
+        .map_err(|error| format!("代理生成结果解析失败：{error}"))?;
+    if job.status != ProxyGenerationJobStatus::Succeeded {
+        return Err(job.error.unwrap_or_else(|| "代理生成结果尚未就绪。".into()));
+    }
+    job.result.ok_or_else(|| "代理任务缺少生成结果。".into())
 }
 
 fn remove_proxy_generation_job(poll_url: String) {
@@ -1269,6 +1492,50 @@ mod tests {
             "http://127.0.0.1:3000/api/health"
         );
         assert_eq!(proxy_health_url("/api/providers/generate"), "/api/health");
+    }
+
+    #[test]
+    fn proxy_capability_defaults_off_for_old_health_responses() {
+        let old: ProxyHealthResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        let current: ProxyHealthResponse = serde_json::from_str(
+            r#"{"ok":true,"capabilities":{"proxy_generation_status_only":true}}"#,
+        )
+        .unwrap();
+
+        assert!(!old.capabilities.proxy_generation_status_only);
+        assert!(current.capabilities.proxy_generation_status_only);
+    }
+
+    #[test]
+    fn generation_route_prediction_preserves_direct_and_proxy_modes() {
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.access_mode = ProviderAccessMode::Direct;
+        config.known_requires_proxy = false;
+        assert!(!generation_uses_proxy(&config, false));
+        assert!(generation_uses_proxy(&config, true));
+
+        config.access_mode = ProviderAccessMode::Proxy;
+        assert!(generation_uses_proxy(&config, false));
+
+        config.access_mode = ProviderAccessMode::Smart;
+        config.known_requires_proxy = true;
+        assert!(generation_uses_proxy(&config, false));
+
+        config.provider_kind = ProviderKind::NanoBanana;
+        config.access_mode = ProviderAccessMode::Smart;
+        assert!(!generation_uses_proxy(&config, true));
+
+        config.provider_kind = ProviderKind::OpenAiImage;
+        config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        assert!(generation_uses_proxy(&config, false));
+    }
+
+    #[test]
+    fn lifecycle_accumulates_multi_batch_response_bytes() {
+        let lifecycle = GenerationLifecycle::new(|_| {}, |_| Box::pin(async { Ok(()) }));
+
+        assert_eq!(lifecycle.accumulate_response_bytes(10), 10);
+        assert_eq!(lifecycle.accumulate_response_bytes(25), 35);
     }
 
     #[test]

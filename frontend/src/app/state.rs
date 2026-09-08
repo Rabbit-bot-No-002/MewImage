@@ -89,13 +89,71 @@ pub(crate) struct WorkspaceState {
     pub(crate) current_config_id: RwSignal<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GenerationRuntimePhase {
+    WaitingPreparationBudget,
+    WaitingFullTaskBudget,
+    LoadingReferences,
+    Submitting,
+    ServerQueued,
+    AwaitingUpstream,
+    WaitingResultBudget,
+    ReceivingResult,
+    ProcessingResult { current: usize, total: usize },
+    RemovingBackground { current: usize, total: usize },
+    PersistingResult { retry: usize },
+    DirectProtected,
+    LegacyProxyProtected,
+}
+
+impl GenerationRuntimePhase {
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::WaitingPreparationBudget => "等待参考图处理资源".into(),
+            Self::WaitingFullTaskBudget => "等待完整任务处理资源".into(),
+            Self::LoadingReferences => "正在加载参考图".into(),
+            Self::Submitting => "正在提交生成请求".into(),
+            Self::ServerQueued => "服务端排队".into(),
+            Self::AwaitingUpstream => "等待上游结果".into(),
+            Self::WaitingResultBudget => "等待结果处理资源".into(),
+            Self::ReceivingResult => "正在领取生成结果".into(),
+            Self::ProcessingResult { current, total } => {
+                format!("处理结果 {current}/{total}")
+            }
+            Self::RemovingBackground { current, total } => {
+                format!("本地去背 {current}/{total}")
+            }
+            Self::PersistingResult { retry: 0 } => "正在保存生成结果".into(),
+            Self::PersistingResult { retry } => format!("等待本地保存（重试 {retry}）"),
+            Self::DirectProtected => "直连请求等待上游".into(),
+            Self::LegacyProxyProtected => "兼容代理等待上游".into(),
+        }
+    }
+
+    pub(crate) fn waits_for_budget(self) -> bool {
+        matches!(
+            self,
+            Self::WaitingPreparationBudget
+                | Self::WaitingFullTaskBudget
+                | Self::WaitingResultBudget
+        )
+    }
+
+    pub(crate) fn result_priority(self) -> bool {
+        matches!(self, Self::WaitingResultBudget)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ActiveGenerationRuntime {
     pub(crate) abort_controller: web_sys::AbortController,
     pub(crate) dependency_asset_ids: HashSet<String>,
     pub(crate) thread_id: String,
-    pub(crate) progress_label: String,
-    /// 只有真正开始加载参考图后才占用预算；等待中的任务保持为 0。
+    pub(crate) phase: GenerationRuntimePhase,
+    pub(crate) sequence: u64,
+    pub(crate) requested_bytes: u64,
+    pub(crate) budget_bytes: u64,
+    /// 首次等待上游时为 0；多批结果已在内存时继续保留累计额度，直到全部落盘。
     pub(crate) reserved_bytes: u64,
 }
 

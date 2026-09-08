@@ -79,6 +79,7 @@ pub(crate) fn PreviewOverlay(
     let derived = expect_context::<AppDerived>();
     let selected_reference_ids = composer.selected_reference_ids;
     let status_text = composer.status_text;
+    let generation_runtimes = composer.generation_runtimes;
     let assets = workspace.assets;
     let preview_panel_state = ui.preview_panel_state;
     let preview_fullscreen = ui.preview_fullscreen;
@@ -116,6 +117,8 @@ pub(crate) fn PreviewOverlay(
                 let copy_asset_id = preview_asset_id.clone();
                 let download_asset_id = preview_asset_id.clone();
                 let prompt_text = panel.prompt.clone();
+                let waiting_task_id = panel.task_id.clone();
+                let waiting_detail_task_id = panel.task_id.clone();
                 let reference_thumb_ids = panel
                     .reference_thumbs
                     .iter()
@@ -259,8 +262,33 @@ pub(crate) fn PreviewOverlay(
                                         view! {
                                             <div class="preview-waiting-stage">
                                                 <span class="gallery-running-spinner"></span>
-                                                <strong>"正在等待上游结果"</strong>
-                                                <span class="status">"任务完成后即可查看生成图片"</span>
+                                                <strong>{move || generation_runtimes.with(|items| {
+                                                    items
+                                                        .get(&waiting_task_id)
+                                                        .map(|runtime| runtime.phase.label())
+                                                        .unwrap_or_else(|| "等待生成结果".into())
+                                                })}</strong>
+                                                <span class="status">{move || generation_runtimes.with(|items| {
+                                                    items.get(&waiting_detail_task_id).map(|runtime| {
+                                                        if matches!(runtime.phase, crate::app::state::GenerationRuntimePhase::WaitingFullTaskBudget) {
+                                                            format!(
+                                                                "Direct 或旧版代理需要完整内存保护：预计 {}，浏览器软预算 {}；大型任务会独占处理。",
+                                                                crate::app::format_byte_size(runtime.requested_bytes),
+                                                                crate::app::format_byte_size(runtime.budget_bytes),
+                                                            )
+                                                        } else if runtime.phase.waits_for_budget() {
+                                                            format!(
+                                                                "预计处理 {}，浏览器软预算 {}；大型任务会独占处理。",
+                                                                crate::app::format_byte_size(runtime.requested_bytes),
+                                                                crate::app::format_byte_size(runtime.budget_bytes),
+                                                            )
+                                                        } else if matches!(runtime.phase, crate::app::state::GenerationRuntimePhase::DirectProtected | crate::app::state::GenerationRuntimePhase::LegacyProxyProtected) {
+                                                            "Direct 或旧版代理无法延迟领取结果，当前任务使用完整内存保护。".into()
+                                                        } else {
+                                                            "任务完成后即可查看生成图片。".into()
+                                                        }
+                                                    }).unwrap_or_else(|| "任务完成后即可查看生成图片。".into())
+                                                })}</span>
                                             </div>
                                         }.into_any()
                                     }}

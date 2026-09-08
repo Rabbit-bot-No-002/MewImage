@@ -692,7 +692,12 @@ fn build_cors_layer(config: &AppConfig) -> anyhow::Result<CorsLayer> {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(json!({ "ok": true }))
+    Json(json!({
+        "ok": true,
+        "capabilities": {
+            "proxy_generation_status_only": true
+        }
+    }))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2348,38 +2353,29 @@ async fn run_proxy_generation_job(
     memory_permits: u32,
     guest_permit: Option<GuestProxyPermit>,
 ) {
-    let memory_permit = match state
-        .generation_memory_budget
-        .clone()
-        .acquire_many_owned(memory_permits)
-        .await
-    {
-        Ok(permit) => permit,
-        Err(error) => {
-            update_proxy_generation_job(
-                &state,
-                &job_id,
-                ProxyGenerationJobState::Failed(format!("生成内存预算不可用：{error}")),
-            )
-            .await;
-            return;
-        }
-    };
-    // 参考图即将载入受执行预算约束的内存，此时再释放排队临时磁盘预算。
-    drop(temp_budget_permit);
+    // 总超时从任务被接受后立即开始，避免任务无限等待执行内存预算。
     let result = tokio::time::timeout(PROXY_GENERATION_JOB_TIMEOUT, async {
+        let memory_permit = state
+            .generation_memory_budget
+            .clone()
+            .acquire_many_owned(memory_permits)
+            .await
+            .map_err(|error| AppError::internal(std::io::Error::other(error.to_string())))?;
+        // 参考图即将载入受执行预算约束的内存，此时再释放排队临时磁盘预算。
+        drop(temp_budget_permit);
         update_proxy_generation_job(&state, &job_id, ProxyGenerationJobState::Running).await;
         hydrate_temporary_reference_files(&mut payload).await?;
-        execute_proxy_generation(&state, &payload.payload).await
+        let generated = execute_proxy_generation(&state, &payload.payload).await?;
+        Ok::<_, AppError>((generated, memory_permit))
     })
     .await;
 
-    let final_state = {
+    let (final_state, memory_permit) = {
         // 结果完成序列化并释放大型临时对象后，再尝试归还 glibc 堆内存。
         let _memory_trim_guard = GenerationMemoryTrimGuard;
         match result {
-            Ok(Ok(result)) => serialize_proxy_generation_result(result)
-                .and_then(|body| {
+            Ok(Ok((result, permit))) => {
+                match serialize_proxy_generation_result(result).and_then(|body| {
                     let reserved_bytes = memory_permits as usize * 1024 * 1024;
                     if body.len() > reserved_bytes {
                         return Err(format!(
@@ -2387,23 +2383,32 @@ async fn run_proxy_generation_job(
                             memory_permits
                         ));
                     }
-                    Ok(ProxyGenerationJobState::Succeeded(body))
-                })
-                .unwrap_or_else(ProxyGenerationJobState::Failed),
-            Ok(Err(error)) => ProxyGenerationJobState::Failed(error.message),
-            Err(_) => ProxyGenerationJobState::Failed(
-                "代理生成等待超过 30 分钟，任务已停止，请稍后重试。".into(),
+                    Ok(body)
+                }) {
+                    Ok(body) => {
+                        // 上游执行缓冲已经释放，缓存阶段只按实际序列化结果继续占用预算。
+                        let mut permit = permit;
+                        let cached_permits = bytes_to_budget_permits(
+                            body.len() as u64,
+                            state.config.proxy_memory_budget_mib,
+                        );
+                        let releasable_permits = memory_permits.saturating_sub(cached_permits);
+                        drop(permit.split(releasable_permits as usize));
+                        (ProxyGenerationJobState::Succeeded(body), Some(permit))
+                    }
+                    Err(error) => (ProxyGenerationJobState::Failed(error), None),
+                }
+            }
+            Ok(Err(error)) => (ProxyGenerationJobState::Failed(error.message), None),
+            Err(_) => (
+                ProxyGenerationJobState::Failed(
+                    "代理任务排队或生成超过 30 分钟，任务已停止，请稍后重试。".into(),
+                ),
+                None,
             ),
         }
     };
-    let keep_memory_permit = matches!(final_state, ProxyGenerationJobState::Succeeded(_));
-    complete_proxy_generation_job(
-        &state,
-        &job_id,
-        final_state,
-        keep_memory_permit.then_some(memory_permit),
-    )
-    .await;
+    complete_proxy_generation_job(&state, &job_id, final_state, memory_permit).await;
     drop(job_slot);
     drop(guest_permit);
 
@@ -2454,14 +2459,21 @@ async fn complete_proxy_generation_job(
 ) {
     if let Some(job) = state.generation_jobs.lock().await.get_mut(job_id) {
         job.state = job_state;
-        job.memory_permit = memory_permit;
+        job.memory_permit = memory_permit.map(Arc::new);
         job.updated_at = Instant::now();
     }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ProxyGenerationJobQuery {
+    #[serde(default)]
+    status_only: bool,
 }
 
 async fn get_proxy_generation_job(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
+    Query(query): Query<ProxyGenerationJobQuery>,
 ) -> Result<Response, AppError> {
     let mut jobs = state.generation_jobs.lock().await;
     cleanup_proxy_generation_job_entries(&mut jobs, Instant::now());
@@ -2476,19 +2488,38 @@ async fn get_proxy_generation_job(
             StatusCode::ACCEPTED,
             ProxyGenerationJobStatus::Queued,
             None,
+            None,
         ),
         ProxyGenerationJobState::Running => proxy_generation_job_response(
             StatusCode::ACCEPTED,
             ProxyGenerationJobStatus::Running,
             None,
+            None,
         ),
         ProxyGenerationJobState::Succeeded(body) => {
-            serialized_proxy_generation_job_response(body.clone())
+            if query.status_only {
+                proxy_generation_job_response(
+                    StatusCode::OK,
+                    ProxyGenerationJobStatus::Succeeded,
+                    None,
+                    Some(body.len() as u64),
+                )
+            } else {
+                let mut response = serialized_proxy_generation_job_response(body.clone());
+                if let Some(permit) = job.memory_permit.clone() {
+                    // DELETE 确认可移除缓存记录，但发送中的正文仍须持有对应内存预算。
+                    response
+                        .extensions_mut()
+                        .insert(ResponseMemoryPermit { _permit: permit });
+                }
+                response
+            }
         }
         ProxyGenerationJobState::Failed(error) => proxy_generation_job_response(
             StatusCode::OK,
             ProxyGenerationJobStatus::Failed,
             Some(error.clone()),
+            None,
         ),
     })
 }
@@ -2509,6 +2540,7 @@ fn serialize_proxy_generation_result(result: GenerationResult) -> Result<Bytes, 
         status: ProxyGenerationJobStatus::Succeeded,
         result: Some(result),
         error: None,
+        result_byte_len: None,
     })
     .map(Bytes::from)
     .map_err(|error| format!("代理生成结果序列化失败：{error}"))
@@ -2518,6 +2550,7 @@ fn proxy_generation_job_response(
     http_status: StatusCode,
     status: ProxyGenerationJobStatus,
     error: Option<String>,
+    result_byte_len: Option<u64>,
 ) -> Response {
     let mut response = (
         http_status,
@@ -2525,6 +2558,7 @@ fn proxy_generation_job_response(
             status,
             result: None,
             error,
+            result_byte_len,
         }),
     )
         .into_response();
@@ -6453,6 +6487,32 @@ mod tests {
         assert_eq!(response.status, ProxyGenerationJobStatus::Succeeded);
         assert!(response.result.is_some());
         assert!(response.error.is_none());
+        assert!(response.result_byte_len.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_only_proxy_response_exposes_size_without_result() {
+        let response = proxy_generation_job_response(
+            StatusCode::OK,
+            ProxyGenerationJobStatus::Succeeded,
+            None,
+            Some(12_345),
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let response: ProxyGenerationJobResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(response.status, ProxyGenerationJobStatus::Succeeded);
+        assert!(response.result.is_none());
+        assert_eq!(response.result_byte_len, Some(12_345));
+    }
+
+    #[tokio::test]
+    async fn health_advertises_lightweight_proxy_polling() {
+        let response = health().await.into_response();
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["capabilities"]["proxy_generation_status_only"], true);
     }
 
     #[test]

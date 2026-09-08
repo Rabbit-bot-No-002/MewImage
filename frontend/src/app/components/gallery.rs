@@ -114,7 +114,7 @@ pub(crate) fn GallerySidebar(
                                     let progress_label = generation_runtimes.with(|items| {
                                         items
                                             .get(&task_id)
-                                            .map(|runtime| runtime.progress_label.clone())
+                                            .map(|runtime| runtime.phase.label())
                                             .unwrap_or_else(|| "等待结果".into())
                                     });
                                     view! {

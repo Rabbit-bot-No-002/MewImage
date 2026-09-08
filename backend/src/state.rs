@@ -31,7 +31,7 @@ pub struct ProxyGenerationJob {
     pub updated_at: Instant,
     pub abort_handle: Option<tokio::task::AbortHandle>,
     // 成功结果被浏览器确认或 TTL 清理前继续占用预算，避免缓存结果绕过内存限制。
-    pub memory_permit: Option<OwnedSemaphorePermit>,
+    pub memory_permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

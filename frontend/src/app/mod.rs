@@ -15,16 +15,18 @@ use std::{
 
 use crate::crypto::derive_trusted_sync_secret;
 use crate::providers::{
-    default_config, generate_with_strategy, hydrate_local_state, load_templates,
+    GenerationLifecycle, ProxyBudgetRequest, ProxyGenerationPhase, default_config,
+    generate_with_strategy, generation_uses_proxy, hydrate_local_state, load_templates,
     prepare_sync_envelope,
 };
 use crate::storage::{
-    apply_asset_payload_changes, clear_asset_payloads, clear_generation_queue_mode,
-    clear_trusted_sync_secret, load_api_key_sync_enabled, load_asset_object_urls,
-    load_asset_payloads, load_snapshot, load_trusted_sync_secret, revoke_all_asset_object_urls,
+    GenerationStagingManifest, apply_asset_payload_changes, clear_asset_payloads,
+    clear_generation_queue_mode, clear_generation_staging, clear_trusted_sync_secret,
+    load_api_key_sync_enabled, load_asset_object_urls, load_asset_payloads, load_snapshot,
+    load_trusted_sync_secret, prepare_generation_asset_blobs, revoke_all_asset_object_urls,
     revoke_asset_object_url, runtime_asset_object_url, save_api_key_sync_enabled,
     save_generation_queue_mode, save_trusted_sync_secret, save_ui_state, save_workspace_snapshot,
-    store_asset_bytes_for_display,
+    stage_generation_asset_blobs, store_asset_bytes_for_display,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gloo_file::{File, futures::read_as_bytes, futures::read_as_data_url};
@@ -99,6 +101,7 @@ const MAX_GENERATION_REFERENCE_ASSETS: usize = 16;
 const DEFAULT_ACTIVE_GENERATION_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
 const MIN_ACTIVE_GENERATION_BYTE_BUDGET: u64 = 192 * 1024 * 1024;
 const MAX_ACTIVE_GENERATION_BYTE_BUDGET: u64 = 512 * 1024 * 1024;
+const GENERATION_PREPARATION_FIXED_BYTE_OVERHEAD: u64 = 16 * 1024 * 1024;
 const GENERATION_TASK_FIXED_BYTE_OVERHEAD: u64 = 32 * 1024 * 1024;
 const THEME_BACKGROUND_ROLE_KEY: &str = "asset_role";
 const THEME_BACKGROUND_ROLE: &str = "theme_background";
