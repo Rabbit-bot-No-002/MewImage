@@ -26,7 +26,7 @@ use crate::app::{
 };
 use crate::{api::api_url, storage::apply_asset_payload_changes};
 
-use super::common::{MaterialSymbolIcon, PaginationControls};
+use super::common::{FullscreenImageViewer, MaterialSymbolIcon, PaginationControls};
 
 const PREVIEW_MAX_EDGE: u32 = 2_048;
 const REFERENCE_MAX_EDGE: u32 = 4_096;
@@ -105,6 +105,7 @@ pub(crate) fn TemplatePlaza(
     let selected_tag_category = RwSignal::new(None::<String>);
     let selected_template = RwSignal::new(None::<GalleryTemplate>);
     let detail_preview_index = RwSignal::new(0usize);
+    let detail_image_fullscreen = RwSignal::new(false);
     let template_favorite_picker = RwSignal::new(None::<TemplateFavoritePickerState>);
     let pending_template_favorites = RwSignal::new(HashSet::<String>::new());
     let request_revision = RwSignal::new(0u64);
@@ -193,6 +194,7 @@ pub(crate) fn TemplatePlaza(
                 .await
                 {
                     Ok(template) => {
+                        detail_image_fullscreen.set(false);
                         detail_preview_index.set(0);
                         selected_template.set(Some(template));
                     }
@@ -208,7 +210,10 @@ pub(crate) fn TemplatePlaza(
         }
 
         // 只关闭当前最上层界面，避免一次 Escape 同时穿透多个弹层。
-        let handled = if editor_delete_confirm.get_untracked() {
+        let handled = if detail_image_fullscreen.get_untracked() {
+            detail_image_fullscreen.set(false);
+            true
+        } else if editor_delete_confirm.get_untracked() {
             editor_delete_confirm.set(false);
             true
         } else if template_favorite_picker.get_untracked().is_some() {
@@ -263,11 +268,13 @@ pub(crate) fn TemplatePlaza(
     let open_template = move |template: GalleryTemplate| {
         update_template_url(Some(&template.id));
         template_favorite_picker.set(None);
+        detail_image_fullscreen.set(false);
         detail_preview_index.set(0);
         selected_template.set(Some(template));
     };
     let close_template = move |_| {
         template_favorite_picker.set(None);
+        detail_image_fullscreen.set(false);
         selected_template.set(None);
         detail_preview_index.set(0);
         update_template_url(None);
@@ -998,12 +1005,22 @@ pub(crate) fn TemplatePlaza(
             } else {
                 detail_preview_index.get().min(preview_count - 1)
             };
+            let active_preview_asset = template.preview_assets.get(active_preview_index).cloned();
+            let fullscreen_preview_src = active_preview_asset.as_ref().map(gallery_asset_url);
+            let fullscreen_preview_alt = format!("{} 的结果预览", template.title);
             view! { <div class="modal-backdrop template-detail-backdrop" on:click=close_template>
                 <article class="panel template-detail" role="dialog" aria-modal="true" aria-labelledby="template-detail-title" on:click=move |event| event.stop_propagation()>
                     <section class="template-detail-visual" aria-label="模板结果预览">
                         <div class="template-detail-stage">
-                            {template.preview_assets.get(active_preview_index).map(|asset| view! {
-                                <img src=gallery_asset_url(asset) alt=format!("{} 的结果预览", template.title) />
+                            {active_preview_asset.as_ref().map(|asset| view! {
+                                <button
+                                    class="image-button template-detail-image-button"
+                                    title="全屏查看结果图"
+                                    aria-label="全屏查看结果图"
+                                    on:click=move |_| detail_image_fullscreen.set(true)
+                                >
+                                    <img src=gallery_asset_url(asset) alt=format!("{} 的结果预览", template.title) />
+                                </button>
                             }.into_any()).unwrap_or_else(|| view! {
                                 <div class="template-detail-empty-preview"><MaterialSymbolIcon name="image" filled=false /><span>"暂无结果预览"</span></div>
                             }.into_any())}
@@ -1054,6 +1071,23 @@ pub(crate) fn TemplatePlaza(
                             <button class="button primary" on:click=move |_| use_template(use_value.clone())>"使用模板"</button></div>
                     </aside>
                 </article>
+                {move || {
+                    if !detail_image_fullscreen.get() {
+                        return ().into_any();
+                    }
+                    let Some(src) = fullscreen_preview_src.clone() else {
+                        return ().into_any();
+                    };
+                    view! {
+                        <FullscreenImageViewer
+                            src=src
+                            alt=fullscreen_preview_alt.clone()
+                            show_download=false
+                            close=move || detail_image_fullscreen.set(false)
+                            download=move || {}
+                        />
+                    }.into_any()
+                }}
             </div> }
         })}
 

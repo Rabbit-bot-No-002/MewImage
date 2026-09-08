@@ -53,10 +53,6 @@ pub(crate) fn build_preview_actions(
     let preview_state = ui.preview_state;
     let preview_panel_state = ui.preview_panel_state;
     let preview_fullscreen = ui.preview_fullscreen;
-    let preview_zoom = ui.preview_zoom;
-    let preview_offset_x = ui.preview_offset_x;
-    let preview_offset_y = ui.preview_offset_y;
-    let preview_dragging = ui.preview_dragging;
     let context_menu_state = ui.context_menu_state;
     let show_settings = ui.show_settings;
     let floating_tip_state = ui.floating_tip_state;
@@ -402,10 +398,6 @@ pub(crate) fn build_preview_actions(
         preview_state.set(None);
         preview_panel_state.set(None);
         preview_fullscreen.set(false);
-        preview_zoom.set(1.0);
-        preview_offset_x.set(0.0);
-        preview_offset_y.set(0.0);
-        preview_dragging.set(false);
         context_menu_state.set(None);
         trim_asset_payload_cache(assets);
     };

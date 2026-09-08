@@ -1,7 +1,7 @@
 use leptos::{prelude::*, task::spawn_local};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{MouseEvent, WheelEvent};
+use web_sys::MouseEvent;
 
 use crate::app::{
     aspect_ratio_label, asset_src, copy_image_from_src,
@@ -12,7 +12,7 @@ use crate::app::{
     state::{ComposerState, UiState, WorkspaceState},
 };
 
-use super::common::MaterialSymbolIcon;
+use super::common::{FullscreenImageViewer, MaterialSymbolIcon};
 
 async fn loaded_asset_source(
     assets: RwSignal<Vec<mew_image_shared::ImageAssetRef>>,
@@ -83,14 +83,6 @@ pub(crate) fn PreviewOverlay(
     let assets = workspace.assets;
     let preview_panel_state = ui.preview_panel_state;
     let preview_fullscreen = ui.preview_fullscreen;
-    let preview_zoom = ui.preview_zoom;
-    let preview_offset_x = ui.preview_offset_x;
-    let preview_offset_y = ui.preview_offset_y;
-    let preview_dragging = ui.preview_dragging;
-    let preview_drag_origin_x = ui.preview_drag_origin_x;
-    let preview_drag_origin_y = ui.preview_drag_origin_y;
-    let preview_drag_start_x = ui.preview_drag_start_x;
-    let preview_drag_start_y = ui.preview_drag_start_y;
     let context_menu_state = ui.context_menu_state;
     let current_preview = derived.current_preview;
 
@@ -113,7 +105,9 @@ pub(crate) fn PreviewOverlay(
                     .or_else(|| panel.display_src.clone())
                     .unwrap_or_default();
                 let preview_image_src = fullscreen_src.clone();
-                let toolbar_download_asset_id = preview_asset_id.clone();
+                let fullscreen_image_src = fullscreen_src.clone();
+                let fullscreen_image_alt = panel.prompt.clone();
+                let fullscreen_download_asset_id = preview_asset_id.clone();
                 let copy_asset_id = preview_asset_id.clone();
                 let download_asset_id = preview_asset_id.clone();
                 let prompt_text = panel.prompt.clone();
@@ -131,102 +125,19 @@ pub(crate) fn PreviewOverlay(
                     >
                         <div class="preview-shell" on:click=move |ev: MouseEvent| ev.stop_propagation()>
                             <button class="button ghost icon-button preview-shell-close" title="关闭详情" on:click=move |_| close_preview()><MaterialSymbolIcon name="close" filled=false /></button>
-                            <section class="preview-stage" class:is-fullscreen=move || preview_fullscreen.get()>
+                            <section class="preview-stage">
                                 <div class="preview-stage-meta">
                                     <span class="tag">{aspect_ratio_label(panel.width, panel.height)}</span>
                                     <span class="tag">{format!("{}x{}", panel.width, panel.height)}</span>
                                 </div>
-                                {move || {
-                                    if has_asset && preview_fullscreen.get() {
-                                        let toolbar_download_asset_id = toolbar_download_asset_id.clone();
-                                        view! {
-                                            <div class="preview-fullscreen-toolbar">
-                                                <button
-                                                    class="button ghost icon-button preview-toolbar-button"
-                                                    title="下载原图"
-                                                    on:click=move |_| {
-                                                        let Some(asset_id) = toolbar_download_asset_id.clone() else {
-                                                            return;
-                                                        };
-                                                        download_asset(assets, asset_id, status_text);
-                                                    }
-                                                >
-                                                    <MaterialSymbolIcon name="download" filled=false />
-                                                </button>
-                                                <button
-                                                    class="button ghost icon-button preview-toolbar-button"
-                                                    title="退出大图"
-                                                    on:click=move |_| {
-                                                        preview_fullscreen.set(false);
-                                                        preview_zoom.set(1.0);
-                                                        preview_offset_x.set(0.0);
-                                                        preview_offset_y.set(0.0);
-                                                        preview_dragging.set(false);
-                                                    }
-                                                >
-                                                    <MaterialSymbolIcon name="close" filled=false />
-                                                </button>
-                                            </div>
-                                        }.into_any()
-                                    } else {
-                                        ().into_any()
-                                    }
-                                }}
                                 <button
                                     class="image-button preview-image-button"
-                                    class:is-pan-enabled=move || preview_fullscreen.get()
                                     disabled=move || !has_asset
                                     on:click=move |_| {
                                         if !has_asset {
                                             return;
                                         }
-                                        if !preview_fullscreen.get_untracked() {
-                                            preview_fullscreen.set(true);
-                                            preview_zoom.set(1.0);
-                                            preview_offset_x.set(0.0);
-                                            preview_offset_y.set(0.0);
-                                        }
-                                    }
-                                    on:mousedown=move |ev: MouseEvent| {
-                                        if !has_asset || !preview_fullscreen.get_untracked() {
-                                            return;
-                                        }
-                                        ev.prevent_default();
-                                        preview_dragging.set(true);
-                                        preview_drag_origin_x.set(preview_offset_x.get_untracked());
-                                        preview_drag_origin_y.set(preview_offset_y.get_untracked());
-                                        preview_drag_start_x.set(ev.client_x() as f64);
-                                        preview_drag_start_y.set(ev.client_y() as f64);
-                                    }
-                                    on:mousemove=move |ev: MouseEvent| {
-                                        if !preview_dragging.get_untracked() {
-                                            return;
-                                        }
-                                        let delta_x = ev.client_x() as f64 - preview_drag_start_x.get_untracked();
-                                        let delta_y = ev.client_y() as f64 - preview_drag_start_y.get_untracked();
-                                        preview_offset_x.set(preview_drag_origin_x.get_untracked() + delta_x);
-                                        preview_offset_y.set(preview_drag_origin_y.get_untracked() + delta_y);
-                                    }
-                                    on:mouseup=move |_| {
-                                        preview_dragging.set(false);
-                                    }
-                                    on:mouseleave=move |_| {
-                                        preview_dragging.set(false);
-                                    }
-                                    on:wheel=move |ev: WheelEvent| {
-                                        if !has_asset || !preview_fullscreen.get_untracked() {
-                                            return;
-                                        }
-                                        ev.prevent_default();
-                                        let current = preview_zoom.get_untracked();
-                                        let delta = if ev.delta_y() < 0.0 { 0.12 } else { -0.12 };
-                                        let next = (current + delta).clamp(0.4, 6.0);
-                                        preview_zoom.set(next);
-                                        if (next - 1.0).abs() < 0.02 {
-                                            preview_zoom.set(1.0);
-                                            preview_offset_x.set(0.0);
-                                            preview_offset_y.set(0.0);
-                                        }
+                                        preview_fullscreen.set(true);
                                     }
                                     on:contextmenu=move |ev: MouseEvent| {
                                         let Some(asset_id) = preview_asset_id.clone() else {
@@ -245,15 +156,6 @@ pub(crate) fn PreviewOverlay(
                                         view! {
                                             <img
                                                 class="preview-image"
-                                                class:is-zoomed=move || preview_fullscreen.get()
-                                                style=move || {
-                                                    format!(
-                                                        "transform: translate({:.1}px, {:.1}px) scale({:.3});",
-                                                        preview_offset_x.get(),
-                                                        preview_offset_y.get(),
-                                                        preview_zoom.get()
-                                                    )
-                                                }
                                                 src=preview_image_src
                                                 alt=panel.prompt.clone()
                                             />
@@ -333,6 +235,7 @@ pub(crate) fn PreviewOverlay(
                                         </div>
                                     </div>
                                 </div>
+                                <div class="preview-sidebar-fixed">
                                 <div class="stack">
                                     <div class="row preview-prompt-head">
                                         <span class="status">"参考图"</span>
@@ -382,11 +285,11 @@ pub(crate) fn PreviewOverlay(
                                     </div>
                                 </div>
                                 <div class="preview-details-grid">
-                                    <div class="detail-card is-source">
+                                    <div class="detail-card is-source is-wide">
                                         <span class="detail-label">"来源"</span>
                                         <strong class="detail-value detail-value-wrap">{format!("{} · {}", panel.source_label, panel.requested_model)}</strong>
                                     </div>
-                                    <div class="detail-card">
+                                    <div class="detail-card is-wide">
                                         <span class="detail-label">"质量"</span>
                                         <strong class="detail-value detail-value-wrap">{format!("请求 {} / 实际 {}", panel.requested_quality_label, panel.actual_quality_label)}</strong>
                                     </div>
@@ -401,14 +304,6 @@ pub(crate) fn PreviewOverlay(
                                     <div class="detail-card is-inline">
                                         <span class="detail-label">"审核"</span>
                                         <strong class="detail-value">{panel.moderation_label.clone()}</strong>
-                                    </div>
-                                    <div class="detail-card is-inline">
-                                        <span class="detail-label">"背景"</span>
-                                        <strong class="detail-value">{panel.background_label.clone()}</strong>
-                                    </div>
-                                    <div class="detail-card is-inline">
-                                        <span class="detail-label">"数量"</span>
-                                        <strong class="detail-value">{panel.image_count.to_string()}</strong>
                                     </div>
                                 </div>
                                 <div class="preview-time-meta">
@@ -455,8 +350,29 @@ pub(crate) fn PreviewOverlay(
                                         }>"下载"</button>
                                     </div>
                                 })}
+                                </div>
                             </aside>
                         </div>
+                        {move || {
+                            if !has_asset || !preview_fullscreen.get() {
+                                return ().into_any();
+                            }
+                            let download_asset_id = fullscreen_download_asset_id.clone();
+                            view! {
+                                <FullscreenImageViewer
+                                    src=fullscreen_image_src.clone()
+                                    alt=fullscreen_image_alt.clone()
+                                    show_download=true
+                                    close=move || preview_fullscreen.set(false)
+                                    download=move || {
+                                        let Some(asset_id) = download_asset_id.clone() else {
+                                            return;
+                                        };
+                                        download_asset(assets, asset_id, status_text);
+                                    }
+                                />
+                            }.into_any()
+                        }}
                     </div>
                 }.into_any()
             }).unwrap_or_else(|| ().into_any())}

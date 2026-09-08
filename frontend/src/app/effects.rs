@@ -136,18 +136,10 @@ pub(crate) fn install_app_effects() {
             }
             if ui.preview_fullscreen.get_untracked() {
                 ui.preview_fullscreen.set(false);
-                ui.preview_zoom.set(1.0);
-                ui.preview_offset_x.set(0.0);
-                ui.preview_offset_y.set(0.0);
-                ui.preview_dragging.set(false);
             } else {
                 ui.preview_state.set(None);
                 ui.preview_panel_state.set(None);
                 ui.preview_fullscreen.set(false);
-                ui.preview_zoom.set(1.0);
-                ui.preview_offset_x.set(0.0);
-                ui.preview_offset_y.set(0.0);
-                ui.preview_dragging.set(false);
                 ui.context_menu_state.set(None);
             }
             event.prevent_default();
