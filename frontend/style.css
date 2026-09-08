@@ -57,6 +57,22 @@
   --surface-saturate: 1;
   --select-option-bg: #fff8fb;
   --select-option-active: #ffe1ef;
+  /* 交互浮层不跟随卡片透明度，避免自定义背景干扰菜单和对话框阅读。 */
+  --floating-surface-base: rgba(255, 250, 253, 0.95);
+  --floating-surface:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.64), transparent 44%),
+    linear-gradient(325deg, rgba(var(--secondary-rgb), 0.1), transparent 52%),
+    linear-gradient(42deg, rgba(var(--primary-rgb), 0.08), transparent 58%),
+    var(--floating-surface-base);
+  --floating-control: rgba(255, 255, 255, 0.84);
+  --floating-border: rgba(174, 94, 135, 0.34);
+  --floating-shadow: 0 24px 64px rgba(67, 41, 61, 0.2);
+  --floating-hover: rgba(var(--primary-rgb), 0.13);
+  --floating-active:
+    linear-gradient(135deg, rgba(var(--primary-rgb), 0.2), rgba(var(--secondary-rgb), 0.15)),
+    rgba(255, 255, 255, 0.72);
+  --floating-muted: #765b69;
+  --floating-blur: 16px;
 }
 
 body[data-theme="night"] {
@@ -87,6 +103,20 @@ body[data-theme="night"] {
   --ornament-glow-secondary: rgba(83, 148, 255, 0.16);
   --select-option-bg: #171d2c;
   --select-option-active: #3b2b46;
+  --floating-surface-base: rgba(18, 23, 36, 0.96);
+  --floating-surface:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.09), transparent 42%),
+    linear-gradient(325deg, rgba(var(--secondary-rgb), 0.1), transparent 54%),
+    linear-gradient(42deg, rgba(var(--primary-rgb), 0.1), transparent 58%),
+    var(--floating-surface-base);
+  --floating-control: rgba(34, 41, 59, 0.94);
+  --floating-border: rgba(148, 174, 229, 0.3);
+  --floating-shadow: 0 24px 68px rgba(0, 3, 12, 0.48);
+  --floating-hover: rgba(var(--primary-rgb), 0.17);
+  --floating-active:
+    linear-gradient(135deg, rgba(var(--primary-rgb), 0.26), rgba(var(--secondary-rgb), 0.18)),
+    rgba(31, 37, 55, 0.92);
+  --floating-muted: #c6b7c3;
 }
 
 * {
@@ -2301,6 +2331,7 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 
 .template-plaza-hero {
   position: relative;
+  z-index: 20;
   overflow: visible;
   display: grid;
   grid-template-columns: minmax(240px, 0.7fr) minmax(480px, 1.3fr);
@@ -2677,6 +2708,8 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
 }
 
 .template-card-grid {
+  position: relative;
+  z-index: 1;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 16px;
@@ -3544,6 +3577,20 @@ body[data-visual-theme="aurora"] {
   --aurora-panel-line: rgba(89, 137, 190, 0.3);
   --aurora-panel-edge: rgba(255, 255, 255, 0.78);
   --aurora-grid-line: rgba(59, 124, 181, 0.22);
+  --floating-surface-base: rgba(238, 247, 255, 0.95);
+  --floating-surface:
+    linear-gradient(180deg, rgba(var(--secondary-rgb), 0.13), transparent 96px),
+    linear-gradient(122deg, rgba(var(--primary-rgb), 0.1), transparent 48%),
+    var(--floating-surface-base);
+  --floating-control: rgba(249, 252, 255, 0.88);
+  --floating-border: rgba(58, 105, 159, 0.38);
+  --floating-shadow: 0 24px 66px rgba(30, 66, 111, 0.24);
+  --floating-hover: rgba(var(--secondary-rgb), 0.14);
+  --floating-active:
+    linear-gradient(135deg, rgba(var(--secondary-rgb), 0.2), rgba(var(--primary-rgb), 0.18)),
+    rgba(244, 249, 255, 0.84);
+  --floating-muted: #586981;
+  --floating-blur: 18px;
 }
 
 body[data-visual-theme="aurora"][data-color-scheme="night"] {
@@ -3582,6 +3629,19 @@ body[data-visual-theme="aurora"][data-color-scheme="night"] {
   --aurora-panel-line: rgba(123, 177, 230, 0.25);
   --aurora-panel-edge: rgba(192, 226, 255, 0.22);
   --aurora-grid-line: rgba(111, 180, 229, 0.2);
+  --floating-surface-base: rgba(9, 17, 40, 0.96);
+  --floating-surface:
+    linear-gradient(180deg, rgba(var(--secondary-rgb), 0.13), transparent 96px),
+    linear-gradient(122deg, rgba(var(--primary-rgb), 0.13), transparent 48%),
+    var(--floating-surface-base);
+  --floating-control: rgba(24, 35, 66, 0.94);
+  --floating-border: rgba(125, 180, 232, 0.34);
+  --floating-shadow: 0 26px 72px rgba(0, 3, 18, 0.56);
+  --floating-hover: rgba(var(--secondary-rgb), 0.16);
+  --floating-active:
+    linear-gradient(135deg, rgba(var(--secondary-rgb), 0.23), rgba(var(--primary-rgb), 0.24)),
+    rgba(18, 27, 57, 0.92);
+  --floating-muted: #bcc9de;
 }
 
 /* 多组互不对齐的星点打破规则点阵，星场本身保持静态。 */
@@ -5688,6 +5748,23 @@ body[data-visual-theme="liquid-glass"] {
     rgba(241, 250, 255, 0.18);
   --select-option-bg: #dcecf7;
   --select-option-active: #f3cde3;
+  --floating-surface-base: rgba(236, 247, 254, 0.9);
+  --floating-surface:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.68), transparent 40%),
+    linear-gradient(325deg, rgba(255, 116, 193, 0.13), transparent 48%),
+    linear-gradient(42deg, rgba(82, 196, 255, 0.16), transparent 56%),
+    var(--floating-surface-base);
+  --floating-control: rgba(248, 252, 255, 0.82);
+  --floating-border: rgba(71, 125, 170, 0.38);
+  --floating-shadow:
+    0 26px 72px rgba(31, 62, 99, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.76);
+  --floating-hover: rgba(var(--secondary-rgb), 0.14);
+  --floating-active:
+    linear-gradient(135deg, rgba(var(--secondary-rgb), 0.2), rgba(var(--primary-rgb), 0.18)),
+    rgba(244, 250, 255, 0.8);
+  --floating-muted: #53667d;
+  --floating-blur: 20px;
 }
 
 body[data-visual-theme="liquid-glass"][data-color-scheme="night"] {
@@ -5730,6 +5807,22 @@ body[data-visual-theme="liquid-glass"][data-color-scheme="night"] {
     rgba(20, 40, 63, 0.16);
   --select-option-bg: #12263e;
   --select-option-active: #41304f;
+  --floating-surface-base: rgba(10, 24, 41, 0.92);
+  --floating-surface:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.16), transparent 40%),
+    linear-gradient(325deg, rgba(255, 91, 194, 0.13), transparent 48%),
+    linear-gradient(42deg, rgba(55, 188, 255, 0.16), transparent 56%),
+    var(--floating-surface-base);
+  --floating-control: rgba(22, 42, 63, 0.88);
+  --floating-border: rgba(154, 207, 239, 0.34);
+  --floating-shadow:
+    0 28px 76px rgba(0, 4, 17, 0.58),
+    inset 0 1px 0 rgba(224, 243, 255, 0.2);
+  --floating-hover: rgba(var(--secondary-rgb), 0.17);
+  --floating-active:
+    linear-gradient(135deg, rgba(var(--secondary-rgb), 0.22), rgba(var(--primary-rgb), 0.22)),
+    rgba(20, 38, 60, 0.86);
+  --floating-muted: #c2cfdd;
 }
 
 body[data-visual-theme="liquid-glass"]::before {
@@ -6102,6 +6195,197 @@ body[data-visual-theme="liquid-glass"][data-decoration="subtle"] .composer-panel
 body[data-visual-theme="liquid-glass"][data-decoration="subtle"] .asset-panel::after {
   animation: none;
   opacity: 0.26;
+}
+
+/*
+ * 菜单与模态框属于交互安全层：固定高 Alpha，不继承卡片透明度滑杆。
+ * 选择器放在全部主题规则之后，确保主题仍能换色，但不会被主题面板材质覆盖。
+ */
+body[data-visual-theme][data-color-scheme] :is(
+  .template-sort-menu,
+  .template-tag-menu,
+  .config-switcher-menu,
+  .thread-archive-menu,
+  .gallery-page-popover,
+  .folder-picker-popover,
+  .inline-action-popover,
+  .context-menu,
+  .floating-tip,
+  .template-plaza-notice,
+  .settings-popover,
+  .favorites-popover,
+  .resolution-sheet,
+  .reference-menu-shell,
+  .mask-modal-shell,
+  .preview-shell,
+  .template-detail,
+  .template-editor,
+  .confirm-dialog,
+  .local-state-gate-card
+) {
+  color: var(--text);
+  border: 1px solid var(--floating-border);
+  background: var(--floating-surface);
+  box-shadow: var(--floating-shadow);
+  -webkit-backdrop-filter: blur(var(--floating-blur)) saturate(1.12);
+  backdrop-filter: blur(var(--floating-blur)) saturate(1.12);
+}
+
+body[data-visual-theme][data-color-scheme] .gallery-page-popover::after {
+  border-color: var(--floating-border);
+  background: var(--floating-surface-base);
+}
+
+body[data-visual-theme][data-color-scheme] .gallery-page-popover :is(
+  .gallery-page-wheel-item.is-focused,
+  .gallery-page-wheel-item.is-near
+) {
+  color: var(--text);
+}
+
+body[data-visual-theme][data-color-scheme] :is(
+  .template-sort-menu,
+  .template-tag-menu,
+  .config-switcher-menu,
+  .thread-archive-menu,
+  .gallery-page-popover,
+  .folder-picker-popover,
+  .inline-action-popover,
+  .context-menu,
+  .settings-popover,
+  .favorites-popover,
+  .resolution-sheet,
+  .reference-menu-shell,
+  .mask-modal-shell,
+  .preview-shell,
+  .template-detail,
+  .template-editor,
+  .confirm-dialog,
+  .local-state-gate-card
+) :is(
+  .field,
+  .text-input,
+  .select-input,
+  .compact-select,
+  .inline-popover-input,
+  .template-tag-search,
+  .gallery-page-wheel
+) {
+  color: var(--text);
+  border-color: var(--floating-border);
+  background: var(--floating-control);
+}
+
+body[data-visual-theme][data-color-scheme] :is(
+  .template-sort-menu,
+  .template-tag-menu,
+  .config-switcher-menu,
+  .thread-archive-menu,
+  .gallery-page-popover,
+  .folder-picker-popover,
+  .inline-action-popover,
+  .context-menu,
+  .settings-popover,
+  .favorites-popover,
+  .resolution-sheet,
+  .reference-menu-shell,
+  .mask-modal-shell,
+  .preview-shell,
+  .template-detail,
+  .template-editor,
+  .confirm-dialog,
+  .local-state-gate-card
+) :is(
+  .muted,
+  .status,
+  small,
+  .detail-label,
+  .config-switcher-model,
+  .template-tag-empty,
+  .gallery-page-wheel-item
+) {
+  color: var(--floating-muted);
+}
+
+body[data-visual-theme][data-color-scheme] :is(
+  .template-sort-option,
+  .template-tag-category,
+  .template-tag-option,
+  .config-switcher-item,
+  .thread-archive-item,
+  .thread-archive-export,
+  .folder-picker-item,
+  .context-item
+) {
+  color: var(--text);
+}
+
+body[data-visual-theme][data-color-scheme] :is(
+  .template-sort-option,
+  .template-tag-category,
+  .template-tag-option,
+  .config-switcher-item,
+  .thread-archive-item,
+  .thread-archive-export,
+  .folder-picker-item,
+  .context-item
+):hover,
+body[data-visual-theme][data-color-scheme] :is(
+  .template-sort-option,
+  .template-tag-category,
+  .template-tag-option,
+  .config-switcher-item,
+  .thread-archive-item,
+  .thread-archive-export,
+  .folder-picker-item,
+  .context-item
+):focus-visible {
+  background: var(--floating-hover);
+}
+
+body[data-visual-theme][data-color-scheme] :is(
+  .template-sort-option,
+  .template-tag-category,
+  .template-tag-option,
+  .config-switcher-item,
+  .thread-archive-item,
+  .folder-picker-item
+).is-active,
+body[data-visual-theme][data-color-scheme] .favorite-folder-tab.is-active {
+  border-color: var(--floating-border);
+  color: var(--text);
+  background: var(--floating-active);
+}
+
+body[data-visual-theme][data-color-scheme] :is(
+  .template-tag-menu-header,
+  .template-tag-menu-actions,
+  .template-tag-categories
+) {
+  border-color: var(--floating-border);
+}
+
+body[data-visual-theme][data-color-scheme] .favorites-popover :is(
+  .favorite-folder-tab,
+  .favorite-folder-add
+) {
+  border-color: var(--floating-border);
+  background: var(--floating-control);
+}
+
+body[data-visual-theme][data-color-scheme] .favorites-popover :is(
+  .favorite-folder-tab,
+  .favorite-folder-add
+):hover,
+body[data-visual-theme][data-color-scheme] .settings-popover .settings-nav-button:hover {
+  background: var(--floating-hover);
+}
+
+body[data-visual-theme][data-color-scheme] .favorites-popover .favorite-folder-tab.is-active,
+body[data-visual-theme][data-color-scheme] .settings-popover .settings-nav-button.is-active {
+  border-color: var(--floating-border);
+  color: var(--text);
+  background: var(--floating-active);
 }
 
 @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
