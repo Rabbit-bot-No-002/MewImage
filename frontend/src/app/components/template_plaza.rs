@@ -1350,8 +1350,8 @@ fn TemplateEditor(
     let delete_id = StoredValue::new(draft.id.clone());
     view! { <div class="modal-backdrop template-editor-backdrop">
         <section class="panel template-editor stack">
-            <div class="row"><div><span class="template-plaza-kicker">"ADMIN EDITOR"</span><h2>{if draft.id.is_some() { "编辑模板" } else { "新建模板" }}</h2></div>
-                <button class="button ghost icon-button" on:click=move |_| { delete_confirm.set(false); editor.set(None); }><MaterialSymbolIcon name="close" filled=false /></button></div>
+            <header class="template-editor-header"><span class="template-plaza-kicker">"ADMIN EDITOR"</span><h2>{if draft.id.is_some() { "编辑模板" } else { "新建模板" }}</h2></header>
+            <button class="button ghost icon-button template-editor-close" title="关闭编辑器" aria-label="关闭编辑器" on:click=move |_| { delete_confirm.set(false); editor.set(None); }><MaterialSymbolIcon name="close" filled=false /></button>
             <label>"标题"<input class="text-input" prop:value=draft.title on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.title = event_target_value(&event) }) /></label>
             <label>"提示词"<textarea class="text-input template-editor-prompt" prop:value=draft.prompt on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.prompt = event_target_value(&event) }) /></label>
             <label>"说明"<textarea class="text-input" prop:value=draft.description on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.description = event_target_value(&event) }) /></label>
@@ -1359,11 +1359,16 @@ fn TemplateEditor(
                 <small class="muted">"使用“分类/标签”归类；没有分类路径的旧标签会显示在“未分类”。"</small>
             </label>
             <div class="template-editor-fields">
-                <label>"推荐服务商"<select class="select-input" prop:value=provider_kind_value(draft.recommended_provider_kind) on:change=move |event| editor.update(|draft| if let Some(draft) = draft { draft.recommended_provider_kind = parse_provider_kind(&event_target_value(&event)) })><option value="openai_image">"OpenAI Images"</option><option value="nano_banana">"Nano Banana"</option><option value="openai_compatible">"OpenAI 兼容"</option></select></label>
-                <label>"推荐模型"<input class="text-input" prop:value=draft.recommended_model on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.recommended_model = event_target_value(&event) }) /></label>
-                <label>"状态"<select class="select-input" prop:value=status_value(draft.status) on:change=move |event| editor.update(|draft| if let Some(draft) = draft { draft.status = parse_status(&event_target_value(&event)) })><option value="draft">"草稿"</option><option value="published">"已发布"</option><option value="archived">"已归档"</option></select></label>
-                <label>"宽度"<input class="text-input" type="number" min="1" prop:value=draft.generation_settings.width on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.width = event_target_value(&event).parse().unwrap_or(1024) }) /></label>
-                <label>"高度"<input class="text-input" type="number" min="1" prop:value=draft.generation_settings.height on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.height = event_target_value(&event).parse().unwrap_or(1024) }) /></label>
+                <label class="template-editor-model-field">"推荐模型"<input class="text-input" prop:value=draft.recommended_model on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.recommended_model = event_target_value(&event) }) /></label>
+                <div class="template-editor-field template-editor-size-field">
+                    <span>"尺寸"</span>
+                    <div class="template-editor-size-inputs">
+                        <input class="text-input" type="number" min="1" aria-label="模板宽度" prop:value=draft.generation_settings.width on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.width = event_target_value(&event).parse().unwrap_or(1024) }) />
+                        <span aria-hidden="true">"×"</span>
+                        <input class="text-input" type="number" min="1" aria-label="模板高度" prop:value=draft.generation_settings.height on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.height = event_target_value(&event).parse().unwrap_or(1024) }) />
+                    </div>
+                </div>
+                <label class="template-editor-status-field">"状态"<select class="select-input" prop:value=status_value(draft.status) on:change=move |event| editor.update(|draft| if let Some(draft) = draft { draft.status = parse_status(&event_target_value(&event)) })><option value="draft">"草稿"</option><option value="published">"已发布"</option><option value="archived">"已归档"</option></select></label>
             </div>
             <EditorAssets title="预览图（最多 6 张）" assets=draft.preview_assets editor role=GalleryAssetRole::Preview max=6 max_edge=PREVIEW_MAX_EDGE editor_busy message />
             <EditorAssets title="参考图（最多 16 张）" assets=draft.reference_assets editor role=GalleryAssetRole::Reference max=16 max_edge=REFERENCE_MAX_EDGE editor_busy message />
@@ -2063,21 +2068,6 @@ fn parse_status(value: &str) -> GalleryTemplateStatus {
         "published" => GalleryTemplateStatus::Published,
         "archived" => GalleryTemplateStatus::Archived,
         _ => GalleryTemplateStatus::Draft,
-    }
-}
-fn provider_kind_value(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::OpenAiImage => "openai_image",
-        ProviderKind::NanoBanana => "nano_banana",
-        ProviderKind::OpenAiCompatible => "openai_compatible",
-        ProviderKind::CustomHttp => "openai_compatible",
-    }
-}
-fn parse_provider_kind(value: &str) -> ProviderKind {
-    match value {
-        "nano_banana" => ProviderKind::NanoBanana,
-        "openai_compatible" => ProviderKind::OpenAiCompatible,
-        _ => ProviderKind::OpenAiImage,
     }
 }
 
