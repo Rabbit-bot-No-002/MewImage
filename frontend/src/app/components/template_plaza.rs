@@ -16,7 +16,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, BlobPropertyBag, Event, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement,
-    KeyboardEvent, MouseEvent,
+    MouseEvent,
 };
 
 use crate::app::{
@@ -31,6 +31,9 @@ use super::common::{FullscreenImageViewer, MaterialSymbolIcon, PaginationControl
 const PREVIEW_MAX_EDGE: u32 = 2_048;
 const REFERENCE_MAX_EDGE: u32 = 4_096;
 const TEMPLATE_IMAGE_QUALITY: f64 = 0.9;
+const TEMPLATE_PAGE_SIZE: usize = 24;
+const TEMPLATE_BATCH_SIZE: usize = 8;
+const TEMPLATE_SCROLL_PREFETCH_PX: f64 = 480.0;
 const UNCATEGORIZED_TAG_CATEGORY: &str = "未分类";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +82,62 @@ impl TemplateEditorDraft {
     }
 }
 
+fn normalized_gallery_search_filters(query: &str, tags: &[String]) -> (String, Vec<String>) {
+    let mut normalized_tags = tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    normalized_tags.sort_unstable();
+    normalized_tags.dedup();
+    (query.trim().to_string(), normalized_tags)
+}
+
+fn next_template_visible_count(current: usize, total: usize) -> usize {
+    current.saturating_add(TEMPLATE_BATCH_SIZE).min(total)
+}
+
+fn reveal_next_template_batch(
+    templates: RwSignal<Vec<GalleryTemplate>>,
+    visible_count: RwSignal<usize>,
+    loading: RwSignal<bool>,
+) {
+    if loading.get_untracked() {
+        return;
+    }
+    let total = templates.with_untracked(|items| items.len());
+    let current = visible_count.get_untracked().min(total);
+    let next = next_template_visible_count(current, total);
+    if next > current {
+        visible_count.set(next);
+    }
+}
+
+fn viewport_near_document_end(prefetch_px: f64) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Some(document) = window.document() else {
+        return false;
+    };
+    let viewport_height = window
+        .inner_height()
+        .ok()
+        .and_then(|value| value.as_f64())
+        .unwrap_or_default();
+    let scroll_y = window.scroll_y().unwrap_or_default();
+    let root_height = document
+        .document_element()
+        .map(|element| f64::from(element.scroll_height()))
+        .unwrap_or_default();
+    let body_height = document
+        .body()
+        .map(|element| f64::from(element.scroll_height()))
+        .unwrap_or_default();
+    scroll_y + viewport_height + prefetch_px >= root_height.max(body_height)
+}
+
 #[component]
 pub(crate) fn TemplatePlaza(
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
@@ -90,6 +149,7 @@ pub(crate) fn TemplatePlaza(
     let ui = expect_context::<UiState>();
 
     let templates = RwSignal::new(Vec::<GalleryTemplate>::new());
+    let visible_template_count = RwSignal::new(TEMPLATE_BATCH_SIZE);
     let available_tags = RwSignal::new(Vec::<GalleryTagSummary>::new());
     let selected_tags = RwSignal::new(Vec::<String>::new());
     let search = RwSignal::new(String::new());
@@ -143,7 +203,7 @@ pub(crate) fn TemplatePlaza(
                 return;
             }
             let mut url = format!(
-                "/api/gallery/templates?page={requested_page}&page_size=24&sort={sort_value}"
+                "/api/gallery/templates?page={requested_page}&page_size={TEMPLATE_PAGE_SIZE}&sort={sort_value}"
             );
             if !query.trim().is_empty() {
                 url.push_str("&q=");
@@ -162,15 +222,34 @@ pub(crate) fn TemplatePlaza(
                         .total
                         .div_ceil(u64::from(response.page_size))
                         .max(1);
-                    total_pages.set(usize::try_from(pages).unwrap_or(usize::MAX));
-                    templates.set(response.items);
-                    loading.set(false);
+                    let initial_count = TEMPLATE_BATCH_SIZE.min(response.items.len());
+                    batch(move || {
+                        total_pages.set(usize::try_from(pages).unwrap_or(usize::MAX));
+                        visible_template_count.set(initial_count);
+                        templates.set(response.items);
+                        loading.set(false);
+                    });
                 }
                 Err(error) if request_revision.get_untracked() == revision => {
                     message.set(Some(error));
                     loading.set(false);
                 }
                 _ => {}
+            }
+        });
+    });
+
+    // 首批内容不足一屏时继续补齐；正常页面仍保持首批只挂载 8 张卡片。
+    Effect::new(move |_| {
+        let total = templates.with(|items| items.len());
+        let visible = visible_template_count.get();
+        if loading.get() || visible >= total {
+            return;
+        }
+        spawn_local(async move {
+            TimeoutFuture::new(0).await;
+            if viewport_near_document_end(0.0) {
+                reveal_next_template_batch(templates, visible_template_count, loading);
             }
         });
     });
@@ -254,6 +333,28 @@ pub(crate) fn TemplatePlaza(
         }
     });
     on_cleanup(move || escape_listener.remove());
+
+    // 滚动检查限制为约 10 Hz，避免连续滚动时反复读取页面尺寸。
+    let last_template_scroll_check = RwSignal::new(0.0_f64);
+    let template_scroll_listener = window_event_listener(ev::scroll, move |_| {
+        let now = js_sys::Date::now();
+        if now - last_template_scroll_check.get_untracked() < 100.0 {
+            return;
+        }
+        last_template_scroll_check.set(now);
+        if viewport_near_document_end(TEMPLATE_SCROLL_PREFETCH_PX) {
+            reveal_next_template_batch(templates, visible_template_count, loading);
+        }
+    });
+    let template_resize_listener = window_event_listener(ev::resize, move |_| {
+        if viewport_near_document_end(0.0) {
+            reveal_next_template_batch(templates, visible_template_count, loading);
+        }
+    });
+    on_cleanup(move || {
+        template_scroll_listener.remove();
+        template_resize_listener.remove();
+    });
 
     Effect::new(move |_| {
         let Some(task_id) = ui.gallery_template_draft_task_id.get() else {
@@ -749,7 +850,7 @@ pub(crate) fn TemplatePlaza(
                             placeholder="搜索标题、提示词或标签"
                             prop:value=move || search.get()
                             on:input=move |event| search.set(event_target_value(&event))
-                            on:keydown=move |event: KeyboardEvent| {
+                            on:keydown=move |event: web_sys::KeyboardEvent| {
                                 if event.key() == "Enter" {
                                     event.prevent_default();
                                     submit_search();
@@ -876,7 +977,10 @@ pub(crate) fn TemplatePlaza(
                 <div class="template-loading"><span class="gallery-running-spinner"></span>"正在整理灵感星图……"</div>
             </Show>
             <section class="template-card-grid">
-                <For each=move || templates.get() key=|template| (
+                <For each=move || {
+                    let visible = visible_template_count.get();
+                    templates.with(|items| items.iter().take(visible).cloned().collect::<Vec<_>>())
+                } key=|template| (
                     template.id.clone(),
                     template.updated_at.clone(),
                     template.like_count,
@@ -954,7 +1058,23 @@ pub(crate) fn TemplatePlaza(
             <Show when=move || !loading.get() && templates.get().is_empty()>
                 <div class="panel template-empty-state"><MaterialSymbolIcon name="travel_explore" filled=false /><h3>"还没有匹配的模板"</h3><p>"换个关键词或减少标签试试看。"</p></div>
             </Show>
-            <PaginationControls page=page page_count=page_count favorite=false />
+            <Show when=move || !loading.get() && templates.with(|items| {
+                !items.is_empty() && visible_template_count.get() < items.len()
+            })>
+                <div class="template-progressive-loader" role="status">
+                    <span class="gallery-running-spinner"></span>
+                    <span>{move || format!(
+                        "继续向下浏览 · 已显示 {}/{}",
+                        visible_template_count.get(),
+                        templates.with(|items| items.len()),
+                    )}</span>
+                </div>
+            </Show>
+            <Show when=move || !loading.get() && templates.with(|items| {
+                !items.is_empty() && visible_template_count.get() >= items.len()
+            })>
+                <PaginationControls page=page page_count=page_count favorite=false />
+            </Show>
         </main>
 
         {move || message.get().map(|notice| view! {
@@ -1828,18 +1948,6 @@ fn gallery_tag_breadcrumb(value: &str) -> String {
     }
 }
 
-fn normalized_gallery_search_filters(query: &str, tags: &[String]) -> (String, Vec<String>) {
-    let mut normalized_tags = tags
-        .iter()
-        .map(|tag| tag.trim())
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    normalized_tags.sort_unstable();
-    normalized_tags.dedup();
-    (query.trim().to_string(), normalized_tags)
-}
-
 fn group_gallery_tags(tags: &[GalleryTagSummary]) -> Vec<GalleryTagGroup> {
     let mut grouped = BTreeMap::<String, Vec<GalleryTagSummary>>::new();
     for tag in tags {
@@ -2100,6 +2208,14 @@ mod tests {
 
         assert_eq!(filters.0, "星空少女");
         assert_eq!(filters.1, ["构图/特写", "风格/写实"]);
+    }
+
+    #[test]
+    fn template_batches_reveal_eight_items_until_page_is_complete() {
+        assert_eq!(next_template_visible_count(8, 24), 16);
+        assert_eq!(next_template_visible_count(16, 24), 24);
+        assert_eq!(next_template_visible_count(24, 24), 24);
+        assert_eq!(next_template_visible_count(8, 13), 13);
     }
 
     #[test]

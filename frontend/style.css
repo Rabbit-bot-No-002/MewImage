@@ -73,6 +73,11 @@
     rgba(255, 255, 255, 0.72);
   --floating-muted: #765b69;
   --floating-blur: 16px;
+  --scrollbar-track-color: rgba(126, 91, 109, 0.11);
+  --scrollbar-thumb-color: rgba(218, 105, 157, 0.64);
+  --scrollbar-thumb-gradient: linear-gradient(160deg, #ff9ac1, #82bcf2);
+  --scrollbar-thumb-hover-gradient: linear-gradient(160deg, #ff72aa, #639fe2);
+  --scrollbar-thumb-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.52);
 }
 
 body[data-theme="night"] {
@@ -117,10 +122,57 @@ body[data-theme="night"] {
     linear-gradient(135deg, rgba(var(--primary-rgb), 0.26), rgba(var(--secondary-rgb), 0.18)),
     rgba(31, 37, 55, 0.92);
   --floating-muted: #c6b7c3;
+  --scrollbar-track-color: rgba(4, 7, 15, 0.34);
+  --scrollbar-thumb-color: rgba(226, 121, 169, 0.7);
+  --scrollbar-thumb-gradient: linear-gradient(160deg, #e67aaa, #719fdf);
+  --scrollbar-thumb-hover-gradient: linear-gradient(160deg, #ff8fba, #83b4f4);
+  --scrollbar-thumb-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* Firefox 使用标准属性；限制在 Gecko，避免新版 Chromium 覆盖 WebKit 渐变。 */
+@supports (-moz-appearance: none) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb-color) var(--scrollbar-track-color);
+  }
+}
+
+/* Chromium、Edge 与 Safari 使用可表现主题渐变的滚动条伪元素。 */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  border-radius: 999px;
+  background: var(--scrollbar-track-color);
+}
+
+*::-webkit-scrollbar-thumb {
+  min-width: 40px;
+  min-height: 40px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--scrollbar-thumb-gradient) padding-box;
+  box-shadow: var(--scrollbar-thumb-shadow);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover-gradient) padding-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 body {
@@ -2901,6 +2953,17 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
   gap: 12px;
 }
 
+.template-progressive-loader {
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .template-empty-state {
   min-height: 260px;
   align-content: center;
@@ -3591,6 +3654,11 @@ body[data-visual-theme="aurora"] {
     rgba(244, 249, 255, 0.84);
   --floating-muted: #586981;
   --floating-blur: 18px;
+  --scrollbar-track-color: rgba(47, 91, 137, 0.12);
+  --scrollbar-thumb-color: rgba(73, 137, 193, 0.68);
+  --scrollbar-thumb-gradient: linear-gradient(160deg, #55d2e3, #8074ed);
+  --scrollbar-thumb-hover-gradient: linear-gradient(160deg, #32bdd2, #685ae1);
+  --scrollbar-thumb-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
 }
 
 body[data-visual-theme="aurora"][data-color-scheme="night"] {
@@ -3642,6 +3710,11 @@ body[data-visual-theme="aurora"][data-color-scheme="night"] {
     linear-gradient(135deg, rgba(var(--secondary-rgb), 0.23), rgba(var(--primary-rgb), 0.24)),
     rgba(18, 27, 57, 0.92);
   --floating-muted: #bcc9de;
+  --scrollbar-track-color: rgba(1, 5, 17, 0.4);
+  --scrollbar-thumb-color: rgba(91, 172, 207, 0.72);
+  --scrollbar-thumb-gradient: linear-gradient(160deg, #48c9db, #7669e8);
+  --scrollbar-thumb-hover-gradient: linear-gradient(160deg, #64e0ed, #9589ff);
+  --scrollbar-thumb-shadow: inset 0 1px 0 rgba(224, 243, 255, 0.26);
 }
 
 /* 多组互不对齐的星点打破规则点阵，星场本身保持静态。 */
@@ -5765,6 +5838,13 @@ body[data-visual-theme="liquid-glass"] {
     rgba(244, 250, 255, 0.8);
   --floating-muted: #53667d;
   --floating-blur: 20px;
+  --scrollbar-track-color: rgba(73, 122, 158, 0.11);
+  --scrollbar-thumb-color: rgba(55, 148, 190, 0.66);
+  --scrollbar-thumb-gradient: linear-gradient(160deg, rgba(50, 184, 229, 0.88), rgba(224, 100, 177, 0.78));
+  --scrollbar-thumb-hover-gradient: linear-gradient(160deg, #28b4df, #dc5baa);
+  --scrollbar-thumb-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    0 0 10px rgba(61, 167, 213, 0.14);
 }
 
 body[data-visual-theme="liquid-glass"][data-color-scheme="night"] {
@@ -5823,6 +5903,13 @@ body[data-visual-theme="liquid-glass"][data-color-scheme="night"] {
     linear-gradient(135deg, rgba(var(--secondary-rgb), 0.22), rgba(var(--primary-rgb), 0.22)),
     rgba(20, 38, 60, 0.86);
   --floating-muted: #c2cfdd;
+  --scrollbar-track-color: rgba(0, 5, 15, 0.38);
+  --scrollbar-thumb-color: rgba(87, 177, 212, 0.7);
+  --scrollbar-thumb-gradient: linear-gradient(160deg, rgba(58, 190, 231, 0.86), rgba(201, 76, 164, 0.78));
+  --scrollbar-thumb-hover-gradient: linear-gradient(160deg, #50d1ed, #e16ab7);
+  --scrollbar-thumb-shadow:
+    inset 0 1px 0 rgba(224, 243, 255, 0.3),
+    0 0 12px rgba(55, 188, 255, 0.12);
 }
 
 body[data-visual-theme="liquid-glass"]::before {
@@ -6146,6 +6233,28 @@ body[data-visual-theme][data-color-scheme] .button.ghost.template-favorite-butto
 }
 
 /* Windows 原生下拉弹层需要字面深色作为提示，变量和继承色常会被 UA 忽略。 */
+body[data-visual-theme="classic"][data-color-scheme="night"] :is(select, select option, select optgroup) {
+  color-scheme: dark;
+  color: #f7ebf3 !important;
+  background-color: #171d2c !important;
+}
+
+body[data-visual-theme="classic"][data-color-scheme="night"] select option:checked {
+  color: #fff7fb !important;
+  background-color: #3b2b46 !important;
+}
+
+body[data-visual-theme="aurora"][data-color-scheme="night"] :is(select, select option, select optgroup) {
+  color-scheme: dark;
+  color: #edf5ff !important;
+  background-color: #101a36 !important;
+}
+
+body[data-visual-theme="aurora"][data-color-scheme="night"] select option:checked {
+  color: #f7fbff !important;
+  background-color: #302b65 !important;
+}
+
 body[data-visual-theme="liquid-glass"][data-color-scheme="night"] select {
   color-scheme: dark;
   color: #f3f8ff;
@@ -6388,6 +6497,60 @@ body[data-visual-theme][data-color-scheme] .settings-popover .settings-nav-butto
   background: var(--floating-active);
 }
 
+/* 分辨率弹层包含多组互相关联的参数，选中项使用实色和勾选标记避免误读。 */
+body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-weight: 700;
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button:not(.active-chip):hover,
+body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button:not(.active-chip):focus-visible {
+  border-color: rgba(var(--primary-rgb), 0.52);
+  background: var(--floating-hover);
+}
+
+body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button.active-chip {
+  border-color: rgba(var(--primary-strong-rgb), 0.72);
+  color: #fff;
+  background: var(--action-gradient);
+  box-shadow:
+    0 0 0 2px var(--floating-surface-base),
+    0 0 0 4px rgba(var(--primary-rgb), 0.28),
+    0 10px 24px rgba(var(--primary-strong-rgb), 0.24);
+  transform: translateY(-1px);
+}
+
+body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button.active-chip::before {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 50%;
+  content: "✓";
+  color: #fff;
+  background: rgba(255, 255, 255, 0.2);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.38);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button.active-chip:hover,
+body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button.active-chip:focus-visible {
+  border-color: rgba(var(--primary-strong-rgb), 0.9);
+  background: var(--action-gradient);
+  filter: none;
+}
+
 @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
   body[data-visual-theme="liquid-glass"] {
     --panel: rgba(242, 250, 255, 0.7);
@@ -6397,6 +6560,30 @@ body[data-visual-theme][data-color-scheme] .settings-popover .settings-nav-butto
   body[data-visual-theme="liquid-glass"][data-color-scheme="night"] {
     --panel: rgba(16, 34, 55, 0.68);
     --panel-strong: rgba(17, 31, 50, 0.78);
+  }
+}
+
+/* 系统强制配色优先保障滚动条可辨认和可操作，不强行保留主题渐变。 */
+@media (forced-colors: active) {
+  * {
+    scrollbar-width: auto;
+    scrollbar-color: ButtonText Canvas;
+  }
+
+  *::-webkit-scrollbar {
+    width: auto;
+    height: auto;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: Canvas;
+  }
+
+  *::-webkit-scrollbar-thumb,
+  *::-webkit-scrollbar-thumb:hover {
+    border-color: Canvas;
+    background: ButtonText;
+    box-shadow: none;
   }
 }
 
