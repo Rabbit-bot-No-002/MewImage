@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashSet};
 use gloo_file::{File, futures::read_as_bytes};
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
-use leptos::{ev, leptos_dom::helpers::window_event_listener, prelude::*, task::spawn_local};
+use leptos::{
+    ev, leptos_dom::helpers::window_event_listener, portal::Portal, prelude::*, task::spawn_local,
+};
 use mew_image_shared::{
     DEFAULT_FAVORITE_FOLDER_ID, GalleryAsset, GalleryAssetRole, GalleryImportMode,
     GalleryImportResponse, GalleryLikeResponse, GalleryTagSummary, GalleryTemplate,
@@ -35,6 +37,8 @@ const TEMPLATE_PAGE_SIZE: usize = 24;
 const TEMPLATE_BATCH_SIZE: usize = 8;
 const TEMPLATE_SCROLL_PREFETCH_PX: f64 = 480.0;
 const UNCATEGORIZED_TAG_CATEGORY: &str = "未分类";
+const MAX_TEMPLATE_TAGS: usize = 12;
+const MAX_TEMPLATE_TAG_CHARS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GalleryTagGroup {
@@ -55,13 +59,43 @@ struct TemplateEditorDraft {
     title: String,
     prompt: String,
     description: String,
-    tags: String,
+    tags: Vec<String>,
     recommended_provider_kind: ProviderKind,
     recommended_model: String,
     generation_settings: GenerationSettingsSnapshot,
     preview_assets: Vec<GalleryAsset>,
     reference_assets: Vec<GalleryAsset>,
     status: GalleryTemplateStatus,
+}
+
+#[derive(Clone, Debug)]
+struct TemplateEditorTagUiState {
+    selected_category: String,
+    search: String,
+    new_category: String,
+    new_tag_input: String,
+    feedback: Option<String>,
+}
+
+impl TemplateEditorTagUiState {
+    fn for_tags(tags: &[String]) -> Self {
+        let selected_category = tags
+            .first()
+            .map(|tag| gallery_tag_parts(tag).0.to_string())
+            .unwrap_or_else(|| UNCATEGORIZED_TAG_CATEGORY.to_string());
+        let new_category = if selected_category == UNCATEGORIZED_TAG_CATEGORY {
+            String::new()
+        } else {
+            selected_category.clone()
+        };
+        Self {
+            selected_category,
+            search: String::new(),
+            new_category,
+            new_tag_input: String::new(),
+            feedback: None,
+        }
+    }
 }
 
 impl TemplateEditorDraft {
@@ -71,7 +105,7 @@ impl TemplateEditorDraft {
             title: template.title,
             prompt: template.prompt,
             description: template.description,
-            tags: template.tags.join(", "),
+            tags: template.tags,
             recommended_provider_kind: template.recommended_provider_kind,
             recommended_model: template.recommended_model,
             generation_settings: template.generation_settings,
@@ -151,6 +185,9 @@ pub(crate) fn TemplatePlaza(
     let templates = RwSignal::new(Vec::<GalleryTemplate>::new());
     let visible_template_count = RwSignal::new(TEMPLATE_BATCH_SIZE);
     let available_tags = RwSignal::new(Vec::<GalleryTagSummary>::new());
+    let admin_available_tags = RwSignal::new(Vec::<GalleryTagSummary>::new());
+    let admin_tags_loading = RwSignal::new(false);
+    let admin_tags_error = RwSignal::new(None::<String>);
     let selected_tags = RwSignal::new(Vec::<String>::new());
     let search = RwSignal::new(String::new());
     let applied_filters = RwSignal::new((String::new(), Vec::<String>::new()));
@@ -170,8 +207,11 @@ pub(crate) fn TemplatePlaza(
     let template_favorite_picker = RwSignal::new(None::<TemplateFavoritePickerState>);
     let pending_template_favorites = RwSignal::new(HashSet::<String>::new());
     let request_revision = RwSignal::new(0u64);
+    let admin_tags_request_revision = RwSignal::new(0u64);
     let reload_trigger = RwSignal::new(0u64);
     let editor = RwSignal::new(None::<TemplateEditorDraft>);
+    let editor_tag_picker_open = RwSignal::new(false);
+    let editor_tag_ui = RwSignal::new(TemplateEditorTagUiState::for_tags(&[]));
     let editor_delete_confirm = RwSignal::new(false);
     let editor_busy = RwSignal::new(false);
     let import_input = NodeRef::<leptos::html::Input>::new();
@@ -256,6 +296,40 @@ pub(crate) fn TemplatePlaza(
 
     Effect::new(move |_| {
         let _ = reload_trigger.get();
+        // 登录态或模板数据变化时让旧请求失效，避免退出登录后的迟到响应重新填充管理员缓存。
+        let admin_tags_revision = admin_tags_request_revision
+            .get_untracked()
+            .saturating_add(1);
+        admin_tags_request_revision.set(admin_tags_revision);
+        if is_admin.get() {
+            admin_tags_loading.set(true);
+            admin_tags_error.set(None);
+            spawn_local(async move {
+                match fetch_json::<Vec<GalleryTagSummary>>("/api/admin/gallery/tags").await {
+                    Ok(tags)
+                        if admin_tags_request_revision.get_untracked() == admin_tags_revision
+                            && is_admin.get_untracked() =>
+                    {
+                        admin_available_tags.set(tags);
+                    }
+                    Err(error)
+                        if admin_tags_request_revision.get_untracked() == admin_tags_revision
+                            && is_admin.get_untracked() =>
+                    {
+                        admin_tags_error
+                            .set(Some(format!("已有标签加载失败，仍可继续新建标签：{error}")));
+                    }
+                    _ => return,
+                }
+                if admin_tags_request_revision.get_untracked() == admin_tags_revision {
+                    admin_tags_loading.set(false);
+                }
+            });
+        } else {
+            admin_available_tags.set(Vec::new());
+            admin_tags_error.set(None);
+            admin_tags_loading.set(false);
+        }
         spawn_local(async move {
             if let Ok(tags) = fetch_json::<Vec<GalleryTagSummary>>("/api/gallery/tags").await {
                 if selected_tag_category.get_untracked().is_none() {
@@ -304,6 +378,9 @@ pub(crate) fn TemplatePlaza(
             true
         } else if export_confirm.get_untracked() {
             export_confirm.set(false);
+            true
+        } else if editor_tag_picker_open.get_untracked() {
+            editor_tag_picker_open.set(false);
             true
         } else if editor.get_untracked().is_some() {
             editor.set(None);
@@ -364,6 +441,8 @@ pub(crate) fn TemplatePlaza(
         if !is_admin.get_untracked() {
             return;
         }
+        editor_tag_picker_open.set(false);
+        editor_tag_ui.set(TemplateEditorTagUiState::for_tags(&[]));
         open_editor_from_task(task_id, workspace, composer, editor, editor_busy, message);
     });
 
@@ -734,11 +813,17 @@ pub(crate) fn TemplatePlaza(
 
     let new_editor = move |_| {
         editor_delete_confirm.set(false);
-        editor.set(Some(default_editor_draft(workspace, composer)));
+        editor_tag_picker_open.set(false);
+        let draft = default_editor_draft(workspace, composer);
+        editor_tag_ui.set(TemplateEditorTagUiState::for_tags(&draft.tags));
+        editor.set(Some(draft));
     };
     let edit_template = move |template: GalleryTemplate| {
         editor_delete_confirm.set(false);
-        editor.set(Some(TemplateEditorDraft::from_template(template)));
+        editor_tag_picker_open.set(false);
+        let draft = TemplateEditorDraft::from_template(template);
+        editor_tag_ui.set(TemplateEditorTagUiState::for_tags(&draft.tags));
+        editor.set(Some(draft));
     };
     let export_templates = move || {
         spawn_local(async move {
@@ -1252,7 +1337,20 @@ pub(crate) fn TemplatePlaza(
         })}
 
         {move || editor.get().map(|draft| view! {
-            <TemplateEditor draft editor delete_confirm=editor_delete_confirm editor_busy message templates reload_trigger />
+            <TemplateEditor
+                draft
+                editor
+                delete_confirm=editor_delete_confirm
+                tag_picker_open=editor_tag_picker_open
+                tag_ui=editor_tag_ui
+                available_tags=admin_available_tags
+                tags_loading=admin_tags_loading
+                tags_error=admin_tags_error
+                editor_busy
+                message
+                templates
+                reload_trigger
+            />
         })}
 
         <Show when=move || export_confirm.get()>
@@ -1292,6 +1390,11 @@ fn TemplateEditor(
     draft: TemplateEditorDraft,
     editor: RwSignal<Option<TemplateEditorDraft>>,
     delete_confirm: RwSignal<bool>,
+    tag_picker_open: RwSignal<bool>,
+    tag_ui: RwSignal<TemplateEditorTagUiState>,
+    available_tags: RwSignal<Vec<GalleryTagSummary>>,
+    tags_loading: RwSignal<bool>,
+    tags_error: RwSignal<Option<String>>,
     editor_busy: RwSignal<bool>,
     message: RwSignal<Option<String>>,
     templates: RwSignal<Vec<GalleryTemplate>>,
@@ -1337,6 +1440,7 @@ fn TemplateEditor(
                         });
                         reload_trigger.update(|value| *value = value.saturating_add(1));
                         delete_confirm.set(false);
+                        tag_picker_open.set(false);
                         editor.set(None);
                     }
                     Err(error) => message.set(Some(error.to_string())),
@@ -1351,13 +1455,11 @@ fn TemplateEditor(
     view! { <div class="modal-backdrop template-editor-backdrop">
         <section class="panel template-editor stack">
             <header class="template-editor-header"><span class="template-plaza-kicker">"ADMIN EDITOR"</span><h2>{if draft.id.is_some() { "编辑模板" } else { "新建模板" }}</h2></header>
-            <button class="button ghost icon-button template-editor-close" title="关闭编辑器" aria-label="关闭编辑器" on:click=move |_| { delete_confirm.set(false); editor.set(None); }><MaterialSymbolIcon name="close" filled=false /></button>
+            <button class="button ghost icon-button template-editor-close" title="关闭编辑器" aria-label="关闭编辑器" on:click=move |_| { delete_confirm.set(false); tag_picker_open.set(false); editor.set(None); }><MaterialSymbolIcon name="close" filled=false /></button>
             <label>"标题"<input class="text-input" prop:value=draft.title on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.title = event_target_value(&event) }) /></label>
             <label>"提示词"<textarea class="text-input template-editor-prompt" prop:value=draft.prompt on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.prompt = event_target_value(&event) }) /></label>
             <label>"说明"<textarea class="text-input" prop:value=draft.description on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.description = event_target_value(&event) }) /></label>
-            <label>"标签（逗号分隔）"<input class="text-input" placeholder="例如：风格/赛博朋克，构图/特写" prop:value=draft.tags on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.tags = event_target_value(&event) }) />
-                <small class="muted">"使用“分类/标签”归类；没有分类路径的旧标签会显示在“未分类”。"</small>
-            </label>
+            <TemplateEditorTags editor picker_open=tag_picker_open ui_state=tag_ui available_tags loading=tags_loading load_error=tags_error />
             <div class="template-editor-fields">
                 <label class="template-editor-model-field">"推荐模型"<input class="text-input" prop:value=draft.recommended_model on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.recommended_model = event_target_value(&event) }) /></label>
                 <div class="template-editor-field template-editor-size-field">
@@ -1373,8 +1475,8 @@ fn TemplateEditor(
             <EditorAssets title="预览图（最多 6 张）" assets=draft.preview_assets editor role=GalleryAssetRole::Preview max=6 max_edge=PREVIEW_MAX_EDGE editor_busy message />
             <EditorAssets title="参考图（最多 16 张）" assets=draft.reference_assets editor role=GalleryAssetRole::Reference max=16 max_edge=REFERENCE_MAX_EDGE editor_busy message />
             <div class="row template-editor-actions">
-                {delete_id.get_value().map(|_| view! { <button class="button danger" disabled=move || editor_busy.get() on:click=move |_| delete_confirm.set(true)><MaterialSymbolIcon name="delete" filled=false />"删除模板"</button> })}
-                <span class="spacer"></span><button class="button ghost" on:click=move |_| { delete_confirm.set(false); editor.set(None); }>"取消"</button><button class="button primary" disabled=move || editor_busy.get() on:click=save>"保存模板"</button>
+                {delete_id.get_value().map(|_| view! { <button class="button danger" disabled=move || editor_busy.get() on:click=move |_| { tag_picker_open.set(false); delete_confirm.set(true); }><MaterialSymbolIcon name="delete" filled=false />"删除模板"</button> })}
+                <span class="spacer"></span><button class="button ghost" on:click=move |_| { delete_confirm.set(false); tag_picker_open.set(false); editor.set(None); }>"取消"</button><button class="button primary" disabled=move || editor_busy.get() on:click=save>"保存模板"</button>
             </div>
             <Show when=move || delete_confirm.get()>
                 <div class="template-inline-confirm">
@@ -1388,6 +1490,474 @@ fn TemplateEditor(
             </Show>
         </section>
     </div> }
+}
+
+#[component]
+fn TemplateEditorTags(
+    editor: RwSignal<Option<TemplateEditorDraft>>,
+    picker_open: RwSignal<bool>,
+    ui_state: RwSignal<TemplateEditorTagUiState>,
+    available_tags: RwSignal<Vec<GalleryTagSummary>>,
+    loading: RwSignal<bool>,
+    load_error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let search_input = NodeRef::<leptos::html::Input>::new();
+
+    view! {
+        <div class="template-editor-tags" aria-labelledby="template-editor-tags-label">
+            <div class="template-editor-tags-header">
+                <strong id="template-editor-tags-label">"标签"</strong>
+                <small>{move || format!("已选 {} / {MAX_TEMPLATE_TAGS}", editor_tag_count(editor))}</small>
+            </div>
+            <div class="template-editor-tag-chips">
+                <Show when=move || current_editor_tags(editor).is_empty()>
+                    <span class="template-editor-tags-empty">"尚未添加标签"</span>
+                </Show>
+                <For
+                    each=move || current_editor_tags(editor)
+                    key=|tag| tag.clone()
+                    children=move |tag| {
+                        let remove_tag = tag.clone();
+                        view! {
+                            <button
+                                class="template-editor-tag-chip"
+                                title=format!("移除标签：{}", gallery_tag_breadcrumb(&tag))
+                                aria-label=format!("移除标签：{}", gallery_tag_breadcrumb(&tag))
+                                on:click=move |_| remove_editor_tag(editor, &remove_tag)
+                            >
+                                <span>{gallery_tag_breadcrumb(&tag)}</span>
+                                <MaterialSymbolIcon name="close" filled=false />
+                            </button>
+                        }
+                    }
+                />
+                <button class="button secondary template-editor-add-tag" on:click=move |_| {
+                    ui_state.update(|state| {
+                        state.feedback = None;
+                        state.search.clear();
+                    });
+                    picker_open.set(true);
+                    spawn_local(async move {
+                        TimeoutFuture::new(0).await;
+                        if let Some(input) = search_input.get() {
+                            let _ = input.focus();
+                        }
+                    });
+                }>
+                    <MaterialSymbolIcon name="add" filled=false />
+                    "添加标签"
+                </button>
+            </div>
+        </div>
+
+        <Show when=move || picker_open.get()>
+            <Portal>
+                <div class="modal-backdrop template-editor-tag-backdrop" on:click=move |_| picker_open.set(false)>
+                    <section
+                        class="template-editor-tag-dialog"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="template-editor-tag-dialog-title"
+                        on:click=move |event: MouseEvent| event.stop_propagation()
+                    >
+                        <header class="template-editor-tag-dialog-header">
+                            <div>
+                                <span class="template-plaza-kicker">"TAG EDITOR"</span>
+                                <h3 id="template-editor-tag-dialog-title">"选择或新建标签"</h3>
+                            </div>
+                            <button class="button ghost icon-button" title="关闭标签选择" aria-label="关闭标签选择" on:click=move |_| picker_open.set(false)>
+                                <MaterialSymbolIcon name="close" filled=false />
+                            </button>
+                        </header>
+
+                        <label class="template-tag-search template-editor-tag-search">
+                            <MaterialSymbolIcon name="search" filled=false />
+                            <input
+                                node_ref=search_input
+                                type="search"
+                                placeholder="搜索当前分类中的标签"
+                                prop:value=move || ui_state.with(|state| state.search.clone())
+                                on:input=move |event| ui_state.update(|state| state.search = event_target_value(&event))
+                            />
+                        </label>
+
+                        <div class="template-tag-browser template-editor-tag-browser">
+                            <nav class="template-tag-categories" aria-label="标签分类">
+                                <For
+                                    each=move || editor_tag_groups(&available_tags.get(), &current_editor_tags(editor))
+                                    key=|group| group.name.clone()
+                                    children=move |group| {
+                                        let category_name = group.name.clone();
+                                        let checked_category = group.name.clone();
+                                        let input_category = if group.name == UNCATEGORIZED_TAG_CATEGORY {
+                                            String::new()
+                                        } else {
+                                            group.name.clone()
+                                        };
+                                        view! {
+                                            <button
+                                                class="template-tag-category"
+                                                class:is-active=move || ui_state.with(|state| state.selected_category == checked_category)
+                                                on:click=move |_| {
+                                                    ui_state.update(|state| {
+                                                        state.selected_category = category_name.clone();
+                                                        state.new_category = input_category.clone();
+                                                        state.search.clear();
+                                                        state.feedback = None;
+                                                    });
+                                                }
+                                            >
+                                                <span>{group.name}</span>
+                                                <small>{group.tags.len()}</small>
+                                            </button>
+                                        }
+                                    }
+                                />
+                            </nav>
+                            <div class="template-tag-options">
+                                <For
+                                    each=move || visible_gallery_tags(
+                                        &merged_editor_tag_summaries(&available_tags.get(), &current_editor_tags(editor)),
+                                        Some(ui_state.with(|state| state.selected_category.clone()).as_str()),
+                                        &ui_state.with(|state| state.search.clone()),
+                                    )
+                                    key=|tag| tag.name.clone()
+                                    children=move |tag| {
+                                        let tag_name = tag.name.clone();
+                                        let selected_for_class = tag.name.clone();
+                                        let selected_for_disabled = tag.name.clone();
+                                        let usage = if tag.template_count == 0 {
+                                            "新".to_string()
+                                        } else {
+                                            tag.template_count.to_string()
+                                        };
+                                        view! {
+                                            <button
+                                                class="template-tag-option"
+                                                class:is-active=move || editor_has_tag(editor, &selected_for_class)
+                                                disabled=move || {
+                                                    editor_tag_count(editor) >= MAX_TEMPLATE_TAGS
+                                                        && !editor_has_tag(editor, &selected_for_disabled)
+                                                }
+                                                on:click=move |_| {
+                                                    let result = toggle_editor_tag(editor, &tag_name).err();
+                                                    ui_state.update(|state| state.feedback = result);
+                                                }
+                                            >
+                                                <span>{gallery_tag_label(&tag.name).to_string()}</span>
+                                                <small>{usage}</small>
+                                            </button>
+                                        }
+                                    }
+                                />
+                                <Show when=move || visible_gallery_tags(
+                                    &merged_editor_tag_summaries(&available_tags.get(), &current_editor_tags(editor)),
+                                    Some(ui_state.with(|state| state.selected_category.clone()).as_str()),
+                                    &ui_state.with(|state| state.search.clone()),
+                                ).is_empty()>
+                                    <p class="template-tag-empty">"当前分类中没有匹配的标签"</p>
+                                </Show>
+                            </div>
+                        </div>
+
+                        <div class="template-editor-new-tag">
+                            <label>
+                                <span>"分类（可选）"</span>
+                                <input
+                                    class="text-input"
+                                    placeholder="留空即未分类"
+                                    prop:value=move || ui_state.with(|state| state.new_category.clone())
+                                    on:input=move |event| ui_state.update(|state| state.new_category = event_target_value(&event))
+                                />
+                            </label>
+                            <label>
+                                <span>"新标签"</span>
+                                <textarea
+                                    class="text-input"
+                                    rows="1"
+                                    placeholder="输入标签；可用逗号、顿号、分号或换行批量添加"
+                                    prop:value=move || ui_state.with(|state| state.new_tag_input.clone())
+                                    on:input=move |event| ui_state.update(|state| state.new_tag_input = event_target_value(&event))
+                                    on:keydown=move |event: web_sys::KeyboardEvent| {
+                                        if should_submit_editor_tag(
+                                            &event.key(),
+                                            event.shift_key(),
+                                            event.is_composing(),
+                                        ) {
+                                            event.prevent_default();
+                                            submit_editor_tag_input(editor, ui_state);
+                                        }
+                                    }
+                                ></textarea>
+                            </label>
+                            <button
+                                class="button primary template-editor-new-tag-submit"
+                                disabled=move || {
+                                    ui_state.with(|state| state.new_tag_input.trim().is_empty())
+                                        || editor_tag_count(editor) >= MAX_TEMPLATE_TAGS
+                                }
+                                on:click=move |_| submit_editor_tag_input(editor, ui_state)
+                            >
+                                <MaterialSymbolIcon name="add" filled=false />
+                                "添加"
+                            </button>
+                        </div>
+
+                        <Show when=move || loading.get()>
+                            <p class="template-editor-tag-note">"正在加载已有标签……"</p>
+                        </Show>
+                        {move || load_error.get().map(|error| view! {
+                            <p class="template-editor-tag-note is-error">{error}</p>
+                        })}
+                        {move || ui_state.with(|state| state.feedback.clone()).map(|notice| view! {
+                            <p class="template-editor-tag-note is-error">{notice}</p>
+                        })}
+
+                        <footer class="template-editor-tag-dialog-actions">
+                            <span>{move || format!("已选 {} / {MAX_TEMPLATE_TAGS}", editor_tag_count(editor))}</span>
+                            <button class="button primary" on:click=move |_| picker_open.set(false)>"完成"</button>
+                        </footer>
+                    </section>
+                </div>
+            </Portal>
+        </Show>
+    }
+}
+
+fn current_editor_tags(editor: RwSignal<Option<TemplateEditorDraft>>) -> Vec<String> {
+    editor.with(|draft| {
+        draft
+            .as_ref()
+            .map(|draft| draft.tags.clone())
+            .unwrap_or_default()
+    })
+}
+
+fn editor_tag_count(editor: RwSignal<Option<TemplateEditorDraft>>) -> usize {
+    editor.with(|draft| draft.as_ref().map_or(0, |draft| draft.tags.len()))
+}
+
+fn editor_tag_key(tag: &str) -> String {
+    tag.trim().to_lowercase()
+}
+
+fn editor_has_tag(editor: RwSignal<Option<TemplateEditorDraft>>, tag: &str) -> bool {
+    let expected = editor_tag_key(tag);
+    editor.with(|draft| {
+        draft.as_ref().is_some_and(|draft| {
+            draft
+                .tags
+                .iter()
+                .any(|current| editor_tag_key(current) == expected)
+        })
+    })
+}
+
+fn merged_editor_tag_summaries(
+    available_tags: &[GalleryTagSummary],
+    selected_tags: &[String],
+) -> Vec<GalleryTagSummary> {
+    let mut merged = BTreeMap::<String, GalleryTagSummary>::new();
+    for tag in available_tags {
+        merged.insert(editor_tag_key(&tag.name), tag.clone());
+    }
+    for tag in selected_tags {
+        merged
+            .entry(editor_tag_key(tag))
+            .or_insert_with(|| GalleryTagSummary {
+                name: tag.clone(),
+                template_count: 0,
+            });
+    }
+    merged.into_values().collect()
+}
+
+fn editor_tag_groups(
+    available_tags: &[GalleryTagSummary],
+    selected_tags: &[String],
+) -> Vec<GalleryTagGroup> {
+    let mut groups =
+        group_gallery_tags(&merged_editor_tag_summaries(available_tags, selected_tags));
+    let uncategorized_index = groups
+        .iter()
+        .position(|group| group.name == UNCATEGORIZED_TAG_CATEGORY);
+    let uncategorized = uncategorized_index
+        .map(|index| groups.remove(index))
+        .unwrap_or_else(|| GalleryTagGroup {
+            name: UNCATEGORIZED_TAG_CATEGORY.to_string(),
+            tags: Vec::new(),
+        });
+    groups.insert(0, uncategorized);
+    groups
+}
+
+fn toggle_editor_tag(
+    editor: RwSignal<Option<TemplateEditorDraft>>,
+    tag: &str,
+) -> Result<(), String> {
+    let expected = editor_tag_key(tag);
+    let mut result = Ok(());
+    editor.update(|draft| {
+        let Some(draft) = draft else {
+            result = Err("模板编辑器已关闭。".to_string());
+            return;
+        };
+        if let Some(index) = draft
+            .tags
+            .iter()
+            .position(|current| editor_tag_key(current) == expected)
+        {
+            draft.tags.remove(index);
+            return;
+        }
+        if draft.tags.len() >= MAX_TEMPLATE_TAGS {
+            result = Err(format!("每个模板最多使用 {MAX_TEMPLATE_TAGS} 个标签。"));
+            return;
+        }
+        draft.tags.push(tag.to_string());
+    });
+    result
+}
+
+fn remove_editor_tag(editor: RwSignal<Option<TemplateEditorDraft>>, tag: &str) {
+    let expected = editor_tag_key(tag);
+    editor.update(|draft| {
+        if let Some(draft) = draft {
+            draft
+                .tags
+                .retain(|current| editor_tag_key(current) != expected);
+        }
+    });
+}
+
+fn submit_editor_tag_input(
+    editor: RwSignal<Option<TemplateEditorDraft>>,
+    ui_state: RwSignal<TemplateEditorTagUiState>,
+) {
+    let current = current_editor_tags(editor);
+    let (new_category, new_tag_input) =
+        ui_state.with_untracked(|state| (state.new_category.clone(), state.new_tag_input.clone()));
+    let result = build_editor_tags(&new_category, &new_tag_input, &current);
+    let additions = match result {
+        Ok(additions) => additions,
+        Err(error) => {
+            ui_state.update(|state| state.feedback = Some(error));
+            return;
+        }
+    };
+    let first_category = gallery_tag_parts(&additions[0]).0.to_string();
+    editor.update(|draft| {
+        if let Some(draft) = draft {
+            draft.tags.extend(additions);
+        }
+    });
+    ui_state.update(|state| {
+        state.selected_category = first_category.clone();
+        state.new_category = if first_category == UNCATEGORIZED_TAG_CATEGORY {
+            String::new()
+        } else {
+            first_category
+        };
+        state.new_tag_input.clear();
+        state.feedback = None;
+    });
+}
+
+fn build_editor_tags(
+    category_input: &str,
+    tag_input: &str,
+    existing_tags: &[String],
+) -> Result<Vec<String>, String> {
+    let default_category = normalize_editor_category(category_input)?;
+    let mut known = existing_tags
+        .iter()
+        .map(|tag| editor_tag_key(tag))
+        .collect::<HashSet<_>>();
+    let mut additions = Vec::new();
+    for value in tag_input.split(is_editor_tag_batch_separator) {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let (category, label) = parse_editor_tag_path(value, default_category)?;
+        let path = category
+            .map(|category| format!("{category}/{label}"))
+            .unwrap_or_else(|| label.to_string())
+            .to_lowercase();
+        if path.chars().count() > MAX_TEMPLATE_TAG_CHARS {
+            return Err(format!(
+                "标签“{path}”超过 {MAX_TEMPLATE_TAG_CHARS} 个字符。"
+            ));
+        }
+        if known.insert(editor_tag_key(&path)) {
+            additions.push(path);
+        }
+    }
+    if additions.is_empty() {
+        return Err(if tag_input.trim().is_empty() {
+            "请输入至少一个标签。".to_string()
+        } else {
+            "输入的标签已经全部添加。".to_string()
+        });
+    }
+    if existing_tags.len().saturating_add(additions.len()) > MAX_TEMPLATE_TAGS {
+        return Err(format!(
+            "添加后将超过每个模板 {MAX_TEMPLATE_TAGS} 个标签的限制。"
+        ));
+    }
+    Ok(additions)
+}
+
+fn normalize_editor_category(value: &str) -> Result<Option<&str>, String> {
+    let value = value.trim();
+    if value.is_empty() || value == UNCATEGORIZED_TAG_CATEGORY {
+        return Ok(None);
+    }
+    validate_editor_tag_component("分类", value)?;
+    Ok(Some(value))
+}
+
+fn parse_editor_tag_path<'a>(
+    value: &'a str,
+    default_category: Option<&'a str>,
+) -> Result<(Option<&'a str>, &'a str), String> {
+    let separator_count = value.chars().filter(|ch| matches!(ch, '/' | '／')).count();
+    if separator_count > 1 {
+        return Err(format!("标签“{value}”只能包含一级分类。"));
+    }
+    if separator_count == 1 {
+        let separator = value.find(['/', '／']).unwrap_or_default();
+        let category = value[..separator].trim();
+        let label = value[separator..].trim_start_matches(['/', '／']).trim();
+        if category.is_empty() || label.is_empty() {
+            return Err(format!("标签路径“{value}”不完整。"));
+        }
+        validate_editor_tag_component("分类", category)?;
+        validate_editor_tag_component("标签", label)?;
+        return Ok((Some(category), label));
+    }
+    validate_editor_tag_component("标签", value)?;
+    Ok((default_category, value))
+}
+
+fn validate_editor_tag_component(label: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|ch| {
+        matches!(
+            ch,
+            '/' | '／' | ',' | '，' | '、' | ';' | '；' | '\r' | '\n'
+        )
+    }) {
+        return Err(format!("{label}不能包含斜杠、逗号、顿号、分号或换行。"));
+    }
+    Ok(())
+}
+
+fn is_editor_tag_batch_separator(ch: char) -> bool {
+    matches!(ch, ',' | '，' | '、' | ';' | '；' | '\r' | '\n')
+}
+
+fn should_submit_editor_tag(key: &str, shift_key: bool, is_composing: bool) -> bool {
+    key == "Enter" && !shift_key && !is_composing
 }
 
 #[component]
@@ -1487,7 +2057,7 @@ fn default_editor_draft(workspace: WorkspaceState, composer: ComposerState) -> T
         title: String::new(),
         prompt: composer.draft_prompt.get_untracked(),
         description: String::new(),
-        tags: String::new(),
+        tags: Vec::new(),
         recommended_provider_kind: config
             .as_ref()
             .map(|config| config.provider_kind)
@@ -1530,13 +2100,7 @@ fn editor_request(draft: &TemplateEditorDraft) -> GalleryTemplateUpsertRequest {
         title: draft.title.clone(),
         prompt: draft.prompt.clone(),
         description: draft.description.clone(),
-        tags: draft
-            .tags
-            .split([',', '，'])
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .map(str::to_string)
-            .collect(),
+        tags: draft.tags.clone(),
         generation_settings,
         recommended_provider_kind: draft.recommended_provider_kind,
         recommended_model: draft.recommended_model.clone(),
@@ -2158,6 +2722,37 @@ mod tests {
         }
     }
 
+    fn template_with_tags(tags: Vec<String>) -> GalleryTemplate {
+        GalleryTemplate {
+            id: "template".into(),
+            title: "标题".into(),
+            prompt: "提示词".into(),
+            description: String::new(),
+            tags,
+            generation_settings: GenerationSettingsSnapshot {
+                width: 1024,
+                height: 1024,
+                quality: None,
+                count: 1,
+                endpoint_mode: ProviderEndpointMode::ImagesApi,
+                output_format: Some("png".into()),
+                output_compression: None,
+                background: None,
+                moderation: None,
+                responses_model: None,
+            },
+            recommended_provider_kind: ProviderKind::OpenAiImage,
+            recommended_model: "gpt-image-2".into(),
+            preview_assets: Vec::new(),
+            reference_assets: Vec::new(),
+            status: GalleryTemplateStatus::Draft,
+            like_count: 0,
+            liked_by_viewer: false,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
     #[test]
     fn gallery_tags_are_grouped_by_category_path() {
         let groups = group_gallery_tags(&[
@@ -2187,6 +2782,65 @@ mod tests {
         let visible = visible_gallery_tags(&tags, Some("风格"), "写实");
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].name, "风格/写实");
+    }
+
+    #[test]
+    fn editor_tags_support_categories_chinese_separators_and_spaces() {
+        let tags =
+            build_editor_tags("风格", "二次元，concept art、厚涂；\n风格／水彩", &[]).unwrap();
+
+        assert_eq!(
+            tags,
+            ["风格/二次元", "风格/concept art", "风格/厚涂", "风格/水彩"]
+        );
+    }
+
+    #[test]
+    fn editor_tags_keep_uncategorized_values_and_ignore_duplicates() {
+        let tags = build_editor_tags(
+            "",
+            "人物 立绘，风格/写实，构图／特写",
+            &["风格/写实".into()],
+        )
+        .unwrap();
+
+        assert_eq!(tags, ["人物 立绘", "构图/特写"]);
+    }
+
+    #[test]
+    fn editor_tag_validation_matches_backend_limits() {
+        let existing = (0..MAX_TEMPLATE_TAGS)
+            .map(|index| format!("标签{index}"))
+            .collect::<Vec<_>>();
+        assert!(build_editor_tags("", "新增", &existing).is_err());
+        assert!(build_editor_tags("分类", &"字".repeat(30), &[]).is_err());
+        assert!(build_editor_tags("错误/分类", "标签", &[]).is_err());
+        assert!(build_editor_tags("", "分类/多/层", &[]).is_err());
+    }
+
+    #[test]
+    fn editor_tag_groups_include_current_draft_and_uncategorized() {
+        let groups =
+            editor_tag_groups(&[tag("风格/写实", 2)], &["构图/特写".into(), "人物".into()]);
+
+        assert_eq!(groups[0].name, UNCATEGORIZED_TAG_CATEGORY);
+        assert!(groups.iter().any(|group| group.name == "构图"));
+    }
+
+    #[test]
+    fn editor_tag_enter_ignores_ime_composition_and_shift_enter() {
+        assert!(should_submit_editor_tag("Enter", false, false));
+        assert!(!should_submit_editor_tag("Enter", false, true));
+        assert!(!should_submit_editor_tag("Enter", true, false));
+        assert!(!should_submit_editor_tag("Space", false, false));
+    }
+
+    #[test]
+    fn editor_request_preserves_existing_tag_order_without_reparsing() {
+        let original_tags = vec!["风格/写实".into(), "人物 立绘".into(), "旧/多/层".into()];
+        let draft = TemplateEditorDraft::from_template(template_with_tags(original_tags.clone()));
+
+        assert_eq!(editor_request(&draft).tags, original_tags);
     }
 
     #[test]

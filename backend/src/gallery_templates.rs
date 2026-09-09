@@ -66,6 +66,7 @@ pub fn routes(max_asset_bytes: usize, max_archive_bytes: usize) -> Router<Arc<Ap
             post(like_template).delete(unlike_template),
         )
         .route("/api/gallery/tags", get(list_tags))
+        .route("/api/admin/gallery/tags", get(list_admin_tags))
         .route("/api/gallery/assets/{asset_id}", get(get_gallery_asset))
         .route(
             "/api/gallery/assets/{asset_id}/thumbnail",
@@ -331,20 +332,42 @@ async fn get_template(
 async fn list_tags(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<GalleryTagSummary>>, AppError> {
-    let rows = sqlx::query(
+    Ok(Json(load_tag_summaries(&state.db, true).await?))
+}
+
+async fn list_admin_tags(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<Vec<GalleryTagSummary>>, AppError> {
+    require_admin(&state, &session).await?;
+    Ok(Json(load_tag_summaries(&state.db, false).await?))
+}
+
+async fn load_tag_summaries(
+    db: &SqlitePool,
+    published_only: bool,
+) -> Result<Vec<GalleryTagSummary>, AppError> {
+    let query = if published_only {
         "SELECT gtt.tag_name, COUNT(DISTINCT gtt.template_id) AS template_count
          FROM gallery_template_tags gtt JOIN gallery_templates gt ON gt.id = gtt.template_id
-         WHERE gt.status = 'published' GROUP BY gtt.tag_name ORDER BY template_count DESC, gtt.tag_name ASC",
-    )
-    .fetch_all(&state.db).await.map_err(AppError::internal)?;
-    Ok(Json(
-        rows.into_iter()
-            .map(|row| GalleryTagSummary {
-                name: row.get("tag_name"),
-                template_count: row.get::<i64, _>("template_count").max(0) as u64,
-            })
-            .collect(),
-    ))
+         WHERE gt.status = 'published'
+         GROUP BY gtt.tag_name ORDER BY template_count DESC, gtt.tag_name ASC"
+    } else {
+        "SELECT gtt.tag_name, COUNT(DISTINCT gtt.template_id) AS template_count
+         FROM gallery_template_tags gtt
+         GROUP BY gtt.tag_name ORDER BY template_count DESC, gtt.tag_name ASC"
+    };
+    let rows = sqlx::query(query)
+        .fetch_all(db)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| GalleryTagSummary {
+            name: row.get("tag_name"),
+            template_count: row.get::<i64, _>("template_count").max(0) as u64,
+        })
+        .collect())
 }
 
 async fn get_gallery_asset(
@@ -2106,8 +2129,33 @@ mod tests {
         let draft_match = test_template(new_id(), "draft match", GalleryTemplateStatus::Draft);
         insert_test_template(&db, &published_match, &["portrait", "night"]).await;
         insert_test_template(&db, &published_partial, &["portrait"]).await;
-        insert_test_template(&db, &draft_match, &["portrait", "night"]).await;
+        insert_test_template(&db, &draft_match, &["portrait", "night", "状态/草稿专用"]).await;
         let tags = vec!["portrait".to_string(), "night".to_string()];
+
+        let public_tags = load_tag_summaries(&db, true).await.unwrap();
+        let admin_tags = load_tag_summaries(&db, false).await.unwrap();
+        assert_eq!(
+            public_tags
+                .iter()
+                .find(|tag| tag.name == "portrait")
+                .map(|tag| tag.template_count),
+            Some(2)
+        );
+        assert_eq!(
+            admin_tags
+                .iter()
+                .find(|tag| tag.name == "portrait")
+                .map(|tag| tag.template_count),
+            Some(3)
+        );
+        assert!(public_tags.iter().all(|tag| tag.name != "状态/草稿专用"));
+        assert_eq!(
+            admin_tags
+                .iter()
+                .find(|tag| tag.name == "状态/草稿专用")
+                .map(|tag| tag.template_count),
+            Some(1)
+        );
 
         let public_rows = fetch_template_list_rows(
             &db,
