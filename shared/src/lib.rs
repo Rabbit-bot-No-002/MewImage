@@ -1507,11 +1507,66 @@ pub enum GalleryImportMode {
     Replace,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryImportConflict {
+    KeepLocal,
+    #[default]
+    Overwrite,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GalleryExportScope {
+    Backup,
+    #[default]
+    Share,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GalleryExportFilter {
+    pub scope: GalleryExportScope,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub uncategorized: bool,
+    #[serde(default)]
+    pub statuses: Vec<GalleryTemplateStatus>,
+}
+
+impl Default for GalleryExportFilter {
+    fn default() -> Self {
+        Self {
+            scope: GalleryExportScope::Share,
+            categories: Vec::new(),
+            tags: Vec::new(),
+            uncategorized: false,
+            statuses: vec![GalleryTemplateStatus::Published],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GalleryExportPreview {
+    pub template_count: usize,
+    pub asset_count: usize,
+    pub asset_byte_len: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GalleryImportResponse {
     pub imported_template_count: usize,
     pub imported_asset_count: usize,
     pub mode: GalleryImportMode,
+    #[serde(default)]
+    pub added_template_count: usize,
+    #[serde(default)]
+    pub overwritten_template_count: usize,
+    #[serde(default)]
+    pub skipped_template_count: usize,
 }
 
 /// 成功任务的图片本体由 ImageAssetRef 管理，任务中只保留结果数量和参数快照。

@@ -3357,6 +3357,37 @@ body[data-theme="night"] .gallery-card-compact:focus-within::after {
   gap: 8px;
 }
 
+.template-transfer-fields {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.template-export-statuses label,
+.template-export-category-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.template-export-category-row .template-tag-category { min-width: 0; }
+.template-export-category-row input { flex: 0 0 auto; }
+.template-export-selection,
+.template-export-summary { overflow-wrap: anywhere; font-size: 13px; color: var(--floating-muted); }
+.template-export-dialog input[type="checkbox"] { accent-color: var(--primary); }
+body[data-visual-theme][data-color-scheme] .template-export-dialog .button.secondary.is-active,
+body[data-visual-theme][data-color-scheme] .template-export-dialog .button.secondary.is-active:hover {
+  color: var(--text);
+  background: var(--floating-active);
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+.template-export-dialog .template-tag-option:disabled.is-active { opacity: 1; }
+.template-export-dialog footer .button { flex-shrink: 0; }
+
 .template-editor-tags-header,
 .template-editor-tag-dialog-header,
 .template-editor-tag-dialog-actions {

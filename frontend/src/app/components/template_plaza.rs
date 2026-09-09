@@ -16,10 +16,7 @@ use mew_image_shared::{
 };
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    Blob, BlobPropertyBag, Event, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement,
-    MouseEvent,
-};
+use web_sys::{Blob, Event, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement, MouseEvent};
 
 use crate::app::{
     FAVORITE_ARCHIVE_ASSET_KEY, asset_src, bytes_to_data_url, ensure_asset_display_sources_loaded,
@@ -29,6 +26,10 @@ use crate::app::{
 use crate::{api::api_url, storage::apply_asset_payload_changes};
 
 use super::common::{FullscreenImageViewer, MaterialSymbolIcon, PaginationControls};
+
+#[path = "template_transfer.rs"]
+mod transfer;
+use transfer::TemplateExportDialog;
 
 const PREVIEW_MAX_EDGE: u32 = 2_048;
 const REFERENCE_MAX_EDGE: u32 = 4_096;
@@ -216,6 +217,9 @@ pub(crate) fn TemplatePlaza(
     let editor_busy = RwSignal::new(false);
     let import_input = NodeRef::<leptos::html::Input>::new();
     let export_confirm = RwSignal::new(false);
+    let export_busy = RwSignal::new(false);
+    let import_confirm = RwSignal::new(false);
+    let import_overwrite = RwSignal::new(false);
     let replace_confirm_stage = RwSignal::new(0u8);
 
     let is_admin = Memo::new(move |_| {
@@ -377,7 +381,14 @@ pub(crate) fn TemplatePlaza(
             replace_confirm_stage.set(0);
             true
         } else if export_confirm.get_untracked() {
-            export_confirm.set(false);
+            if !export_busy.get_untracked() {
+                export_confirm.set(false);
+            }
+            true
+        } else if import_confirm.get_untracked() {
+            if !editor_busy.get_untracked() {
+                import_confirm.set(false);
+            }
             true
         } else if editor_tag_picker_open.get_untracked() {
             editor_tag_picker_open.set(false);
@@ -825,31 +836,6 @@ pub(crate) fn TemplatePlaza(
         editor_tag_ui.set(TemplateEditorTagUiState::for_tags(&draft.tags));
         editor.set(Some(draft));
     };
-    let export_templates = move || {
-        spawn_local(async move {
-            message.set(Some("正在导出模板广场……".into()));
-            match Request::get(&api_url("/api/admin/gallery/export"))
-                .credentials(web_sys::RequestCredentials::Include)
-                .send()
-                .await
-            {
-                Ok(response) if response.ok() => match response.binary().await {
-                    Ok(bytes) => {
-                        if let Err(error) =
-                            download_bytes(&bytes, "application/zip", "mew-gallery.zip")
-                        {
-                            message.set(Some(error));
-                        } else {
-                            message.set(Some("模板广场已导出。".into()));
-                        }
-                    }
-                    Err(error) => message.set(Some(error.to_string())),
-                },
-                Ok(response) => message.set(Some(response_error(response).await)),
-                Err(error) => message.set(Some(error.to_string())),
-            }
-        });
-    };
 
     let import_archive = move |event: Event| {
         let input = event_target::<HtmlInputElement>(&event);
@@ -862,10 +848,28 @@ pub(crate) fn TemplatePlaza(
         } else {
             GalleryImportMode::Merge
         };
+        let overwrite = import_overwrite.get_untracked();
         spawn_local(async move {
             editor_busy.set(true);
+            if mode == GalleryImportMode::Merge {
+                match fetch_json::<serde_json::Value>("/api/health").await {
+                    Ok(health) if transfer::supports_import_conflict(&health) => {}
+                    _ => {
+                        message.set(Some(
+                            "当前后端不支持导入冲突策略，请更新并重启后端后重试。".into(),
+                        ));
+                        editor_busy.set(false);
+                        return;
+                    }
+                }
+            }
             let path = match mode {
-                GalleryImportMode::Merge => "/api/admin/gallery/import?mode=merge",
+                GalleryImportMode::Merge if overwrite => {
+                    "/api/admin/gallery/import?mode=merge&conflict=overwrite"
+                }
+                GalleryImportMode::Merge => {
+                    "/api/admin/gallery/import?mode=merge&conflict=keep_local"
+                }
                 GalleryImportMode::Replace => "/api/admin/gallery/import?mode=replace",
             };
             let request = match Request::post(&api_url(path))
@@ -884,8 +888,10 @@ pub(crate) fn TemplatePlaza(
                     match response.json::<GalleryImportResponse>().await {
                         Ok(result) => {
                             message.set(Some(format!(
-                                "已导入 {} 个模板和 {} 个资源。",
-                                result.imported_template_count, result.imported_asset_count
+                                "已新增 {} 个、覆盖 {} 个、跳过 {} 个模板。",
+                                result.added_template_count,
+                                result.overwritten_template_count,
+                                result.skipped_template_count
                             )));
                             page.set(1);
                             reload_trigger.update(|value| *value = value.saturating_add(1));
@@ -897,6 +903,7 @@ pub(crate) fn TemplatePlaza(
                 Err(error) => message.set(Some(error.to_string())),
             }
             replace_confirm_stage.set(0);
+            import_confirm.set(false);
             editor_busy.set(false);
         });
     };
@@ -911,12 +918,13 @@ pub(crate) fn TemplatePlaza(
                             <button class="button ghost icon-button template-admin-create" title="新建模板" aria-label="新建模板" on:click=new_editor>
                                 <MaterialSymbolIcon name="add" filled=false />
                             </button>
-                            <button class="button ghost icon-button template-admin-export" title="导出全部模板" aria-label="导出全部模板" on:click=move |_| export_confirm.set(true)>
+                            <button class="button ghost icon-button template-admin-export" title="导出模板" aria-label="导出模板" disabled=move || export_busy.get() on:click=move |_| export_confirm.set(true)>
                                 <MaterialSymbolIcon name="download" filled=false />
                             </button>
                             <button class="button ghost icon-button template-admin-import" title="合并导入模板" aria-label="合并导入模板" on:click=move |_| {
                                 replace_confirm_stage.set(0);
-                                if let Some(input) = import_input.get() { input.click(); }
+                                import_overwrite.set(false);
+                                import_confirm.set(true);
                             }>
                                 <MaterialSymbolIcon name="upload" filled=false />
                             </button>
@@ -1354,18 +1362,21 @@ pub(crate) fn TemplatePlaza(
         })}
 
         <Show when=move || export_confirm.get()>
-            <div class="modal-backdrop" on:click=move |_| export_confirm.set(false)>
-                <div class="panel confirm-dialog" on:click=move |event| event.stop_propagation()>
-                    <h3>"导出全部模板"</h3>
-                    <p>"将导出模板广场中的草稿、已发布和已归档模板，以及关联的预览图和参考图。是否继续？"</p>
+            <TemplateExportDialog open=export_confirm busy=export_busy tags=admin_available_tags tags_loading=admin_tags_loading tags_error=admin_tags_error reload=reload_trigger message />
+        </Show>
+        <Show when=move || import_confirm.get()>
+            <div class="modal-backdrop" on:click=move |_| { if !editor_busy.get_untracked() { import_confirm.set(false); } }>
+                <section class="panel confirm-dialog" on:click=move |event| event.stop_propagation()>
+                    <h3>"合并导入模板"</h3>
+                    <p>"新增模板正常导入；遇到相同 UUID 的模板时："</p>
+                    <label><input type="radio" name="gallery-conflict" prop:checked=move || !import_overwrite.get() disabled=move || editor_busy.get() on:change=move |_| import_overwrite.set(false) />"保留本地版本（跳过包内同 ID 模板）"</label>
+                    <label><input type="radio" name="gallery-conflict" prop:checked=move || import_overwrite.get() disabled=move || editor_busy.get() on:change=move |_| import_overwrite.set(true) />"使用包内版本（覆盖本地同 ID 模板）"</label>
+                    <p>"包外模板和现有点赞保留；图片及生成参数一同导入。"</p>
                     <div class="row">
-                        <button class="button ghost" on:click=move |_| export_confirm.set(false)>"取消"</button>
-                        <button class="button primary" on:click=move |_| {
-                            export_confirm.set(false);
-                            export_templates();
-                        }>"确认导出"</button>
+                        <button class="button ghost" disabled=move || editor_busy.get() on:click=move |_| import_confirm.set(false)>"取消"</button>
+                        <button class="button primary" disabled=move || editor_busy.get() on:click=move |_| { if let Some(input) = import_input.get() { input.click(); } }>{move || if editor_busy.get() { "正在导入…" } else { "选择 ZIP 并导入" }}</button>
                     </div>
-                </div>
+                </section>
             </div>
         </Show>
 
@@ -1373,7 +1384,7 @@ pub(crate) fn TemplatePlaza(
             <div class="modal-backdrop" on:click=move |_| replace_confirm_stage.set(0)>
                 <div class="panel confirm-dialog" on:click=move |event| event.stop_propagation()>
                     <h3>"全量替换模板广场"</h3>
-                    <p>{move || if replace_confirm_stage.get() == 1 { "导入成功后，包外模板及全部点赞会被清除。请再次确认。" } else { "这是最后一步确认。现有模板资源将在完整校验成功后被替换。" }}</p>
+                    <p>{move || if replace_confirm_stage.get() == 1 { "即使导入的是分类包，也会替换整个广场，包外模板及全部点赞会被清除。请再次确认。" } else { "这是最后一步确认。现有模板资源将在完整校验成功后被替换。" }}</p>
                     <div class="row"><button class="button ghost" on:click=move |_| replace_confirm_stage.set(0)>"取消"</button>
                     <button class="button danger" on:click=move |_| {
                         if replace_confirm_stage.get_untracked() == 1 { replace_confirm_stage.set(2); }
@@ -2683,32 +2694,6 @@ fn template_id_from_location() -> Option<String> {
         .find_map(|part| part.strip_prefix("template="))
         .filter(|value| uuid::Uuid::parse_str(value).is_ok())
         .map(str::to_string)
-}
-
-fn download_bytes(bytes: &[u8], mime: &str, file_name: &str) -> Result<(), String> {
-    let window = web_sys::window().ok_or_else(|| "浏览器窗口不可用。".to_string())?;
-    let document = window
-        .document()
-        .ok_or_else(|| "浏览器文档不可用。".to_string())?;
-    let array = js_sys::Uint8Array::from(bytes);
-    let parts = js_sys::Array::new();
-    parts.push(&array.buffer());
-    let options = BlobPropertyBag::new();
-    options.set_type(mime);
-    let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &options)
-        .map_err(|error| format!("创建下载文件失败：{error:?}"))?;
-    let url = web_sys::Url::create_object_url_with_blob(&blob)
-        .map_err(|error| format!("创建下载地址失败：{error:?}"))?;
-    let anchor: HtmlAnchorElement = document
-        .create_element("a")
-        .map_err(|error| format!("创建下载按钮失败：{error:?}"))?
-        .dyn_into()
-        .map_err(|_| "下载按钮类型错误。".to_string())?;
-    anchor.set_href(&url);
-    anchor.set_download(file_name);
-    anchor.click();
-    let _ = web_sys::Url::revoke_object_url(&url);
-    Ok(())
 }
 
 #[cfg(test)]

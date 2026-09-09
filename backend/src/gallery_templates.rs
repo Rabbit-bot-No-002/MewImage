@@ -18,7 +18,8 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use image::{ImageFormat, ImageReader};
 use mew_image_shared::{
-    GalleryAsset, GalleryAssetRole, GalleryImportMode, GalleryImportResponse, GalleryLikeResponse,
+    GalleryAsset, GalleryAssetRole, GalleryExportFilter, GalleryExportPreview, GalleryExportScope,
+    GalleryImportConflict, GalleryImportMode, GalleryImportResponse, GalleryLikeResponse,
     GalleryTagSummary, GalleryTemplate, GalleryTemplateListResponse, GalleryTemplateStatus,
     GalleryTemplateUpsertRequest, new_id, now_rfc3339,
 };
@@ -85,7 +86,14 @@ pub fn routes(max_asset_bytes: usize, max_archive_bytes: usize) -> Router<Arc<Ap
             "/api/admin/gallery/assets/{asset_id}",
             delete(delete_gallery_asset),
         )
-        .route("/api/admin/gallery/export", get(export_gallery_archive))
+        .route(
+            "/api/admin/gallery/export",
+            get(export_gallery_archive).post(export_filtered_archive),
+        )
+        .route(
+            "/api/admin/gallery/export-preview",
+            post(preview_gallery_export),
+        )
         .route(
             "/api/admin/gallery/import",
             post(import_gallery_archive).layer(DefaultBodyLimit::max(max_archive_bytes)),
@@ -873,6 +881,7 @@ struct GalleryArchiveAsset {
 #[derive(Debug, Deserialize, Default)]
 struct ImportModeQuery {
     mode: Option<GalleryImportMode>,
+    conflict: Option<GalleryImportConflict>,
 }
 
 struct TemporaryPath(PathBuf);
@@ -897,28 +906,147 @@ async fn export_gallery_archive(
     session: Session,
 ) -> Result<Response, AppError> {
     require_admin(&state, &session).await?;
-    let _gallery_guard = state.gallery_write_lock.lock().await;
-    let rows = sqlx::query(
-        "SELECT gt.*, 0 AS like_count, 0 AS liked_by_viewer FROM gallery_templates gt ORDER BY gt.created_at",
+    export_gallery_selection(
+        &state,
+        &GalleryExportFilter {
+            scope: GalleryExportScope::Backup,
+            ..Default::default()
+        },
     )
-    .fetch_all(&state.db)
     .await
-    .map_err(AppError::internal)?;
+}
+
+async fn export_filtered_archive(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(filter): Json<GalleryExportFilter>,
+) -> Result<Response, AppError> {
+    require_admin(&state, &session).await?;
+    export_gallery_selection(&state, &normalize_export_filter(filter)?).await
+}
+
+async fn preview_gallery_export(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(filter): Json<GalleryExportFilter>,
+) -> Result<Json<GalleryExportPreview>, AppError> {
+    require_admin(&state, &session).await?;
+    let filter = normalize_export_filter(filter)?;
+    let _guard = state.gallery_write_lock.lock().await;
+    let (templates, assets) = load_export_selection(&state.db, &filter).await?;
+    Ok(Json(GalleryExportPreview {
+        template_count: templates.len(),
+        asset_count: assets.len(),
+        asset_byte_len: assets
+            .iter()
+            .map(|row| row.get::<i64, _>("byte_len").max(0) as u64)
+            .sum(),
+    }))
+}
+
+fn normalize_export_filter(
+    mut filter: GalleryExportFilter,
+) -> Result<GalleryExportFilter, AppError> {
+    let mut statuses = Vec::with_capacity(3);
+    for status in filter.statuses.drain(..) {
+        if !statuses.contains(&status) {
+            statuses.push(status);
+        }
+    }
+    filter.statuses = statuses;
+    for values in [&mut filter.categories, &mut filter.tags] {
+        for value in values.iter_mut() {
+            *value = value.trim().to_lowercase();
+            if value.is_empty() || value.chars().count() > MAX_TAG_CHARS {
+                return Err(AppError::bad_request("分类和标签必须为 1–32 个字符。"));
+            }
+        }
+        values.sort();
+        values.dedup();
+    }
+    if filter.categories.len() + filter.tags.len() + usize::from(filter.uncategorized) > 256 {
+        return Err(AppError::bad_request("最多选择 256 个分类或标签。"));
+    }
+    if filter.scope == GalleryExportScope::Share
+        && (filter.statuses.is_empty()
+            || (filter.categories.is_empty() && filter.tags.is_empty() && !filter.uncategorized))
+    {
+        return Err(AppError::bad_request(
+            "请选择至少一个分类或标签，以及一种模板状态。",
+        ));
+    }
+    Ok(filter)
+}
+
+async fn load_export_selection(
+    db: &SqlitePool,
+    filter: &GalleryExportFilter,
+) -> Result<(Vec<GalleryTemplate>, Vec<sqlx::sqlite::SqliteRow>), AppError> {
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT gt.*, 0 AS like_count, 0 AS liked_by_viewer FROM gallery_templates gt WHERE ",
+    );
+    if filter.scope == GalleryExportScope::Backup {
+        query.push("1=1");
+    } else {
+        query.push("gt.status IN (");
+        let mut statuses = query.separated(",");
+        for status in &filter.statuses {
+            statuses.push_bind(status_value(*status));
+        }
+        statuses.push_unseparated(") AND (");
+        query.push("0=1");
+        // 与前端一致：仅第一条斜杠两侧均非空时识别为分类，避免前缀误匹配。
+        const CATEGORY: &str = "CASE WHEN instr(gtt.tag_name, '/') > 0 AND trim(substr(gtt.tag_name,1,instr(gtt.tag_name,'/')-1)) != '' AND trim(substr(gtt.tag_name,instr(gtt.tag_name,'/')+1)) != '' THEN trim(substr(gtt.tag_name,1,instr(gtt.tag_name,'/')-1)) ELSE '未分类' END";
+        for category in &filter.categories {
+            query.push(" OR EXISTS(SELECT 1 FROM gallery_template_tags gtt WHERE gtt.template_id=gt.id AND (").push(CATEGORY).push(")=").push_bind(category).push(")");
+        }
+        for tag in &filter.tags {
+            query.push(" OR EXISTS(SELECT 1 FROM gallery_template_tags gtt WHERE gtt.template_id=gt.id AND gtt.tag_name=").push_bind(tag).push(")");
+        }
+        if filter.uncategorized {
+            query.push(" OR NOT EXISTS(SELECT 1 FROM gallery_template_tags gtt WHERE gtt.template_id=gt.id) OR EXISTS(SELECT 1 FROM gallery_template_tags gtt WHERE gtt.template_id=gt.id AND (").push(CATEGORY).push(")='未分类')");
+        }
+        query.push(")");
+    }
+    query.push(" ORDER BY gt.created_at, gt.id");
+    let rows = query
+        .build()
+        .fetch_all(db)
+        .await
+        .map_err(AppError::internal)?;
     let mut templates = Vec::with_capacity(rows.len());
+    let mut ids = BTreeSet::new();
     for row in rows {
-        let mut template = template_from_row(&state.db, row).await?;
-        template.like_count = 0;
-        template.liked_by_viewer = false;
+        let template = template_from_row(db, row).await?;
+        ids.extend(
+            template
+                .preview_assets
+                .iter()
+                .chain(&template.reference_assets)
+                .map(|asset| asset.id.clone()),
+        );
         templates.push(template);
     }
-    let asset_rows = sqlx::query(
-        "SELECT ga.* FROM gallery_assets ga
-         WHERE EXISTS (SELECT 1 FROM gallery_template_assets gta WHERE gta.asset_id = ga.id)
-         ORDER BY ga.id",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(AppError::internal)?;
+    let rows = sqlx::query("SELECT * FROM gallery_assets ORDER BY id")
+        .fetch_all(db)
+        .await
+        .map_err(AppError::internal)?;
+    let assets = rows
+        .into_iter()
+        .filter(|row| ids.contains(&row.get::<String, _>("id")))
+        .collect();
+    Ok((templates, assets))
+}
+
+async fn export_gallery_selection(
+    state: &AppState,
+    filter: &GalleryExportFilter,
+) -> Result<Response, AppError> {
+    let _gallery_guard = state.gallery_write_lock.lock().await;
+    let (templates, asset_rows) = load_export_selection(&state.db, filter).await?;
+    if filter.scope == GalleryExportScope::Share && templates.is_empty() {
+        return Err(AppError::bad_request("没有匹配的模板，请刷新导出范围。"));
+    }
     let export_dir = unique_temp_path("mew-gallery-export", true).await?;
     let export_guard = TemporaryPath(export_dir.clone());
     let staged_assets_dir = export_dir.join("assets");
@@ -930,7 +1058,7 @@ async fn export_gallery_archive(
         let id = row.get::<String, _>("id");
         let object_key = row.get::<String, _>("object_key");
         let byte_len = row.get::<i64, _>("byte_len").max(0) as u64;
-        let bytes = get_object_bytes(&state, &object_key, byte_len.max(1)).await?;
+        let bytes = get_object_bytes(state, &object_key, byte_len.max(1)).await?;
         let sha256 = row.get::<String, _>("sha256");
         if bytes.len() as u64 != byte_len || hex_sha256(&bytes) != sha256 {
             return Err(AppError::bad_request(format!(
@@ -971,7 +1099,15 @@ async fn export_gallery_archive(
     let file = tokio::fs::File::open(&zip_path)
         .await
         .map_err(AppError::internal)?;
-    let file_name = format!("mew-gallery-{}.zip", chrono::Utc::now().format("%Y%m%d"));
+    let purpose = if filter.scope == GalleryExportScope::Share {
+        "share"
+    } else {
+        "backup"
+    };
+    let file_name = format!(
+        "mew-gallery-{purpose}-{}.zip",
+        chrono::Utc::now().format("%Y%m%d")
+    );
     let stream = stream::try_unfold(
         TemporaryDownload {
             file,
@@ -1052,17 +1188,137 @@ async fn import_gallery_archive(
         state.config.gallery_asset_quota_bytes,
         state.config.gallery_asset_quota_count,
     );
-    let manifest = tokio::task::spawn_blocking(move || {
+    let mut manifest = tokio::task::spawn_blocking(move || {
         extract_and_validate_gallery_zip(&zip_for_extract, &extracted_for_task, limits)
     })
     .await
     .map_err(AppError::internal)?
     .map_err(AppError::bad_request)?;
     validate_archive_manifest(&manifest)?;
+    // 即使选择跳过同 ID 模板，也先校验原包的所有图片，不能借冲突策略绕过校验。
+    for asset in &manifest.assets {
+        if asset.byte_len > state.config.max_upload_bytes {
+            return Err(AppError::bad_request("模板图片超过本站单文件限制。"));
+        }
+        let file_len = tokio::fs::metadata(extracted_dir.join(&asset.path))
+            .await
+            .map_err(AppError::internal)?
+            .len();
+        if file_len != asset.byte_len {
+            return Err(AppError::bad_request("模板图片实际大小与清单不一致。"));
+        }
+        let bytes = tokio::fs::read(extracted_dir.join(&asset.path))
+            .await
+            .map_err(AppError::internal)?;
+        if detect_image_mime(&bytes) != Some("image/webp")
+            || bytes.len() as u64 != asset.byte_len
+            || hex_sha256(&bytes) != asset.sha256
+            || webp_dimensions(&bytes)? != (asset.width, asset.height)
+        {
+            return Err(AppError::bad_request(format!(
+                "模板图片 `{}` 校验失败。",
+                asset.id
+            )));
+        }
+    }
+    let existing_ids = sqlx::query_scalar::<_, String>("SELECT id FROM gallery_templates")
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut skipped_template_count = 0;
+    if mode == GalleryImportMode::Merge
+        && query.conflict.unwrap_or_default() == GalleryImportConflict::KeepLocal
+    {
+        manifest.templates.retain(|template| {
+            let keep = !existing_ids.contains(&template.id);
+            skipped_template_count += usize::from(!keep);
+            keep
+        });
+    }
+    let overwritten_template_count = if mode == GalleryImportMode::Merge {
+        manifest
+            .templates
+            .iter()
+            .filter(|template| existing_ids.contains(&template.id))
+            .count()
+    } else {
+        0
+    };
+    let added_template_count = manifest.templates.len() - overwritten_template_count;
+    if mode == GalleryImportMode::Merge && manifest.templates.is_empty() {
+        return Ok(Json(GalleryImportResponse {
+            imported_template_count: 0,
+            imported_asset_count: 0,
+            mode,
+            added_template_count: 0,
+            overwritten_template_count: 0,
+            skipped_template_count,
+        }));
+    }
+    let used_ids = manifest
+        .templates
+        .iter()
+        .flat_map(|template| {
+            template
+                .preview_assets
+                .iter()
+                .chain(&template.reference_assets)
+        })
+        .map(|asset| asset.id.clone())
+        .collect::<BTreeSet<_>>();
+    manifest.assets.retain(|asset| used_ids.contains(&asset.id));
+    let mut reused_asset_ids = BTreeSet::new();
+    if mode == GalleryImportMode::Merge {
+        for asset in &mut manifest.assets {
+            let Some(row) = sqlx::query("SELECT * FROM gallery_assets WHERE id=?")
+                .bind(&asset.id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(AppError::internal)?
+            else {
+                continue;
+            };
+            let same = row.get::<String, _>("sha256") == asset.sha256
+                && row.get::<String, _>("mime_type") == asset.mime_type
+                && row.get::<i64, _>("byte_len") == asset.byte_len as i64
+                && row.get::<i64, _>("width") == i64::from(asset.width)
+                && row.get::<i64, _>("height") == i64::from(asset.height);
+            if same {
+                let bytes = get_object_bytes(
+                    &state,
+                    &row.get::<String, _>("object_key"),
+                    asset.byte_len.max(1),
+                )
+                .await?;
+                if bytes.len() as u64 == asset.byte_len && hex_sha256(&bytes) == asset.sha256 {
+                    reused_asset_ids.insert(asset.id.clone());
+                    continue;
+                }
+            }
+            // 图片 ID 冲突只能改变本次导入的引用，不能覆盖包外或保留模板的原图。
+            let old_id = std::mem::replace(&mut asset.id, new_id());
+            for template in &mut manifest.templates {
+                for reference in template
+                    .preview_assets
+                    .iter_mut()
+                    .chain(&mut template.reference_assets)
+                {
+                    if reference.id == old_id {
+                        reference.id.clone_from(&asset.id);
+                    }
+                }
+            }
+        }
+    }
     let mut staged_objects = Vec::with_capacity(manifest.assets.len().saturating_mul(2));
     let mut thumbnail_objects = BTreeMap::<String, (String, u64)>::new();
     let batch_id = new_id();
     for asset in &manifest.assets {
+        if reused_asset_ids.contains(&asset.id) {
+            continue;
+        }
         let bytes = tokio::fs::read(extracted_dir.join(&asset.path))
             .await
             .map_err(AppError::internal)?;
@@ -1119,6 +1375,7 @@ async fn import_gallery_archive(
             batch_id: &batch_id,
             thumbnail_objects: &thumbnail_objects,
             staged_object_keys: &staged_objects,
+            reused_asset_ids: &reused_asset_ids,
             quota_bytes: state.config.gallery_asset_quota_bytes,
             quota_count: state.config.gallery_asset_quota_count,
         },
@@ -1141,6 +1398,9 @@ async fn import_gallery_archive(
         imported_template_count: manifest.templates.len(),
         imported_asset_count: manifest.assets.len(),
         mode,
+        added_template_count,
+        overwritten_template_count,
+        skipped_template_count,
     }))
 }
 
@@ -1158,6 +1418,9 @@ fn write_gallery_zip(
         .start_file("manifest.json", options)
         .map_err(|error| error.to_string())?;
     let json = serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?;
+    if json.len() > 8 * 1024 * 1024 {
+        return Err("模板清单超过 8 MiB，请缩小导出范围。".into());
+    }
     writer.write_all(&json).map_err(|error| error.to_string())?;
     for asset in &manifest.assets {
         writer
@@ -1241,7 +1504,15 @@ fn extract_and_validate_gallery_zip(
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         let mut output = StdFile::create(destination).map_err(|error| error.to_string())?;
-        std::io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+        let expected_size = entry.size();
+        let actual_size = std::io::copy(
+            &mut entry.take(expected_size.saturating_add(1)),
+            &mut output,
+        )
+        .map_err(|error| error.to_string())?;
+        if actual_size != expected_size {
+            return Err("模板包文件实际解压大小与声明不一致。".into());
+        }
     }
     let bytes = manifest_bytes.ok_or_else(|| "模板包缺少 manifest.json。".to_string())?;
     serde_json::from_slice(&bytes).map_err(|error| format!("模板包清单无效：{error}"))
@@ -1354,6 +1625,7 @@ struct GalleryImportCommit<'a> {
     batch_id: &'a str,
     thumbnail_objects: &'a BTreeMap<String, (String, u64)>,
     staged_object_keys: &'a [String],
+    reused_asset_ids: &'a BTreeSet<String>,
     quota_bytes: u64,
     quota_count: u64,
 }
@@ -1368,72 +1640,42 @@ async fn commit_gallery_import(
         batch_id,
         thumbnail_objects,
         staged_object_keys,
+        reused_asset_ids,
         quota_bytes,
         quota_count,
     } = commit;
+    let rows = sqlx::query("SELECT id, object_key, thumbnail_object_key FROM gallery_assets")
+        .fetch_all(db)
+        .await
+        .map_err(AppError::internal)?;
     let imported_ids = manifest
         .assets
         .iter()
         .map(|asset| asset.id.as_str())
         .collect::<BTreeSet<_>>();
-    let rows = sqlx::query(
-        "SELECT id, object_key, thumbnail_object_key, byte_len, thumbnail_byte_len FROM gallery_assets",
-    )
-        .fetch_all(db)
-        .await
-        .map_err(AppError::internal)?;
-    let mut effective_bytes = 0u64;
-    let mut effective_count = 0u64;
     let mut old_keys = Vec::new();
-    if mode == GalleryImportMode::Merge {
-        for row in &rows {
-            let id = row.get::<String, _>("id");
-            if imported_ids.contains(id.as_str()) {
-                old_keys.push(row.get("object_key"));
-                if let Some(key) = row.get::<Option<String>, _>("thumbnail_object_key") {
-                    old_keys.push(key);
-                }
-            } else {
-                effective_bytes = effective_bytes
-                    .saturating_add(row.get::<i64, _>("byte_len").max(0) as u64)
-                    .saturating_add(row.get::<i64, _>("thumbnail_byte_len").max(0) as u64);
-                effective_count = effective_count.saturating_add(1);
-                if row
-                    .get::<Option<String>, _>("thumbnail_object_key")
-                    .is_some()
-                {
-                    effective_count = effective_count.saturating_add(1);
-                }
-            }
-        }
-    } else {
-        for row in &rows {
+    for row in rows {
+        let id = row.get::<String, _>("id");
+        if mode == GalleryImportMode::Replace
+            || (imported_ids.contains(id.as_str()) && !reused_asset_ids.contains(&id))
+        {
             old_keys.push(row.get::<String, _>("object_key"));
             if let Some(key) = row.get::<Option<String>, _>("thumbnail_object_key") {
                 old_keys.push(key);
             }
         }
     }
-    effective_bytes = manifest
-        .assets
-        .iter()
-        .fold(effective_bytes, |total, asset| {
-            total.saturating_add(asset.byte_len)
-        });
-    effective_count = effective_count.saturating_add(manifest.assets.len() as u64);
-    for (_, thumbnail_bytes) in thumbnail_objects.values() {
-        effective_bytes = effective_bytes.saturating_add(*thumbnail_bytes);
-        effective_count = effective_count.saturating_add(1);
-    }
-    if quota_bytes > 0 && effective_bytes > quota_bytes {
-        return Err(AppError::bad_request("合并后的模板广场资源超过容量配额。"));
-    }
-    if quota_count > 0 && effective_count > quota_count {
-        return Err(AppError::bad_request("合并后的模板广场资源数量超过配额。"));
-    }
+    let previously_referenced =
+        sqlx::query_scalar::<_, String>("SELECT DISTINCT asset_id FROM gallery_template_assets")
+            .fetch_all(db)
+            .await
+            .map_err(AppError::internal)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
 
     let mut transaction = db.begin().await.map_err(AppError::internal)?;
     if mode == GalleryImportMode::Replace {
+        // 全量替换在下方统一处理。
         sqlx::query("DELETE FROM gallery_likes")
             .execute(&mut *transaction)
             .await
@@ -1460,6 +1702,9 @@ async fn commit_gallery_import(
             .map_err(AppError::internal)?;
     }
     for asset in &manifest.assets {
+        if reused_asset_ids.contains(&asset.id) {
+            continue;
+        }
         let object_key = format!("gallery/imports/{batch_id}/{}.webp", asset.id);
         let (thumbnail_object_key, thumbnail_byte_len) = thumbnail_objects
             .get(&asset.id)
@@ -1537,6 +1782,33 @@ async fn commit_gallery_import(
             "reference",
         )
         .await?;
+    }
+    let orphan_rows = sqlx::query("SELECT id, object_key, thumbnail_object_key FROM gallery_assets WHERE NOT EXISTS (SELECT 1 FROM gallery_template_assets gta WHERE gta.asset_id=gallery_assets.id)")
+        .fetch_all(&mut *transaction).await.map_err(AppError::internal)?;
+    // 未关联的编辑器上传不能误删，只回收此次导入前已有模板实际引用过的旧资源。
+    for row in orphan_rows {
+        let id = row.get::<String, _>("id");
+        if !previously_referenced.contains(&id) {
+            continue;
+        }
+        old_keys.push(row.get::<String, _>("object_key"));
+        if let Some(key) = row.get::<Option<String>, _>("thumbnail_object_key") {
+            old_keys.push(key);
+        }
+        sqlx::query("DELETE FROM gallery_assets WHERE id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    let usage = sqlx::query("SELECT COALESCE(SUM(byte_len + thumbnail_byte_len),0) AS bytes, COUNT(*) + COUNT(thumbnail_object_key) AS files FROM gallery_assets")
+        .fetch_one(&mut *transaction).await.map_err(AppError::internal)?;
+    if (quota_bytes > 0 && usage.get::<i64, _>("bytes").max(0) as u64 > quota_bytes)
+        || (quota_count > 0 && usage.get::<i64, _>("files").max(0) as u64 > quota_count)
+    {
+        return Err(AppError::bad_request(
+            "合并后的模板广场资源超过容量或文件数量配额。",
+        ));
     }
     sqlx::query("DELETE FROM gallery_tags WHERE NOT EXISTS (SELECT 1 FROM gallery_template_tags gtt WHERE gtt.tag_name = gallery_tags.name)")
         .execute(&mut *transaction).await.map_err(AppError::internal)?;
@@ -1992,12 +2264,16 @@ pub(crate) async fn cleanup_expired_staged_objects(state: &AppState) -> Result<(
 }
 
 #[cfg(test)]
+#[path = "gallery_transfer_tests.rs"]
+mod transfer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use image::{DynamicImage, Rgba, RgbaImage};
     use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn test_db() -> SqlitePool {
+    pub(super) async fn test_db() -> SqlitePool {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -2026,7 +2302,11 @@ mod tests {
         }
     }
 
-    fn test_template(id: String, title: &str, status: GalleryTemplateStatus) -> GalleryTemplate {
+    pub(super) fn test_template(
+        id: String,
+        title: &str,
+        status: GalleryTemplateStatus,
+    ) -> GalleryTemplate {
         GalleryTemplate {
             id,
             title: title.into(),
@@ -2046,7 +2326,11 @@ mod tests {
         }
     }
 
-    async fn insert_test_template(db: &SqlitePool, template: &GalleryTemplate, tags: &[&str]) {
+    pub(super) async fn insert_test_template(
+        db: &SqlitePool,
+        template: &GalleryTemplate,
+        tags: &[&str],
+    ) {
         sqlx::query(
             "INSERT INTO gallery_templates
              (id, title, prompt, description, generation_settings, recommended_provider_kind,
@@ -2245,6 +2529,7 @@ mod tests {
                     batch_id: "batch",
                     thumbnail_objects: &BTreeMap::new(),
                     staged_object_keys: &[],
+                    reused_asset_ids: &BTreeSet::new(),
                     quota_bytes: 1024,
                     quota_count: 10,
                 },

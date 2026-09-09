@@ -695,7 +695,8 @@ async fn health() -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "capabilities": {
-            "proxy_generation_status_only": true
+            "proxy_generation_status_only": true,
+            "gallery_import_conflict": true
         }
     }))
 }
@@ -5916,7 +5917,7 @@ mod tests {
         db
     }
 
-    async fn test_app_state(local_asset_dir: String) -> AppState {
+    pub(super) async fn test_app_state(local_asset_dir: String) -> AppState {
         AppState {
             config: test_config(local_asset_dir),
             db: test_db().await,
@@ -5972,7 +5973,7 @@ mod tests {
         }
     }
 
-    async fn insert_test_user(
+    pub(super) async fn insert_test_user(
         db: &SqlitePool,
         user_id: &str,
         username: &str,
@@ -5998,7 +5999,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn authenticated_test_session(
+    pub(super) async fn authenticated_test_session(
         store: Arc<MemoryStore>,
         user_id: &str,
         session_version: i64,
@@ -6513,6 +6514,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["capabilities"]["proxy_generation_status_only"], true);
+        assert_eq!(value["capabilities"]["gallery_import_conflict"], true);
     }
 
     #[test]
