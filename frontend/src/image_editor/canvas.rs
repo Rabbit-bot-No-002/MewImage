@@ -74,6 +74,22 @@ pub fn ImageEditorCanvas(
                 color: color.get(),
                 width: brush_width.get(),
             });
+        let live_move = if active_tool.get() == DrawTool::Select {
+            let current_points = points.get();
+            selected.get().and_then(|id| {
+                let start = current_points.first()?;
+                let end = current_points.last()?;
+                Some((
+                    id,
+                    Point {
+                        x: end.x - start.x,
+                        y: end.y - start.y,
+                    },
+                ))
+            })
+        } else {
+            None
+        };
         let result = (|| -> Result<(), String> {
             let base = base.and_then(|base| base.get());
             let imported_mask = imported_mask
@@ -85,6 +101,7 @@ pub fn ImageEditorCanvas(
                 imported_mask.as_ref().map(|mask| mask.image()),
                 1024,
                 live_object.as_ref(),
+                live_move.as_ref().map(|(id, delta)| (id.as_str(), *delta)),
             )?;
             canvas.set_width(rendered.canvas().width());
             canvas.set_height(rendered.canvas().height());
@@ -184,7 +201,7 @@ pub fn ImageEditorCanvas(
                             context
                                 .as_ref()
                                 .and_then(|context| {
-                                    context.set_font(&format!("{size}px sans-serif"));
+                                    context.set_font(&format!("600 {size}px sans-serif"));
                                     context
                                         .measure_text(text)
                                         .ok()

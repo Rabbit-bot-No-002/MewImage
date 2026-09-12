@@ -347,11 +347,19 @@ pub(crate) fn WorkspaceMain(
 
                     {move || continuation_asset.get().map(|asset| {
                         let clear_asset = asset.id.clone();
+                        let edit_asset = asset.id.clone();
                         view! {
                             <div class="continuation-banner">
                                 <div class="row">
                                     <div class="row">
-                                        <img class="continuation-thumb" src=asset_display_src(&asset) alt="连续修改底图" />
+                                        <button type="button" class="continuation-thumb-button" title="编辑上一轮结果" aria-label="编辑上一轮结果"
+                                            on:click=move |_| {
+                                                ui.image_editor_base_id.set(Some(edit_asset.clone()));
+                                                ui.image_editor_thread.set(Some(current_thread_id.get_untracked()));
+                                            }>
+                                            <img class="continuation-thumb" src=asset_display_src(&asset) alt="连续修改底图" />
+                                            <span class="continuation-thumb-edit"><MaterialSymbolIcon name="edit" filled=false /></span>
+                                        </button>
                                         <div class="stack">
                                             <strong>"连续修改模式"</strong>
                                             <span class="status">"下一次会基于上一张输出继续生成，不会加入参考图队列。"</span>

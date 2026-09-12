@@ -30,6 +30,11 @@ pub const MAX_HISTORY_STEPS: usize = 100;
 pub const MAX_DRAFT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EDITOR_EDGE: u32 = 4096;
 
+/// 新建文字按画布短边给出可辨认字号，避免把笔刷粗细误当成字体大小。
+pub fn recommended_text_size(width: u32, height: u32) -> f64 {
+    (f64::from(width.min(height)) * 0.065).clamp(36.0, 192.0)
+}
+
 #[derive(Default)]
 struct ByteCounter(usize);
 
@@ -460,6 +465,13 @@ mod tests {
 
     fn session() -> EditorSession {
         EditorSession::new(EditorDraft::new("thread".into(), None, 1024, 1024).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn recommended_text_size_scales_with_canvas_and_stays_readable() {
+        assert_eq!(recommended_text_size(320, 640), 36.0);
+        assert!((recommended_text_size(1024, 1024) - 66.56).abs() < 0.001);
+        assert_eq!(recommended_text_size(4096, 4096), 192.0);
     }
 
     #[test]

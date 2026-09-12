@@ -122,7 +122,7 @@ impl RenderedCanvas {
         imported_mask: Option<&HtmlImageElement>,
         maximum_edge: u32,
     ) -> Result<Self, String> {
-        Self::render_preview(draft, base, imported_mask, maximum_edge, None)
+        Self::render_preview(draft, base, imported_mask, maximum_edge, None, None)
     }
 
     /// 实时笔画单独传入，不复制已经保存的全部图层。
@@ -132,6 +132,7 @@ impl RenderedCanvas {
         imported_mask: Option<&HtmlImageElement>,
         maximum_edge: u32,
         live_object: Option<&DrawingObject>,
+        live_move: Option<(&str, Point)>,
     ) -> Result<Self, String> {
         draft.validate_size()?;
         if draft.mode == EditMode::Mask
@@ -189,7 +190,25 @@ impl RenderedCanvas {
             }
         }
         for object in draft.active_objects() {
-            draw_object(&layer.context, object, draft.mode)?;
+            if let Some((_, delta)) =
+                live_move.filter(|(moving_id, _)| *moving_id == object.id.as_str())
+            {
+                if !delta.x.is_finite() || !delta.y.is_finite() {
+                    return Err("对象预览位移无效。".into());
+                }
+                layer.context.save();
+                let translated = layer
+                    .context
+                    .translate(delta.x, delta.y)
+                    .map_err(canvas_error);
+                let drawn =
+                    translated.and_then(|()| draw_object(&layer.context, object, draft.mode));
+                layer.context.restore();
+                drawn?;
+                layer.full_resolution = false;
+            } else {
+                draw_object(&layer.context, object, draft.mode)?;
+            }
         }
         if let Some(object) = live_object {
             draw_object(&layer.context, object, draft.mode)?;
@@ -236,8 +255,16 @@ impl RenderedCanvas {
         imported_mask: Option<&HtmlImageElement>,
         maximum_edge: u32,
         live_object: Option<&DrawingObject>,
+        live_move: Option<(&str, Point)>,
     ) -> Result<Self, String> {
-        let layer = Self::render_preview(draft, base, imported_mask, maximum_edge, live_object)?;
+        let layer = Self::render_preview(
+            draft,
+            base,
+            imported_mask,
+            maximum_edge,
+            live_object,
+            live_move,
+        )?;
         if draft.mode != EditMode::Mask {
             return Ok(layer);
         }
@@ -405,7 +432,7 @@ fn draw_object(
         }
         Geometry::Text { position, text } => {
             let size = object.width.max(12.0);
-            context.set_font(&format!("{size}px sans-serif"));
+            context.set_font(&format!("600 {size}px sans-serif"));
             context.set_text_baseline("top");
             for (index, line) in text.lines().enumerate() {
                 context
