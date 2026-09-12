@@ -159,6 +159,7 @@ pub(crate) struct ActiveGenerationRuntime {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ComposerState {
+    pub(crate) editing_by_thread: RwSignal<HashMap<String, mew_image_shared::ImageEditingSnapshot>>,
     pub(crate) selected_reference_ids: RwSignal<Vec<String>>,
     pub(crate) show_all_reference_assets: RwSignal<bool>,
     pub(crate) dragging_reference_id: RwSignal<Option<String>>,
@@ -214,6 +215,10 @@ pub(crate) struct AccountState {
 
 #[derive(Clone, Copy)]
 pub(crate) struct UiState {
+    pub(crate) image_editor_base_id: RwSignal<Option<String>>,
+    pub(crate) image_editor_thread: RwSignal<Option<String>>,
+    pub(crate) reference_selection:
+        RwSignal<Option<super::components::reference_selection::ReferenceSelection>>,
     pub(crate) main_view: RwSignal<MainView>,
     pub(crate) gallery_template_draft_task_id: RwSignal<Option<String>>,
     pub(crate) show_favorites_panel: RwSignal<bool>,
@@ -296,6 +301,7 @@ impl AppState {
             current_config_id: RwSignal::new(String::new()),
         };
         let composer = ComposerState {
+            editing_by_thread: RwSignal::new(HashMap::new()),
             selected_reference_ids: RwSignal::new(Vec::new()),
             show_all_reference_assets: RwSignal::new(false),
             dragging_reference_id: RwSignal::new(None),
@@ -350,6 +356,9 @@ impl AppState {
             syncing: RwSignal::new(false),
         };
         let ui = UiState {
+            image_editor_thread: RwSignal::new(None),
+            image_editor_base_id: RwSignal::new(None),
+            reference_selection: RwSignal::new(None),
             main_view: RwSignal::new(MainView::from_location()),
             gallery_template_draft_task_id: RwSignal::new(None),
             show_favorites_panel: RwSignal::new(false),

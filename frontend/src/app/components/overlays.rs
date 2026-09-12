@@ -173,6 +173,7 @@ pub(crate) fn ContextMenuOverlay(
 pub(crate) fn ReferenceMenuOverlay(
     delete_asset: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
 ) -> impl IntoView {
+    let ui = expect_context::<crate::app::state::UiState>();
     let composer = expect_context::<crate::app::state::ComposerState>();
     let workspace = expect_context::<crate::app::state::WorkspaceState>();
     let reference_menu_asset_id = composer.reference_menu_asset_id;
@@ -184,6 +185,7 @@ pub(crate) fn ReferenceMenuOverlay(
             assets.with(|items| items.iter().find(|asset| asset.id == asset_id).cloned())
         }).map(|asset| {
             let delete_asset_id = asset.id.clone();
+            let edit_asset_id = asset.id.clone();
             let toggle_reference_id = asset.id.clone();
             let toggle_reference_label_id = asset.id.clone();
             view! {
@@ -201,10 +203,21 @@ pub(crate) fn ReferenceMenuOverlay(
                         </div>
                         <div class="row reference-menu-actions">
                             <button class="button ghost" on:click=move |_| {
+                                reference_menu_asset_id.set(None);
+                                ui.image_editor_base_id.set(Some(edit_asset_id.clone()));
+                                ui.image_editor_thread.set(Some(workspace.current_thread_id.get_untracked()));
+                            }>"编辑"</button>
+                            <button class="button ghost" on:click=move |_| {
                                 selected_reference_ids.update(|ids| {
                                     if let Some(index) = ids.iter().position(|id| id == &toggle_reference_id) {
                                         ids.remove(index);
                                     } else {
+                                        let base = composer.continuation_asset_id.get_untracked();
+                                        let extra = usize::from(base.as_ref().is_some_and(|id| id != &toggle_reference_id && !ids.contains(id)));
+                                        if ids.len() + extra >= mew_image_shared::MAX_GENERATION_REFERENCE_IMAGES {
+                                            composer.status_text.set("最多选择 10 张参考图，请先取消部分选择。".into());
+                                            return;
+                                        }
                                         ids.push(toggle_reference_id.clone());
                                     }
                                 });

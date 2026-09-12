@@ -480,6 +480,9 @@ pub(crate) fn download_backup_bytes(bytes: &[u8], file_name: &str) -> Result<(),
 }
 
 pub(crate) async fn import_file_list(files: FileList) -> Result<Vec<ImageAssetRef>, String> {
+    if files.length() as usize > mew_image_shared::MAX_GENERATION_REFERENCE_IMAGES {
+        return Err("一次最多导入 10 张参考图，请减少选择后重试。".into());
+    }
     let mut imported = Vec::new();
     for index in 0..files.length() {
         let Some(file) = files.get(index) else {

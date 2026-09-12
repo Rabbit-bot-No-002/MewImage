@@ -110,6 +110,7 @@ pub(crate) fn PreviewOverlay(
                 let fullscreen_download_asset_id = preview_asset_id.clone();
                 let copy_asset_id = preview_asset_id.clone();
                 let download_asset_id = preview_asset_id.clone();
+                let drawing_asset_id = preview_asset_id.clone();
                 let prompt_text = panel.prompt.clone();
                 let waiting_task_id = panel.task_id.clone();
                 let waiting_detail_task_id = panel.task_id.clone();
@@ -232,6 +233,12 @@ pub(crate) fn PreviewOverlay(
                                         </div>
                                         <div class="preview-prompt-box">
                                             <p class="preview-prompt">{panel.prompt.clone()}</p>
+                                            {panel.editing_instruction.clone().filter(|text| !text.trim().is_empty()).map(|instruction| view! {
+                                                <div class="stack">
+                                                    <span class="status">"图像编辑附加说明"</span>
+                                                    <p class="preview-prompt">{instruction}</p>
+                                                </div>
+                                            })}
                                         </div>
                                     </div>
                                 </div>
@@ -257,8 +264,21 @@ pub(crate) fn PreviewOverlay(
                                                 if !reference_tip_enabled() {
                                                     return;
                                                 }
-                                                selected_reference_ids.set(reference_thumb_ids.clone());
-                                                if let Some(target) = ev
+                                                let current_thread = workspace.current_thread_id.get_untracked();
+                                                let base = composer.continuation_asset_id.get_untracked();
+                                                let choices = base.iter().chain(reference_thumb_ids.iter()).map(|id| super::reference_selection::ReferenceChoice {
+                                                    id: id.clone(),
+                                                    preview: assets.with_untracked(|items| items.iter().find(|asset| asset.id == *id).map(crate::app::asset_display_src).unwrap_or_default()),
+                                                    required: base.as_ref() == Some(id),
+                                                }).collect();
+                                                super::reference_selection::choose_references(ui, choices, move |mut ids| {
+                                                    if workspace.current_thread_id.get_untracked() == current_thread && composer.foreground_generation_task_id.get_untracked().is_none() {
+                                                        ids.retain(|id| base.as_ref() != Some(id));
+                                                        selected_reference_ids.set(ids);
+                                                        composer.status_text.set("参考图已引用。".into());
+                                                    }
+                                                });
+                                                if ui.reference_selection.get_untracked().is_none() && let Some(target) = ev
                                                     .current_target()
                                                     .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
                                                 {
@@ -319,6 +339,12 @@ pub(crate) fn PreviewOverlay(
                                     {has_asset.then(|| view! {
                                         <>
                                             <button class="button secondary" on:click=move |_| edit_output_asset(edit_task_id.clone(), edit_asset_id.clone())>"编辑输出"</button>
+                                            <button class="button ghost" on:click=move |_| {
+                                                if let Some(id) = drawing_asset_id.clone() {
+                                                    ui.image_editor_base_id.set(Some(id));
+                                                    ui.image_editor_thread.set(Some(workspace.current_thread_id.get_untracked()));
+                                                }
+                                            }>"编辑此图"</button>
                                             <button class="button ghost danger" on:click=move |ev: MouseEvent| {
                                                 delete_task(delete_task_id.clone(), ev.client_x() as f64, ev.client_y() as f64);
                                             }>"删除记录"</button>

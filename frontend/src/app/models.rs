@@ -22,6 +22,7 @@ pub(crate) struct FailureLogState {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PreviewPanelState {
+    pub(crate) editing_instruction: Option<String>,
     pub(crate) task_id: String,
     pub(crate) asset_id: Option<String>,
     pub(crate) prompt: String,

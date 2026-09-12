@@ -173,7 +173,7 @@ pub fn prepare_session_backup(
         .collect::<HashSet<_>>();
     let mut asset_ids = tasks
         .iter()
-        .flat_map(|task| task.reference_asset_ids.iter().cloned())
+        .flat_map(|task| task.input_asset_ids().cloned())
         .collect::<HashSet<_>>();
     let available_asset_ids = state
         .assets
@@ -605,7 +605,7 @@ fn import_session_backup(
     if let Some(missing_asset_id) = imported
         .tasks
         .iter()
-        .flat_map(|task| task.reference_asset_ids.iter())
+        .flat_map(|task| task.input_asset_ids())
         .find(|asset_id| !asset_ids.contains(asset_id.as_str()))
     {
         return Err(format!("会话项目包缺少引用图片 {missing_asset_id}。"));
@@ -655,6 +655,9 @@ fn import_session_backup(
                     .ok_or_else(|| "会话参考图 ID 重映射失败。".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(editing) = task.editing.as_mut() {
+            editing.remap_asset_ids(&asset_id_remap);
+        }
         task.favorite = false;
         task.favorite_folder_id = None;
         task.detached_from_thread = false;
@@ -763,6 +766,9 @@ fn unique_imported_thread_title(
 
 fn remap_asset_references(state: &mut LocalAppState, remap: &HashMap<String, String>) {
     for task in &mut state.tasks {
+        if let Some(editing) = task.editing.as_mut() {
+            editing.remap_asset_ids(remap);
+        }
         for id in &mut task.reference_asset_ids {
             if let Some(mapped) = remap.get(id) {
                 *id = mapped.clone();
@@ -885,6 +891,7 @@ mod tests {
         let mut backup = LocalAppState::default();
         backup.assets.push(imported_asset);
         backup.tasks.push(mew_image_shared::LocalTaskRecord {
+            editing: None,
             id: "task".into(),
             thread_id: backup.threads[0].id.clone(),
             config_id: String::new(),
@@ -1071,6 +1078,78 @@ mod tests {
     }
 
     #[test]
+    fn edit_snapshot_round_trips_with_session_resources_and_id_remapping() {
+        let mut task = test_task("project-task", "project", &["base"], true);
+        task.editing = Some(mew_image_shared::ImageEditingSnapshot {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: "base".into(),
+            mask_asset_id: Some("mask".into()),
+            instruction: Some("只修改选区".into()),
+        });
+        let mut source = LocalAppState {
+            threads: vec![test_thread("project", "编辑项目")],
+            tasks: vec![task],
+            assets: vec![
+                test_scoped_asset("base", b"base", None, None),
+                test_scoped_asset("mask", b"mask", None, None),
+            ],
+            ..Default::default()
+        };
+        source.assets[1]
+            .metadata
+            .insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+        let prepared = prepare_session_backup(&source, "project").unwrap();
+        assert_eq!(prepared.assets.len(), 2);
+        let zip = build_session_backup(prepared, &HashMap::new()).unwrap();
+        let imported = import_backup(&zip, &LocalAppState::default()).unwrap();
+        let task = &imported.state.tasks[0];
+        let editing = task.editing.as_ref().unwrap();
+        assert_ne!(editing.base_asset_id, "base");
+        assert_ne!(editing.mask_asset_id.as_deref(), Some("mask"));
+        assert_eq!(
+            task.reference_asset_ids.as_slice(),
+            std::slice::from_ref(&editing.base_asset_id)
+        );
+        assert_eq!(editing.instruction.as_deref(), Some("只修改选区"));
+        for id in editing.asset_ids() {
+            assert!(imported.state.assets.iter().any(|asset| &asset.id == id));
+            assert!(imported.payloads.iter().any(|(asset_id, _)| asset_id == id));
+        }
+        source.assets.pop();
+        assert!(prepare_session_backup(&source, "project").is_err());
+    }
+
+    #[test]
+    fn old_tasks_default_to_no_editing_and_remapping_preserves_edit_mode() {
+        let task = test_task("task", "thread", &["base"], false);
+        let json = serde_json::to_value(&task).unwrap();
+        assert!(json.get("editing").is_none());
+        let mut restored: LocalTaskRecord = serde_json::from_value(json).unwrap();
+        assert!(restored.editing.is_none());
+        restored.editing = Some(mew_image_shared::ImageEditingSnapshot {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: "base".into(),
+            mask_asset_id: Some("mask".into()),
+            instruction: None,
+        });
+        let mut state = LocalAppState {
+            tasks: vec![restored],
+            ..Default::default()
+        };
+        remap_asset_references(
+            &mut state,
+            &HashMap::from([
+                ("base".into(), "base-copy".into()),
+                ("mask".into(), "mask-copy".into()),
+            ]),
+        );
+        let editing = state.tasks[0].editing.as_ref().unwrap();
+        assert_eq!(editing.base_asset_id, "base-copy");
+        assert_eq!(editing.mask_asset_id.as_deref(), Some("mask-copy"));
+        assert_eq!(editing.mode, mew_image_shared::ImageEditingMode::Mask);
+    }
+
+    #[test]
     fn session_import_creates_independent_copy_and_can_repeat() {
         let mut source = LocalAppState {
             threads: vec![test_thread("project", "项目 A")],
@@ -1156,6 +1235,7 @@ mod tests {
         favorite: bool,
     ) -> LocalTaskRecord {
         LocalTaskRecord {
+            editing: None,
             id: id.into(),
             thread_id: thread_id.into(),
             config_id: "config".into(),

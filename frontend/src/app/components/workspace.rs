@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use leptos::{prelude::*, task::spawn_local};
-use mew_image_shared::{EncryptedApiConfig, clamp_size, now_rfc3339};
+use mew_image_shared::{EncryptedApiConfig, now_rfc3339};
 use web_sys::{DragEvent, FileList, MouseEvent};
 
 use crate::storage::save_generation_queue_mode;
@@ -374,6 +374,9 @@ pub(crate) fn WorkspaceMain(
                             on:click=move |_| show_resolution_menu.update(|value| *value = !*value)
                         >
                             {move || {
+                                if resolution_mode.get() == "model_auto" {
+                                    return "分辨率：模型自动".to_string();
+                                }
                                 let (width, height) = resolve_dimensions(
                                     resolution_mode.get().as_str(),
                                     resolution_group.get().as_str(),
@@ -397,6 +400,9 @@ pub(crate) fn WorkspaceMain(
                                         <option value="low">"质量：低"</option>
                                         <option value="medium">"质量：中"</option>
                                         <option value="high">"质量：高"</option>
+                                        <option value="auto">"质量：自动"</option>
+                                        <option value="xhigh" disabled=move || current_config.get().is_some_and(|config| !mew_image_shared::supports_extended_image_quality(&config.model))>"质量：超高"</option>
+                                        <option value="max" disabled=move || current_config.get().is_some_and(|config| !mew_image_shared::supports_extended_image_quality(&config.model))>"质量：最高"</option>
                                     </select>
                                     <select
                                         class="select-input compact-select"
@@ -597,6 +603,9 @@ pub(crate) fn WorkspaceMain(
                                         <span class="tag">
                                             {move || {
                                                 // 只更新预览文本，避免输入宽高时重建整个弹层并丢失焦点。
+                                                if resolution_mode.get() == "model_auto" {
+                                                    return "由模型决定实际尺寸；按最大输出尺寸预留内存。".to_string();
+                                                }
                                                 let (preview_width, preview_height) = resolve_dimensions(
                                                     resolution_mode.get().as_str(),
                                                     resolution_group.get().as_str(),
@@ -610,9 +619,10 @@ pub(crate) fn WorkspaceMain(
                                             }}
                                         </span>
                                     </div>
-                                    <div class="tag">"Responses API 会自动切换到 gpt-5.5 兼容模型，并通过 image_generation 工具产图。"</div>
+                                    <div class="tag">"Responses API 使用配置中的主模型，通过 image_generation 工具调用所选图片模型。超过 2560×1440 的 GPT Image 2/2.5 输出为实验性。"</div>
                                     <div class="mode-tabs">
                                         <button class="chip-button" class:active-chip=move || resolution_mode.get() == "auto" on:click=move |_| resolution_mode.set("auto".into())>"自动"</button>
+                                        <button class="chip-button" class:active-chip=move || resolution_mode.get() == "model_auto" disabled=move || !current_config.get().is_some_and(|config| config.provider_kind == mew_image_shared::ProviderKind::OpenAiImage) on:click=move |_| resolution_mode.set("model_auto".into())>"模型自动"</button>
                                         <button class="chip-button" class:active-chip=move || resolution_mode.get() == "preset" on:click=move |_| resolution_mode.set("preset".into())>"按比例"</button>
                                         <button class="chip-button" class:active-chip=move || resolution_mode.get() == "custom" on:click=move |_| resolution_mode.set("custom".into())>"自定义"</button>
                                     </div>
@@ -739,15 +749,7 @@ pub(crate) fn WorkspaceMain(
                                                         {move || {
                                                             let input_width = custom_width.get();
                                                             let input_height = custom_height.get();
-                                                            let result = clamp_size(input_width, input_height);
-                                                            if result.adjusted {
-                                                                format!(
-                                                                    "输入 {} × {}，实际按 {} × {} 生效",
-                                                                    input_width, input_height, result.width, result.height,
-                                                                )
-                                                            } else {
-                                                                format!("实际生效：{} × {}", result.width, result.height)
-                                                            }
+                                                            format!("请求尺寸：{input_width} × {input_height}；提交前校验，不自动调整。")
                                                         }}
                                                     </div>
                                                 </div>
@@ -755,8 +757,8 @@ pub(crate) fn WorkspaceMain(
                                         } else {
                                             view! {
                                                 <div class="stack resolution-panel">
-                                                    <div class="tag">"自动模式会优先沿用参考图或上一轮结果的尺寸。"</div>
-                                                    <div class="tag">"如果当前没有参考图，则会回落到 1024 × 1024。"</div>
+                                                    <div class="tag">{move || if resolution_mode.get() == "model_auto" { "模型自动模式会发送 size=auto，不沿用参考图尺寸。" } else { "自动模式会优先沿用参考图或上一轮结果的尺寸。" }}</div>
+                                                    <div class="tag">{move || if resolution_mode.get() == "model_auto" { "生成后读取图片实际尺寸；预算按最大输出尺寸计算。" } else { "如果当前没有参考图，则会回落到 1024 × 1024。" }}</div>
                                                 </div>
                                             }.into_any()
                                         }}
@@ -812,6 +814,13 @@ pub(crate) fn WorkspaceMain(
                         <div class="row reference-title-row">
                             <h2>"参考图"</h2>
                             <div class="reference-title-actions">
+                                <button type="button" class="button ghost compact-toggle"
+                                    on:click=move |_| {
+                                        ui.image_editor_base_id.set(None);
+                                        ui.image_editor_thread.set(Some(current_thread_id.get_untracked()));
+                                    }>
+                                    <MaterialSymbolIcon name="draw" filled=false />"绘制草图"
+                                </button>
                                 <span class="tag">{move || format!("已选参考图 {} 张", selected_reference_ids.get().len())}</span>
                                 <button
                                     type="button"
@@ -896,6 +905,12 @@ pub(crate) fn WorkspaceMain(
                                                         if let Some(index) = ids.iter().position(|id| id == &toggle_reference_id) {
                                                             ids.remove(index);
                                                         } else {
+                                                            let base = composer.continuation_asset_id.get_untracked();
+                                                            let extra = usize::from(base.as_ref().is_some_and(|id| id != &toggle_reference_id && !ids.contains(id)));
+                                                            if ids.len() + extra >= mew_image_shared::MAX_GENERATION_REFERENCE_IMAGES {
+                                                                composer.status_text.set("最多选择 10 张参考图，请先取消部分选择。".into());
+                                                                return;
+                                                            }
                                                             ids.push(toggle_reference_id.clone());
                                                         }
                                                     });

@@ -1,5 +1,6 @@
 pub(crate) mod appearance;
 pub(crate) mod audio;
+pub(crate) mod editor_budget;
 pub(crate) mod formatting;
 pub(crate) mod image;
 pub(crate) mod persistence;

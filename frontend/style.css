@@ -7174,3 +7174,98 @@ body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button.active
     transform: none;
   }
 }
+/* 精简历史参考图独立于详情层，固定高对比材质不受卡片透明度影响。 */
+.reference-selection-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20000;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgb(0 0 0 / 48%);
+}
+.image-editor-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 21000;
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  background: rgb(0 0 0 / 55%);
+}
+.image-editor-dialog {
+  width: min(1120px, 100%);
+  height: min(900px, calc(100dvh - 24px));
+  min-height: 0;
+  overflow: auto;
+  padding: 18px;
+  border-radius: 20px;
+  color: var(--text);
+  background: var(--floating-surface-base);
+  border: 1px solid var(--floating-border);
+}
+.image-editor-dialog > header,
+.image-editor-dialog > footer { justify-content: space-between; }
+.image-editor-controls { border: 0; padding: 0; margin: 0; flex-wrap: wrap; }
+.image-editor-controls button[aria-pressed="true"] {
+  background: var(--floating-active);
+  border-color: var(--primary);
+}
+.image-editor-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 120px;
+  overflow: hidden;
+  background: #242632;
+  border-radius: 12px;
+}
+.image-editor-text-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 21100;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgb(0 0 0 / 45%);
+}
+.image-editor-text-dialog {
+  width: min(480px, 100%);
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  padding: 20px;
+  border-radius: 16px;
+  background: var(--floating-surface-base);
+  color: var(--text);
+  border: 1px solid var(--floating-border);
+}
+.reference-selection-dialog {
+  width: min(680px, 100%);
+  max-height: calc(100dvh - 32px);
+  min-height: 0;
+  overflow: auto;
+  padding: 20px;
+  border-radius: 20px;
+  color: var(--text);
+  background: var(--floating-surface-base);
+  border: 1px solid var(--floating-border);
+}
+.reference-selection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 10px;
+}
+.reference-selection-item {
+  border: 2px solid var(--floating-border);
+  border-radius: 12px;
+  background: var(--floating-control);
+  color: var(--text);
+  padding: 6px;
+}
+.reference-selection-item.is-selected {
+  border-color: var(--primary);
+  background: var(--floating-active);
+  box-shadow: inset 0 0 0 2px var(--primary);
+}
+.reference-selection-item img { width: 100%; height: 90px; object-fit: contain; }

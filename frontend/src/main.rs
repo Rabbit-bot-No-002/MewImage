@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod crypto;
 mod data_management;
+pub mod image_editor;
 mod providers;
 mod storage;
 

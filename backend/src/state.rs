@@ -74,6 +74,7 @@ pub struct AppConfig {
     pub enforce_provider_host_whitelist: bool,
     pub allow_insecure_upstreams: bool,
     pub allow_loopback_upstreams: bool,
+    pub dev_bypass_upstream_ssrf: bool,
     pub enable_guest_proxy: bool,
     pub guest_generation_concurrency: u32,
     pub guest_image_concurrency: u32,
@@ -192,6 +193,12 @@ impl AppConfig {
                 .or_else(|_| std::env::var("MEW_IMAGE_ALLOW_LOOPBACK_UPSTREAM"))
                 .map(|value| value == "true")
                 .unwrap_or(false),
+            dev_bypass_upstream_ssrf: env_value(
+                "MEW_DEV_BYPASS_UPSTREAM_SSRF",
+                "MEW_IMAGE_DEV_BYPASS_UPSTREAM_SSRF",
+            )
+            .map(|value| value == "true")
+            .unwrap_or(false),
             enable_guest_proxy: env_value("MEW_GUEST_PROXY", "MEW_IMAGE_ENABLE_GUEST_PROXY")
                 .map(|value| value != "false")
                 .unwrap_or(true),

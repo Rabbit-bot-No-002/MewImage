@@ -1986,8 +1986,10 @@ async fn validate_template_asset_ids(
     if payload.preview_asset_ids.len() > MAX_PREVIEWS {
         return Err(AppError::bad_request("每个模板最多使用 6 张预览图。"));
     }
-    if payload.reference_asset_ids.len() > MAX_REFERENCES {
-        return Err(AppError::bad_request("每个模板最多使用 16 张参考图。"));
+    if payload.reference_asset_ids.len() > mew_image_shared::MAX_GENERATION_REFERENCE_IMAGES {
+        return Err(AppError::bad_request(
+            "每个模板最多使用 10 张参考图；旧模板请精简后再保存。",
+        ));
     }
     let mut unique = BTreeSet::new();
     for (ids, max_edge, label) in [
@@ -2289,6 +2291,7 @@ mod tests {
 
     fn test_settings() -> mew_image_shared::GenerationSettingsSnapshot {
         mew_image_shared::GenerationSettingsSnapshot {
+            automatic_size: false,
             width: 1024,
             height: 1024,
             quality: Some("high".into()),
@@ -2586,6 +2589,7 @@ mod tests {
             description: String::new(),
             tags: vec!["测试".into()],
             generation_settings: mew_image_shared::GenerationSettingsSnapshot {
+                automatic_size: false,
                 width: 1024,
                 height: 1024,
                 quality: Some("high".into()),

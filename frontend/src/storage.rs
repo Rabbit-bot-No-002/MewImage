@@ -26,6 +26,253 @@ const TRUSTED_SYNC_KEY_PREFIX: &str = "mew-image-trusted-sync-key:";
 const API_KEY_SYNC_ENABLED_PREFIX: &str = "mew-image-api-key-sync-enabled:";
 const GENERATION_QUEUE_MODE_KEY: &str = "mew-image-generation-queue-mode";
 const GENERATION_STAGING_KEY_PREFIX: &str = "generation_staging:";
+const EDITOR_STAGING_KEY_PREFIX: &str = "editor_asset_staging:";
+
+mod editor_commit;
+pub(crate) use editor_commit::commit_editor_application;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EditorAssetStaging {
+    thread_id: String,
+    assets: Vec<ImageAssetRef>,
+}
+
+/// Blob 与编辑结果元数据一起提交，跨越工作区后台快照的保存窗口。
+pub(crate) async fn stage_editor_assets(
+    thread_id: &str,
+    assets: &[ImageAssetRef],
+    blobs: &[(String, Blob)],
+) -> Result<String, String> {
+    if assets.is_empty()
+        || assets.len() > 2
+        || assets.len() != blobs.len()
+        || assets.iter().any(|asset| {
+            !blobs
+                .iter()
+                .any(|(id, blob)| id == &asset.id && blob.size() as u64 == asset.byte_len)
+        })
+    {
+        return Err("编辑暂存资源与文件不一致。".into());
+    }
+    let key = format!("{EDITOR_STAGING_KEY_PREFIX}{}", uuid::Uuid::new_v4());
+    let value = serde_json::to_string(&EditorAssetStaging {
+        thread_id: thread_id.into(),
+        assets: assets.to_vec(),
+    })
+    .map_err(|error| error.to_string())?;
+    let db = open_db().await?;
+    let transaction = db
+        .transaction(
+            &[STORE_NAME, ASSET_BLOB_STORE_NAME],
+            TransactionMode::ReadWrite,
+        )
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(ASSET_BLOB_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    for (id, blob) in blobs {
+        store
+            .put(blob.as_ref(), Some(&JsValue::from_str(id)))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?
+        .put(&JsValue::from_str(&value), Some(&JsValue::from_str(&key)))
+        .await
+        .map_err(|error| error.to_string())?;
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(key)
+}
+
+pub(crate) async fn discard_editor_staging(key: &str, asset_ids: &[String]) -> Result<(), String> {
+    if !key.starts_with(EDITOR_STAGING_KEY_PREFIX) {
+        return Err("编辑暂存键无效。".into());
+    }
+    let db = open_db().await?;
+    let transaction = db
+        .transaction(
+            &[STORE_NAME, ASSET_BLOB_STORE_NAME],
+            TransactionMode::ReadWrite,
+        )
+        .map_err(|error| error.to_string())?;
+    let manifest_store = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let Some(value) = manifest_store
+        .get(JsValue::from_str(key))
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        // 已确认的应用不再有清单，迟到的取消清理不得删除其正式原图。
+        transaction
+            .done()
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    };
+    let staged: EditorAssetStaging =
+        serde_json::from_str(&value.as_string().ok_or("编辑暂存清单类型异常。")?)
+            .map_err(|error| error.to_string())?;
+    let staged_ids = staged
+        .assets
+        .iter()
+        .map(|asset| &asset.id)
+        .collect::<HashSet<_>>();
+    if staged_ids.len() != asset_ids.len() || asset_ids.iter().any(|id| !staged_ids.contains(id)) {
+        return Err("编辑清理范围与暂存清单不一致，未删除图片。".into());
+    }
+    let store = transaction
+        .store(ASSET_BLOB_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    for id in asset_ids {
+        store
+            .delete(JsValue::from_str(id))
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?
+        .delete(JsValue::from_str(key))
+        .await
+        .map_err(|error| error.to_string())?;
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn recover_editor_assets(db: &Rexie, state: &mut LocalAppState) -> Result<(), String> {
+    let draft_ids = crate::image_editor::draft_asset_ids(None).await?;
+    let transaction = db
+        .transaction(
+            &[STORE_NAME, ASSET_BLOB_STORE_NAME],
+            TransactionMode::ReadOnly,
+        )
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let blobs = transaction
+        .store(ASSET_BLOB_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    let mut keys = Vec::new();
+    let mut orphan_ids = HashSet::new();
+    for key in store
+        .get_all_keys(None, None)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if !key
+            .as_string()
+            .is_some_and(|key| key.starts_with(EDITOR_STAGING_KEY_PREFIX))
+        {
+            continue;
+        }
+        let value = store
+            .get(key.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .and_then(|value| value.as_string())
+            .ok_or("编辑暂存清单损坏，原数据未重置。")?;
+        let staged: EditorAssetStaging =
+            serde_json::from_str(&value).map_err(|error| error.to_string())?;
+        for asset in &staged.assets {
+            if editor_asset_needs_recovery(state, &staged.thread_id, &asset.id)
+                || (draft_ids.contains(&asset.id)
+                    && !state.assets.iter().any(|item| item.id == asset.id)
+                    && !state.tombstones.iter().any(|item| {
+                        item.entity_kind == mew_image_shared::SyncEntityKind::Asset
+                            && item.entity_id == asset.id
+                    }))
+            {
+                let blob = blobs
+                    .get(JsValue::from_str(&asset.id))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .and_then(|value| value.dyn_into::<Blob>().ok())
+                    .ok_or("编辑暂存原图缺失，无法完成恢复。")?;
+                if blob.size() as u64 != asset.byte_len {
+                    return Err("编辑暂存原图大小不匹配。".into());
+                }
+                state.assets.push(asset.clone());
+            } else if editor_asset_is_orphan(state, &draft_ids, &asset.id) {
+                orphan_ids.insert(asset.id.clone());
+            }
+        }
+        keys.push(key);
+    }
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    // 先确认索引保存，再清理清单；任一步失败都允许下次重复恢复。
+    save_workspace_snapshot_with_db(db, state).await?;
+    let transaction = db
+        .transaction(
+            &[STORE_NAME, ASSET_BLOB_STORE_NAME],
+            TransactionMode::ReadWrite,
+        )
+        .map_err(|error| error.to_string())?;
+    let store = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    for key in keys {
+        store.delete(key).await.map_err(|error| error.to_string())?;
+    }
+    let blobs = transaction
+        .store(ASSET_BLOB_STORE_NAME)
+        .map_err(|error| error.to_string())?;
+    for id in orphan_ids {
+        // 再次检查合并后的索引，避免另一份清单刚恢复的共享图片被回收。
+        if editor_asset_is_orphan(state, &draft_ids, &id) {
+            blobs
+                .delete(JsValue::from_str(&id))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction
+        .done()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn editor_asset_needs_recovery(state: &LocalAppState, thread_id: &str, asset_id: &str) -> bool {
+    (state.threads.iter().any(|thread| thread.id == thread_id)
+        || state
+            .tasks
+            .iter()
+            .any(|task| task.input_asset_ids().any(|id| id == asset_id)))
+        && !state.assets.iter().any(|asset| asset.id == asset_id)
+        && !state.tombstones.iter().any(|item| {
+            item.entity_kind == mew_image_shared::SyncEntityKind::Asset
+                && item.entity_id == asset_id
+        })
+}
+
+fn editor_asset_is_orphan(
+    state: &LocalAppState,
+    draft_ids: &HashSet<String>,
+    asset_id: &str,
+) -> bool {
+    !state.assets.iter().any(|asset| asset.id == asset_id)
+        && !state
+            .tasks
+            .iter()
+            .any(|task| task.input_asset_ids().any(|id| id == asset_id))
+        && !draft_ids.contains(asset_id)
+}
 const ASSET_WRITE_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 thread_local! {
@@ -162,7 +409,7 @@ fn set_local_storage_value(key: &str, value: &str) -> Result<(), String> {
         .map_err(|error| format!("{error:?}"))
 }
 
-async fn open_db() -> Result<Rexie, String> {
+pub(crate) async fn open_db() -> Result<Rexie, String> {
     Rexie::builder(DB_NAME)
         .version(3)
         .add_object_store(ObjectStore::new(STORE_NAME))
@@ -214,6 +461,7 @@ pub async fn load_snapshot() -> Result<LocalAppState, String> {
         save_workspace_snapshot_with_db(&db, &state).await?;
         clear_generation_staging_entries(&db, &recovery).await?;
     }
+    recover_editor_assets(&db, &mut state).await?;
     Ok(state)
 }
 
@@ -601,7 +849,7 @@ fn asset_write_batch_end(payload_writes: &[(String, String)], start: usize) -> u
     end.max(start.saturating_add(1)).min(payload_writes.len())
 }
 
-async fn apply_asset_blob_changes(
+pub(crate) async fn apply_asset_blob_changes(
     payload_writes: &[(String, Blob)],
     payload_deletes: &[String],
 ) -> Result<(), String> {
@@ -730,6 +978,34 @@ enum StoredAssetPayload {
     Legacy(String),
 }
 
+/// 编辑底图和遮罩必须读取原始持久化字节；不从远程地址回退或重新编码。
+pub(crate) async fn load_edit_asset_blob(asset_id: &str) -> Result<Blob, String> {
+    let stored = load_stored_asset_payloads(&[asset_id.to_string()]).await?;
+    match stored.into_iter().next().map(|(_, payload)| payload) {
+        Some(StoredAssetPayload::Blob(blob)) => Ok(blob),
+        Some(StoredAssetPayload::Legacy(data_url)) => data_url_to_blob(&data_url),
+        None => Err(format!(
+            "编辑资源 `{asset_id}` 的本地原图缺失，请重新应用编辑草稿。"
+        )),
+    }
+}
+
+pub(crate) async fn store_editor_draft_blob(asset_id: &str, blob: &Blob) -> Result<(), String> {
+    if !asset_id.starts_with("editor-mask-") || blob.type_() != "image/png" {
+        return Err("编辑遮罩暂存标识或格式无效。".into());
+    }
+    apply_asset_blob_changes(&[(asset_id.to_string(), blob.clone())], &[]).await
+}
+
+pub(crate) async fn delete_editor_draft_blobs(asset_ids: &[String]) -> Result<(), String> {
+    let ids = asset_ids
+        .iter()
+        .filter(|id| id.starts_with("editor-mask-"))
+        .cloned()
+        .collect::<Vec<_>>();
+    apply_asset_blob_changes(&[], &ids).await
+}
+
 async fn load_stored_asset_payloads(
     asset_ids: &[String],
 ) -> Result<Vec<(String, StoredAssetPayload)>, String> {
@@ -810,10 +1086,11 @@ fn replace_cached_asset_blob(asset_id: &str, blob: &Blob) {
 }
 
 pub async fn clear_asset_payloads() -> Result<(), String> {
+    crate::image_editor::runtime::invalidate_runtime_writes();
     let db = open_db().await?;
     let transaction = db
         .transaction(
-            &[ASSET_BLOB_STORE_NAME, ASSET_STORE_NAME],
+            &[ASSET_BLOB_STORE_NAME, ASSET_STORE_NAME, STORE_NAME],
             TransactionMode::ReadWrite,
         )
         .map_err(|error| error.to_string())?;
@@ -824,6 +1101,9 @@ pub async fn clear_asset_payloads() -> Result<(), String> {
     let legacy_store = transaction
         .store(ASSET_STORE_NAME)
         .map_err(|error| error.to_string())?;
+    let kv = transaction
+        .store(STORE_NAME)
+        .map_err(|error| error.to_string())?;
     blob_store
         .clear()
         .await
@@ -832,6 +1112,18 @@ pub async fn clear_asset_payloads() -> Result<(), String> {
         .clear()
         .await
         .map_err(|error| error.to_string())?;
+    for key in kv
+        .get_all_keys(None, None)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        if key.as_string().is_some_and(|key| {
+            key.starts_with(EDITOR_STAGING_KEY_PREFIX)
+                || key == crate::image_editor::runtime::RUNTIME_KEY
+        }) {
+            kv.delete(key).await.map_err(|error| error.to_string())?;
+        }
+    }
     transaction
         .done()
         .await
@@ -884,6 +1176,7 @@ mod tests {
 
     fn running_task(id: &str) -> LocalTaskRecord {
         LocalTaskRecord {
+            editing: None,
             id: id.into(),
             thread_id: "thread-1".into(),
             config_id: "config-1".into(),
@@ -919,6 +1212,45 @@ mod tests {
             source_task_id: Some(task_id.into()),
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn editor_orphan_cleanup_preserves_task_draft_and_restored_references() {
+        let mut state = LocalAppState::default();
+        state.threads.clear();
+        let mut task = running_task("task");
+        task.reference_asset_ids.push("base".into());
+        state.tasks.push(task);
+        let drafts = HashSet::from(["draft-base".into()]);
+        assert!(editor_asset_needs_recovery(
+            &state,
+            "removed-thread",
+            "base"
+        ));
+        assert!(!editor_asset_is_orphan(&state, &drafts, "base"));
+        assert!(!editor_asset_is_orphan(&state, &drafts, "draft-base"));
+        assert!(editor_asset_is_orphan(&state, &drafts, "unused"));
+        state.assets.push(staged_asset("unused", "task"));
+        assert!(!editor_asset_is_orphan(&state, &drafts, "unused"));
+    }
+
+    #[test]
+    fn editor_recovery_never_resurrects_deleted_assets_or_removed_threads() {
+        let mut state = LocalAppState::default();
+        let thread_id = state.threads[0].id.clone();
+        assert!(editor_asset_needs_recovery(&state, &thread_id, "base"));
+        state.assets.push(staged_asset("base", "task"));
+        assert!(!editor_asset_needs_recovery(&state, &thread_id, "base"));
+        state.assets.clear();
+        state.tombstones.push(mew_image_shared::SyncTombstone {
+            entity_kind: mew_image_shared::SyncEntityKind::Asset,
+            entity_id: "base".into(),
+            deleted_at: "now".into(),
+        });
+        assert!(!editor_asset_needs_recovery(&state, &thread_id, "base"));
+        state.tombstones.clear();
+        state.threads.clear();
+        assert!(!editor_asset_needs_recovery(&state, &thread_id, "base"));
     }
 
     #[test]

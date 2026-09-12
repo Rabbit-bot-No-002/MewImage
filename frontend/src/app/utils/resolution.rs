@@ -33,8 +33,10 @@ pub(crate) fn resolve_dimensions_from_reference_size(
     reference_size: Option<(u32, u32)>,
 ) -> (u32, u32) {
     if mode == "custom" {
-        let result = clamp_size(custom_width, custom_height);
-        return (result.width, result.height);
+        return (custom_width, custom_height);
+    }
+    if mode == "model_auto" {
+        return mew_image_shared::AUTO_IMAGE_BUDGET_DIMENSIONS;
     }
     if mode == "auto" {
         if let Some((width, height)) = reference_size {

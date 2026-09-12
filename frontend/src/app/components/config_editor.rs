@@ -215,10 +215,15 @@ pub(crate) fn ConfigEditor(
             <input
                 class="text-input"
                 placeholder="模型名"
+                list="image-model-suggestions"
                 prop:value=move || model_draft.get()
                 on:input=move |ev| model_draft.set(event_target_value(&ev))
                 on:blur=move |_| commit_model()
             />
+            <datalist id="image-model-suggestions">
+                <option value="gpt-image-2.5-flare">"GPT Image 2.5 · Flare"</option>
+                <option value="gpt-image-2.5-sunburst">"GPT Image 2.5 · Sunburst"</option>
+            </datalist>
             {move || {
                 let show_responses_model = template_id_draft.get()
                     == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID

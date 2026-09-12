@@ -10,6 +10,29 @@ pub(crate) fn install_app_effects() {
     let derived = expect_context::<AppDerived>();
 
     Effect::new(move |_| {
+        if !persistence
+            .local_state_status
+            .with(LocalStateLoadStatus::is_ready)
+        {
+            return;
+        }
+        let runtime = crate::image_editor::runtime::EditorRuntime {
+            editing_by_thread: composer.editing_by_thread.get(),
+            thread_id: workspace.current_thread_id.get(),
+            reference_ids: composer.selected_reference_ids.get(),
+            continuation_id: composer.continuation_asset_id.get(),
+        };
+        let save = crate::image_editor::runtime::save_runtime(runtime);
+        spawn_local(async move {
+            if let Err(error) = save.await {
+                composer
+                    .status_text
+                    .set(format!("当前编辑选择保存失败，请勿刷新：{error}"));
+            }
+        });
+    });
+
+    Effect::new(move |_| {
         apply_appearance(&workspace.preferences.get(), ui.system_dark.get());
     });
 
@@ -123,6 +146,15 @@ pub(crate) fn install_app_effects() {
         };
         let on_keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |event: KeyboardEvent| {
             if event.key() != "Escape" {
+                return;
+            }
+            if ui.image_editor_thread.get_untracked().is_some() {
+                return;
+            }
+            if ui.reference_selection.get_untracked().is_some() {
+                ui.reference_selection.set(None);
+                event.prevent_default();
+                event.stop_immediate_propagation();
                 return;
             }
             if ui.show_config_switcher.get_untracked() {
@@ -311,11 +343,29 @@ async fn initialize_app_state(
         false
     };
     reconcile_task_integrity(&mut state.tasks, &state.assets, true);
-    let initial_thread_id = state
-        .threads
-        .first()
-        .map(|thread| thread.id.clone())
-        .unwrap_or_default();
+    let mut editor_runtime = match crate::image_editor::runtime::load_runtime().await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            persistence
+                .local_state_status
+                .set(LocalStateLoadStatus::Failed(error.clone()));
+            composer
+                .status_text
+                .set(format!("编辑状态恢复失败，原数据未重置：{error}"));
+            return;
+        }
+    };
+    editor_runtime.retain_existing_threads(&state);
+    let initial_thread_id = editor_runtime.thread_id;
+    composer
+        .editing_by_thread
+        .set(editor_runtime.editing_by_thread);
+    composer
+        .selected_reference_ids
+        .set(editor_runtime.reference_ids);
+    composer
+        .continuation_asset_id
+        .set(editor_runtime.continuation_id);
     workspace.current_thread_id.set(initial_thread_id.clone());
     workspace.current_config_id.set(
         state
@@ -327,7 +377,8 @@ async fn initialize_app_state(
     composer.draft_prompt.set(
         state
             .threads
-            .first()
+            .iter()
+            .find(|thread| thread.id == initial_thread_id)
             .map(|thread| thread.draft_prompt.clone())
             .unwrap_or_default(),
     );

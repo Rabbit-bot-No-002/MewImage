@@ -17,6 +17,16 @@ youtube：https://youtu.be/43DXly6Cw5U?si=57ihgJLuHs3uyjgu
 
 ## 当前实现
 
+- GPT Image 2.5 基础适配：可选 `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`，质量支持 `auto/low/medium/high/xhigh/max`；`max` 表示质量，不等于 4K。已有模型不会自动替换。
+- 已知 GPT Image 2/2.5 的显式尺寸在前后端统一校验；Responses 请求同时指定图片工具模型与独立主模型。未知中转站别名的新质量兼容性由上游决定。
+- 新生成请求最多使用 10 张参考图，旧任务和模板包的 11–16 张历史图片不会自动删除或截断；旧模板修改后保存须精简到 10 张，历史复用超额时先选择参考图再应用。
+- “模型自动”向 OpenAI Image 发送 `size=auto`，按最大输出尺寸预留内存；原“自动”仍表示沿用参考图尺寸。代理后端须支持 `image_generation_options_v2` 才能使用模型自动尺寸及显式 Responses 图片模型。
+- 遮罩/草图/标记编辑器已接入工作台及生成协议，浏览器交互和真实上游兼容性仍在分阶段验收，详见 [升级进度](docs/image-25-upgrade.md)。
+- 编辑器应用输入时先保存原图，再以同一事务确认资源索引和本地编辑参数，确认后才更新工作台；操作草稿仅保存在当前浏览器，不进入云同步和项目包，最终底图、遮罩与任务快照进入正常同步和备份链路。
+- 编辑底图超过 4096 边长时，会先请求确认创建等比 PNG 工作副本；不覆盖原图。取消或缩小失败不会自动覆盖已有编辑草稿。
+- 局部修改可导入与工作底图同尺寸、含透明编辑区域的 Alpha PNG 遮罩，并继续用画笔或橡皮调整；遮罩是独立资源，不占 10 张普通参考图名额。Images API 使用独立 `mask`，Responses API 使用 `input_image_mask.image_url`；中转站仅承诺其文档明确支持的 Images 路线。
+- 后端健康接口以 `image_editing_v1` 声明编辑协议能力。代理生成和包含编辑任务的云同步会在上传资源前检查该能力，旧后端不会静默丢弃遮罩关系。
+
 - 历史、会话、收藏、参考图、界面偏好默认保存在浏览器 IndexedDB；v3 起原图以 Blob 保存，旧 Data URL 会按需迁移
 - 登录只是同步增强能力，不是使用前提
 - 注册用户默认需要管理员审批，审批通过后才能使用云端同步和服务器资源存储
@@ -65,7 +75,7 @@ youtube：https://youtu.be/43DXly6Cw5U?si=57ihgJLuHs3uyjgu
 
 点击“使用模板”只会下载并校验参考图、填充原始提示词和兼容参数，然后返回工作台等待用户确认，不会自动提交生成或产生费用。当前服务商与推荐服务商不一致时保留当前配置，并显示推荐模型差异。点击“收藏”会在浏览器中建立包含预览、参考图和参数的独立本地快照，因此模板下架后仍可使用，但会额外占用 IndexedDB 空间。
 
-管理员可以新建模板，或从成功结果卡片的发布按钮预填草稿。每个模板最多包含 6 张预览图和 16 张参考图；浏览器统一转换为质量 0.9 的 WebP，预览图最长边 2048px、参考图最长边 4096px。服务端会为模板图片生成最长边 480px 的独立缩略图，列表和紧凑图片条优先加载缩略图，详情主预览及实际复用时再读取原图。草稿和归档内容仅管理员可见，公开用户只能访问已发布模板及其图片。
+管理员可以新建模板，或从成功结果卡片的发布按钮预填草稿。每个模板最多包含 6 张预览图和 10 张参考图；浏览器统一转换为质量 0.9 的 WebP，预览图最长边 2048px、参考图最长边 4096px。服务端会为模板图片生成最长边 480px 的独立缩略图，列表和紧凑图片条优先加载缩略图，详情主预览及实际复用时再读取原图。草稿和归档内容仅管理员可见，公开用户只能访问已发布模板及其图片。
 
 管理员可单独导出模板广场 ZIP，也可选择合并或全量替换导入。模板包包含模板、标签、非敏感生成参数和经 SHA-256 校验的全部原始图片，不包含账号、API Key、点赞身份或票数；缩略图属于可重建派生数据，导入时由服务端重新生成。全量替换会清空现有点赞并经过两次确认；服务端完整校验 ZIP 路径、大小、数量、格式和哈希后才提交 SQLite 事务，对象存储 staging 记录会在提交时原子转换并由后台回收中断上传。广场资源默认总配额为 5 GiB、20,000 个文件，可通过 `MEW_GALLERY_ASSET_QUOTA_MIB` 和 `MEW_GALLERY_ASSET_QUOTA_COUNT` 调整。
 
@@ -243,6 +253,35 @@ cargo run -p mew-image-backend
 
 该开发开关只允许显式的 `127.0.0.1`、`::1`、`localhost` 和 `localhost.localdomain`，且仅在 MewImage 后端自身监听环回地址时生效；`10.x`、`172.16–31.x`、`192.168.x` 等局域网地址仍会被拒绝。默认 Docker 监听 `0.0.0.0:3000`，因此该开关不会放宽容器部署。直接执行 `cargo run` 不会自动读取项目根目录的 `.env`，使用上述命令最可靠。测试结束后可关闭当前终端；PowerShell 也可执行 `Remove-Item Env:MEW_ALLOW_LOOPBACK_UPSTREAM, Env:MEW_ALLOW_HTTP_UPSTREAM`，Bash/Zsh 可执行 `unset MEW_ALLOW_LOOPBACK_UPSTREAM MEW_ALLOW_HTTP_UPSTREAM` 清除临时变量。
 
+
+#### 本地生图被 SSRF 策略拦截
+
+`MEW_ALLOW_HTTP_UPSTREAM` 只允许明文 HTTP，`MEW_ALLOW_LOOPBACK_UPSTREAM` 只允许显式环回上游。生图还会下载上游返回的图片 URL，并逐次检查图片重定向；因此即使 API 是公网 IP，图片域名解析到私网或代理软件的 Fake-IP（例如 `198.18.x.x`）仍会失败。错误中的目标主机和后端日志中的解析地址可用于定位实际被拦截的地址。
+
+本地需要完整测试这些上游时，先停止后端，在**启动后端的同一个 PowerShell 终端**执行：
+
+```powershell
+Set-Location D:\project\MewImage
+$env:MEW_LISTEN = "127.0.0.1:3000"
+$env:MEW_ALLOW_HTTP_UPSTREAM = "true"
+$env:MEW_DEV_BYPASS_UPSTREAM_SSRF = "true"
+cargo run -p mew-image-backend
+```
+
+Linux/macOS 可在项目根目录运行：
+
+```bash
+MEW_LISTEN=127.0.0.1:3000 \
+MEW_ALLOW_HTTP_UPSTREAM=true \
+MEW_DEV_BYPASS_UPSTREAM_SSRF=true \
+cargo run -p mew-image-backend
+```
+
+前端仍可使用 `http://127.0.0.1:8080/`。在前端终端设置变量不会影响已经启动的后端，直接 `cargo run` 也不会自动加载 `.env`。启动日志会明确显示开关是否生效。
+
+`MEW_DEV_BYPASS_UPSTREAM_SSRF` 默认关闭，仅在后端绑定环回地址时生效；绑定 `0.0.0.0`、`[::]` 或局域网地址时会忽略此开关并记录警告。开启后，生成请求、图片下载和图片重定向均跳过主机名与 IP 地址的 SSRF 拦截，无需再设置 `MEW_ALLOW_LOOPBACK_UPSTREAM`；HTTP 开关、URL 协议/凭据检查、已启用的主机白名单、大小/超时/重定向次数限制仍保留。这个模式允许访问本机和内部服务，仅用于本机开发，不应通过反向代理或隧道对外公开。
+
+测试后关闭该终端，或执行 `Remove-Item Env:MEW_DEV_BYPASS_UPSTREAM_SSRF, Env:MEW_ALLOW_HTTP_UPSTREAM` 并重启后端，即恢复默认策略。
 
 ### 账号规则
 

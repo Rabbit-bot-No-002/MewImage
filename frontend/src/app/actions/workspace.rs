@@ -1,5 +1,14 @@
 use super::super::*;
 
+struct ReferenceImportGuard(RwSignal<bool>);
+
+impl Drop for ReferenceImportGuard {
+    fn drop(&mut self) {
+        // 失败、提前返回或页面卸载均释放导入占用，避免按钮永久锁定。
+        let _ = self.0.try_set(false);
+    }
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_workspace_actions(
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
@@ -94,76 +103,117 @@ pub(crate) fn build_workspace_actions(
     };
 
     let perform_delete_thread = move |thread_id: String| {
-        // 确认框可能在任务提交前已经打开，因此执行删除时必须再次校验。
-        if generation_runtimes
-            .with_untracked(|items| items.values().any(|runtime| runtime.thread_id == thread_id))
-        {
-            status_text.set("该会话仍有生成任务运行，请先停止或等待任务完成。".into());
-            return;
-        }
-        let result = delete_thread_preserving_favorites(
-            tasks.get_untracked(),
-            assets.get_untracked(),
-            &thread_id,
-            &now_rfc3339(),
-        );
-        let mut deleted_entities =
-            Vec::with_capacity(1 + result.removed_task_ids.len() + result.removed_asset_ids.len());
-        deleted_entities.push((SyncEntityKind::Thread, thread_id.clone()));
-        deleted_entities.extend(
-            result
-                .removed_task_ids
-                .iter()
-                .cloned()
-                .map(|id| (SyncEntityKind::Task, id)),
-        );
-        deleted_entities.extend(
-            result
-                .removed_asset_ids
-                .iter()
-                .cloned()
-                .map(|id| (SyncEntityKind::Asset, id)),
-        );
-        record_sync_tombstones(tombstones, deleted_entities);
-        let removed_asset_ids = result.removed_asset_ids.clone();
-        let retained_favorite_count = result.retained_favorite_count;
-        tasks.set(result.tasks);
-        assets.set(result.assets);
-        if !removed_asset_ids.is_empty() {
-            enqueue_payload_deletes(removed_asset_ids.clone());
-        }
-        threads.update(|items| {
-            items.retain(|thread| thread.id != thread_id);
-            if items.is_empty() {
-                items.push(default_thread());
-            }
-        });
-        selected_reference_ids.update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
-        if continuation_asset_id
-            .get_untracked()
-            .as_ref()
-            .map(|id| removed_asset_ids.contains(id))
-            .unwrap_or(false)
-        {
-            continuation_asset_id.set(None);
-        }
-        if current_thread_id.get_untracked() == thread_id {
-            let fallback = threads
+        spawn_local(async move {
+            let mut protected_ids =
+                match crate::image_editor::draft_asset_ids(Some(&thread_id)).await {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        status_text.set(format!("无法确认其他会话的草稿引用，未删除会话：{error}"));
+                        return;
+                    }
+                };
+            composer.editing_by_thread.with_untracked(|items| {
+                protected_ids.extend(
+                    items
+                        .iter()
+                        .filter(|(id, _)| *id != &thread_id)
+                        .flat_map(|(_, editing)| editing.asset_ids().cloned()),
+                );
+            });
+            if ui
+                .image_editor_thread
                 .get_untracked()
-                .first()
-                .cloned()
-                .unwrap_or_else(default_thread);
-            current_thread_id.set(fallback.id.clone());
-            draft_prompt.set(fallback.draft_prompt);
-            selected_reference_ids.set(Vec::new());
-            reference_menu_asset_id.set(None);
-            continuation_asset_id.set(None);
-        }
-        persist_state();
-        status_text.set(if retained_favorite_count == 0 {
-            "会话已删除。".into()
-        } else {
-            format!("会话已删除，已在全局收藏夹独立保留 {retained_favorite_count} 条收藏。")
+                .as_ref()
+                .is_some_and(|id| id != &thread_id)
+            {
+                protected_ids.extend(ui.image_editor_base_id.get_untracked());
+            }
+            // 确认框可能在任务提交前已经打开，因此执行删除时必须再次校验。
+            if generation_runtimes.with_untracked(|items| {
+                items.values().any(|runtime| runtime.thread_id == thread_id)
+            }) {
+                status_text.set("该会话仍有生成任务运行，请先停止或等待任务完成。".into());
+                return;
+            }
+            crate::image_editor::invalidate_pending_draft_writes();
+            if ui.image_editor_thread.get_untracked().as_deref() == Some(&thread_id) {
+                ui.image_editor_thread.set(None);
+            }
+            let deleted_draft_thread = thread_id.clone();
+            composer.editing_by_thread.update(|items| {
+                items.remove(&thread_id);
+            });
+            spawn_local(async move {
+                if let Err(error) = crate::image_editor::delete_draft(&deleted_draft_thread).await {
+                    status_text.set(format!("会话编辑草稿清理失败：{error}"));
+                }
+            });
+            let result = delete_thread_preserving_inputs(
+                tasks.get_untracked(),
+                assets.get_untracked(),
+                &thread_id,
+                &now_rfc3339(),
+                &protected_ids,
+            );
+            let mut deleted_entities = Vec::with_capacity(
+                1 + result.removed_task_ids.len() + result.removed_asset_ids.len(),
+            );
+            deleted_entities.push((SyncEntityKind::Thread, thread_id.clone()));
+            deleted_entities.extend(
+                result
+                    .removed_task_ids
+                    .iter()
+                    .cloned()
+                    .map(|id| (SyncEntityKind::Task, id)),
+            );
+            deleted_entities.extend(
+                result
+                    .removed_asset_ids
+                    .iter()
+                    .cloned()
+                    .map(|id| (SyncEntityKind::Asset, id)),
+            );
+            record_sync_tombstones(tombstones, deleted_entities);
+            let removed_asset_ids = result.removed_asset_ids.clone();
+            let retained_favorite_count = result.retained_favorite_count;
+            tasks.set(result.tasks);
+            assets.set(result.assets);
+            if !removed_asset_ids.is_empty() {
+                enqueue_payload_deletes(removed_asset_ids.clone());
+            }
+            threads.update(|items| {
+                items.retain(|thread| thread.id != thread_id);
+                if items.is_empty() {
+                    items.push(default_thread());
+                }
+            });
+            selected_reference_ids.update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
+            if continuation_asset_id
+                .get_untracked()
+                .as_ref()
+                .map(|id| removed_asset_ids.contains(id))
+                .unwrap_or(false)
+            {
+                continuation_asset_id.set(None);
+            }
+            if current_thread_id.get_untracked() == thread_id {
+                let fallback = threads
+                    .get_untracked()
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(default_thread);
+                current_thread_id.set(fallback.id.clone());
+                draft_prompt.set(fallback.draft_prompt);
+                selected_reference_ids.set(Vec::new());
+                reference_menu_asset_id.set(None);
+                continuation_asset_id.set(None);
+            }
+            persist_state();
+            status_text.set(if retained_favorite_count == 0 {
+                "会话已删除。".into()
+            } else {
+                format!("会话已删除，已在全局收藏夹独立保留 {retained_favorite_count} 条收藏。")
+            });
         });
     };
 
@@ -200,13 +250,31 @@ pub(crate) fn build_workspace_actions(
         show_thread_archive_menu.set(false);
     };
 
+    let reference_import_busy = RwSignal::new(false);
     let import_reference_assets = move |files: FileList| {
+        if reference_import_busy.get_untracked() {
+            status_text.set("上一批参考图仍在导入，请稍后再添加。".into());
+            return;
+        }
+        let selected = selected_reference_ids.get_untracked();
+        let continuation = continuation_asset_id.get_untracked();
+        let extra_base = usize::from(
+            continuation
+                .as_ref()
+                .is_some_and(|id| !selected.contains(id)),
+        );
+        if selected.len() + extra_base + files.length() as usize > MAX_GENERATION_REFERENCE_ASSETS {
+            status_text.set("参考图总数最多 10 张，请减少本次文件选择或先取消部分参考图。".into());
+            return;
+        }
         let assets_signal = assets;
         let selected_reference_ids = selected_reference_ids;
         let status_text = status_text;
         let persist = persist_state;
         let thread_id = current_thread_id.get_untracked();
+        reference_import_busy.set(true);
         spawn_local(async move {
+            let _import_guard = ReferenceImportGuard(reference_import_busy);
             match import_file_list(files).await {
                 Ok(mut imported) => {
                     let existing_thread_assets = assets_signal.with_untracked(|items| {
@@ -265,6 +333,18 @@ pub(crate) fn build_workspace_actions(
                     }
                     for asset in &mut imported {
                         asset.data_url = None;
+                    }
+                    // 写入期间用户仍可改变选择；应用前再次校验，超额时回滚新 Blob。
+                    let mut next_selected: HashSet<_> =
+                        selected_reference_ids.get_untracked().into_iter().collect();
+                    next_selected.extend(continuation_asset_id.get_untracked());
+                    next_selected.extend(reused_ids.iter().chain(imported_ids.iter()).cloned());
+                    if current_thread_id.get_untracked() != thread_id
+                        || next_selected.len() > MAX_GENERATION_REFERENCE_ASSETS
+                    {
+                        let _ = apply_asset_payload_changes(&[], &imported_ids).await;
+                        status_text.set("导入期间会话或参考图选择发生变化，本次导入未应用，请减少到 10 张以内后重试。".into());
+                        return;
                     }
                     assets_signal.update(|items| {
                         items.extend(imported);
@@ -326,31 +406,63 @@ pub(crate) fn build_workspace_actions(
     };
 
     let perform_delete_asset = move |asset_id: String| {
-        // 防止旧确认框在图片成为运行任务依赖后继续执行物理删除。
-        if generation_runtimes.with_untracked(|items| {
-            items
-                .values()
-                .any(|runtime| runtime.dependency_asset_ids.contains(&asset_id))
-        }) {
-            status_text.set("这张图片正被生成任务使用，请先停止或等待任务完成。".into());
-            return;
-        }
-        assets.update(|items| items.retain(|asset| asset.id != asset_id));
-        selected_reference_ids.update(|ids| ids.retain(|id| id != &asset_id));
-        if dragging_reference_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
-            dragging_reference_id.set(None);
-        }
-        if reference_menu_asset_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
-            reference_menu_asset_id.set(None);
-        }
-        if continuation_asset_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
-            continuation_asset_id.set(None);
-        }
-        let removed_asset_ids = vec![asset_id.clone()];
-        record_sync_tombstones(tombstones, [(SyncEntityKind::Asset, asset_id.clone())]);
-        enqueue_payload_deletes(removed_asset_ids);
-        persist_state();
-        status_text.set("参考图已删除。".into());
+        spawn_local(async move {
+            match crate::image_editor::draft_references_asset(&asset_id).await {
+                Ok(false) => (),
+                Ok(true) => {
+                    status_text.set(
+                        "这张图片仍被本地编辑草稿使用，请先更换草稿底图或删除对应会话。".into(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    status_text.set(format!("无法确认编辑草稿引用，未删除图片：{error}"));
+                    return;
+                }
+            }
+            if (ui.image_editor_thread.with_untracked(Option::is_some)
+                && ui.image_editor_base_id.get_untracked().as_deref() == Some(asset_id.as_str()))
+                || tasks.with_untracked(|items| {
+                    items
+                        .iter()
+                        .any(|task| task.input_asset_ids().any(|id| id == &asset_id))
+                })
+                || composer.editing_by_thread.with_untracked(|items| {
+                    items
+                        .values()
+                        .any(|editing| editing.asset_ids().any(|id| id == &asset_id))
+                })
+            {
+                status_text
+                    .set("这张图片仍被任务或当前编辑输入引用，不能删除；可以取消参考选择。".into());
+                return;
+            }
+            // 防止旧确认框在图片成为运行任务依赖后继续执行物理删除。
+            if generation_runtimes.with_untracked(|items| {
+                items
+                    .values()
+                    .any(|runtime| runtime.dependency_asset_ids.contains(&asset_id))
+            }) {
+                status_text.set("这张图片正被生成任务使用，请先停止或等待任务完成。".into());
+                return;
+            }
+            assets.update(|items| items.retain(|asset| asset.id != asset_id));
+            selected_reference_ids.update(|ids| ids.retain(|id| id != &asset_id));
+            if dragging_reference_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
+                dragging_reference_id.set(None);
+            }
+            if reference_menu_asset_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
+                reference_menu_asset_id.set(None);
+            }
+            if continuation_asset_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
+                continuation_asset_id.set(None);
+            }
+            let removed_asset_ids = vec![asset_id.clone()];
+            record_sync_tombstones(tombstones, [(SyncEntityKind::Asset, asset_id.clone())]);
+            enqueue_payload_deletes(removed_asset_ids);
+            persist_state();
+            status_text.set("参考图已删除。".into());
+        });
     };
 
     let delete_asset = move |asset_id: String, x: f64, y: f64| {
@@ -377,25 +489,33 @@ pub(crate) fn build_workspace_actions(
         let Some(task) = task_list.iter().find(|task| task.id == task_id).cloned() else {
             return;
         };
-        let thread_list = threads.get_untracked();
-        let target_thread_id =
-            task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
-        selected_reference_ids.set(task.reference_asset_ids.clone());
-        reference_menu_asset_id.set(None);
-        current_thread_id.set(target_thread_id.clone());
-        draft_prompt.set(task.prompt.clone());
-        continuation_asset_id.set(None);
-        threads.update(|items| {
-            if let Some(thread) = items
-                .iter_mut()
-                .find(|thread| thread.id == target_thread_id)
-            {
-                thread.draft_prompt = task.prompt.clone();
-                thread.updated_at = now_rfc3339();
-            }
-        });
-        persist_state();
-        status_text.set("已复用配置，下一次会继续沿用该提示词和参考图。".into());
+        crate::app::components::reference_selection::choose_task_references(
+            ui,
+            assets,
+            task,
+            None,
+            move |task| {
+                let thread_list = threads.get_untracked();
+                let target_thread_id =
+                    task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
+                selected_reference_ids.set(task.reference_asset_ids.clone());
+                reference_menu_asset_id.set(None);
+                current_thread_id.set(target_thread_id.clone());
+                draft_prompt.set(task.prompt.clone());
+                continuation_asset_id.set(None);
+                threads.update(|items| {
+                    if let Some(thread) = items
+                        .iter_mut()
+                        .find(|thread| thread.id == target_thread_id)
+                    {
+                        thread.draft_prompt = task.prompt.clone();
+                        thread.updated_at = now_rfc3339();
+                    }
+                });
+                persist_state();
+                status_text.set("已复用配置，下一次会继续沿用该提示词和参考图。".into());
+            },
+        );
     };
 
     let enter_continuation_context = move |task_id: String, asset_id: String| {
@@ -403,118 +523,145 @@ pub(crate) fn build_workspace_actions(
         let Some(task) = task_list.iter().find(|task| task.id == task_id).cloned() else {
             return;
         };
-        let thread_list = threads.get_untracked();
-        let target_thread_id =
-            task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
-        current_thread_id.set(target_thread_id.clone());
-        draft_prompt.set(task.prompt.clone());
-        selected_reference_ids.set(task.reference_asset_ids.clone());
-        continuation_asset_id.set(Some(asset_id.clone()));
-        queue_mode_enabled.set(false);
-        let _ = save_generation_queue_mode(false);
-        reference_menu_asset_id.set(None);
-        threads.update(|items| {
-            if let Some(thread) = items
-                .iter_mut()
-                .find(|thread| thread.id == target_thread_id)
-            {
-                thread.draft_prompt = task.prompt.clone();
-                thread.updated_at = now_rfc3339();
-            }
-        });
-        let assets_signal = assets;
-        let mut preload_asset_ids = task.reference_asset_ids.clone();
-        preload_asset_ids.push(asset_id);
-        spawn_local(async move {
-            let _ = ensure_asset_payloads_loaded(assets_signal, &preload_asset_ids).await;
-        });
-        persist_state();
-        status_text.set("已进入连续修改模式。".into());
+        crate::app::components::reference_selection::choose_task_references(
+            ui,
+            assets,
+            task,
+            Some(asset_id.clone()),
+            move |task| {
+                let thread_list = threads.get_untracked();
+                let target_thread_id =
+                    task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
+                current_thread_id.set(target_thread_id.clone());
+                draft_prompt.set(task.prompt.clone());
+                selected_reference_ids.set(task.reference_asset_ids.clone());
+                continuation_asset_id.set(Some(asset_id.clone()));
+                queue_mode_enabled.set(false);
+                let _ = save_generation_queue_mode(false);
+                reference_menu_asset_id.set(None);
+                threads.update(|items| {
+                    if let Some(thread) = items
+                        .iter_mut()
+                        .find(|thread| thread.id == target_thread_id)
+                    {
+                        thread.draft_prompt = task.prompt.clone();
+                        thread.updated_at = now_rfc3339();
+                    }
+                });
+                let assets_signal = assets;
+                let mut preload_asset_ids = task.reference_asset_ids.clone();
+                preload_asset_ids.push(asset_id.clone());
+                spawn_local(async move {
+                    let _ = ensure_asset_payloads_loaded(assets_signal, &preload_asset_ids).await;
+                });
+                persist_state();
+                status_text.set("已进入连续修改模式。".into());
+            },
+        );
     };
 
     let perform_delete_task = move |task_id: String| {
-        let deleting_current_preview = preview_state
-            .get_untracked()
-            .as_ref()
-            .map(|preview| preview.task_id == task_id)
-            .unwrap_or(false);
-        let mut next_tasks = tasks.get_untracked();
-        let deleted_reference_ids = next_tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .map(|task| {
-                task.reference_asset_ids
+        spawn_local(async move {
+            let mut protected_ids = match crate::image_editor::draft_asset_ids(None).await {
+                Ok(ids) => ids,
+                Err(error) => {
+                    status_text.set(format!("无法确认草稿引用，未删除任务：{error}"));
+                    return;
+                }
+            };
+            composer.editing_by_thread.with_untracked(|items| {
+                protected_ids.extend(
+                    items
+                        .values()
+                        .flat_map(|editing| editing.asset_ids().cloned()),
+                );
+            });
+            if ui.image_editor_thread.with_untracked(Option::is_some) {
+                protected_ids.extend(ui.image_editor_base_id.get_untracked());
+            }
+            if generation_runtimes.with_untracked(|items| items.contains_key(&task_id)) {
+                status_text.set("该任务仍在运行，请先取消生成。".into());
+                return;
+            }
+            let deleting_current_preview = preview_state
+                .get_untracked()
+                .as_ref()
+                .map(|preview| preview.task_id == task_id)
+                .unwrap_or(false);
+            let mut next_tasks = tasks.get_untracked();
+            let deleted_reference_ids = next_tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .map(|task| task.input_asset_ids().cloned().collect::<HashSet<_>>())
+                .unwrap_or_default();
+            next_tasks.retain(|task| task.id != task_id);
+            let mut remaining_reference_ids = next_tasks
+                .iter()
+                .flat_map(|task| task.input_asset_ids().cloned())
+                .collect::<HashSet<_>>();
+            remaining_reference_ids.extend(protected_ids);
+            let mut next_assets = assets.get_untracked();
+            let mut removed_asset_ids = Vec::new();
+            let updated_at = now_rfc3339();
+            next_assets.retain_mut(|asset| {
+                let generated_by_deleted_task =
+                    asset.source_task_id.as_deref() == Some(task_id.as_str());
+                if generated_by_deleted_task && remaining_reference_ids.contains(&asset.id) {
+                    asset.source_task_id = None;
+                    asset
+                        .metadata
+                        .insert(FAVORITE_ARCHIVE_ASSET_KEY.into(), "true".into());
+                    asset.updated_at = updated_at.clone();
+                    return true;
+                }
+                let unused_archived_reference = deleted_reference_ids.contains(&asset.id)
+                    && !remaining_reference_ids.contains(&asset.id)
+                    && asset.metadata.contains_key(FAVORITE_ARCHIVE_ASSET_KEY);
+                if generated_by_deleted_task || unused_archived_reference {
+                    removed_asset_ids.push(asset.id.clone());
+                    return false;
+                }
+                true
+            });
+            let mut deleted_entities = Vec::with_capacity(1 + removed_asset_ids.len());
+            deleted_entities.push((SyncEntityKind::Task, task_id.clone()));
+            deleted_entities.extend(
+                removed_asset_ids
                     .iter()
                     .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-        next_tasks.retain(|task| task.id != task_id);
-        let remaining_reference_ids = next_tasks
-            .iter()
-            .flat_map(|task| task.reference_asset_ids.iter().cloned())
-            .collect::<HashSet<_>>();
-        let mut next_assets = assets.get_untracked();
-        let mut removed_asset_ids = Vec::new();
-        let updated_at = now_rfc3339();
-        next_assets.retain_mut(|asset| {
-            let generated_by_deleted_task =
-                asset.source_task_id.as_deref() == Some(task_id.as_str());
-            if generated_by_deleted_task && remaining_reference_ids.contains(&asset.id) {
-                asset.source_task_id = None;
-                asset
-                    .metadata
-                    .insert(FAVORITE_ARCHIVE_ASSET_KEY.into(), "true".into());
-                asset.updated_at = updated_at.clone();
-                return true;
-            }
-            let unused_archived_reference = deleted_reference_ids.contains(&asset.id)
-                && !remaining_reference_ids.contains(&asset.id)
-                && asset.metadata.contains_key(FAVORITE_ARCHIVE_ASSET_KEY);
-            if generated_by_deleted_task || unused_archived_reference {
-                removed_asset_ids.push(asset.id.clone());
-                return false;
-            }
-            true
-        });
-        let mut deleted_entities = Vec::with_capacity(1 + removed_asset_ids.len());
-        deleted_entities.push((SyncEntityKind::Task, task_id.clone()));
-        deleted_entities.extend(
-            removed_asset_ids
-                .iter()
-                .cloned()
-                .map(|id| (SyncEntityKind::Asset, id)),
-        );
-        record_sync_tombstones(tombstones, deleted_entities);
-        assets.set(next_assets);
-        tasks.set(next_tasks);
-        threads.update(|items| {
-            for thread in items {
-                let previous_len = thread.task_ids.len();
-                thread.task_ids.retain(|id| id != &task_id);
-                if thread.task_ids.len() != previous_len {
-                    thread.updated_at = now_rfc3339();
+                    .map(|id| (SyncEntityKind::Asset, id)),
+            );
+            record_sync_tombstones(tombstones, deleted_entities);
+            assets.set(next_assets);
+            tasks.set(next_tasks);
+            threads.update(|items| {
+                for thread in items {
+                    let previous_len = thread.task_ids.len();
+                    thread.task_ids.retain(|id| id != &task_id);
+                    if thread.task_ids.len() != previous_len {
+                        thread.updated_at = now_rfc3339();
+                    }
                 }
+            });
+            selected_reference_ids.update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
+            if let Some(asset_id) = continuation_asset_id.get_untracked()
+                && removed_asset_ids.contains(&asset_id)
+            {
+                continuation_asset_id.set(None);
             }
+            if !removed_asset_ids.is_empty() {
+                enqueue_payload_deletes(removed_asset_ids.clone());
+            }
+            if deleting_current_preview {
+                preview_state.set(None);
+                preview_panel_state.set(None);
+                preview_fullscreen.set(false);
+                context_menu_state.set(None);
+                trim_asset_payload_cache(assets);
+            }
+            persist_state();
+            status_text.set("历史记录已删除。".into());
         });
-        selected_reference_ids.update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
-        if let Some(asset_id) = continuation_asset_id.get_untracked()
-            && removed_asset_ids.contains(&asset_id)
-        {
-            continuation_asset_id.set(None);
-        }
-        if !removed_asset_ids.is_empty() {
-            enqueue_payload_deletes(removed_asset_ids.clone());
-        }
-        if deleting_current_preview {
-            preview_state.set(None);
-            preview_panel_state.set(None);
-            preview_fullscreen.set(false);
-            context_menu_state.set(None);
-            trim_asset_payload_cache(assets);
-        }
-        persist_state();
-        status_text.set("历史记录已删除。".into());
     };
 
     let delete_task = move |task_id: String, x: f64, y: f64| {

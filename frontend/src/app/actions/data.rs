@@ -280,6 +280,7 @@ pub(crate) fn build_data_actions(
                         );
                     }
                     draft_prompt.set(target_thread.draft_prompt.clone());
+                    composer.editing_by_thread.update(HashMap::clear);
                     selected_reference_ids.set(Vec::new());
                     continuation_asset_id.set(None);
                     reference_menu_asset_id.set(None);
@@ -341,6 +342,9 @@ pub(crate) fn build_data_actions(
             LocalDataClearScope::Preferences | LocalDataClearScope::All
         );
         if clear_workspace {
+            composer.editing_by_thread.update(HashMap::clear);
+            crate::image_editor::invalidate_pending_draft_writes();
+            ui.image_editor_thread.set(None);
             payload_write_queue.set(HashMap::new());
             payload_delete_queue.set(HashSet::new());
             tasks.set(Vec::new());
@@ -414,6 +418,9 @@ pub(crate) fn build_data_actions(
         }
         spawn_local(async move {
             let mut errors = Vec::new();
+            if clear_workspace && let Err(error) = crate::image_editor::clear_drafts().await {
+                errors.push(format!("清除编辑草稿失败：{error}"));
+            }
             if clear_workspace && let Err(error) = clear_asset_payloads().await {
                 errors.push(format!("清除图片失败：{error}"));
             }

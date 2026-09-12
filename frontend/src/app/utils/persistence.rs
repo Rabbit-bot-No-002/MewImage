@@ -702,6 +702,7 @@ pub(crate) fn generation_settings_for_rerun(
         .as_ref()
         .map(|result| &result.parameter_snapshot);
     GenerationSettingsSnapshot {
+        automatic_size: false,
         width: parameters
             .and_then(|value| value.requested_width.or(value.actual_width))
             .unwrap_or(1024),
@@ -761,6 +762,7 @@ mod tests {
     fn rerun_prefers_historical_generation_settings() {
         let config = providers::default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
         let expected = GenerationSettingsSnapshot {
+            automatic_size: false,
             width: 2048,
             height: 1152,
             quality: Some("medium".into()),
@@ -773,6 +775,7 @@ mod tests {
             responses_model: Some("gpt-5.6".into()),
         };
         let task = LocalTaskRecord {
+            editing: None,
             id: "task-1".into(),
             thread_id: "thread-1".into(),
             config_id: config.id.clone(),
@@ -896,6 +899,7 @@ mod tests {
     fn task_snapshots_strip_large_payloads_for_success_and_failure() {
         let config = providers::default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
         let make_task = |id: &str, status| LocalTaskRecord {
+            editing: None,
             id: id.into(),
             thread_id: "thread-1".into(),
             config_id: config.id.clone(),

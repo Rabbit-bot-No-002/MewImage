@@ -18,11 +18,12 @@ fn submitted_reference_ids(
         .chain(selected_ids.iter().map(String::as_str));
 
     for asset_id in candidates {
-        if ordered_ids.len() >= MAX_GENERATION_REFERENCE_ASSETS || !seen_ids.insert(asset_id) {
+        if !seen_ids.insert(asset_id) {
             continue;
         }
         let is_usable = assets.iter().any(|asset| {
             asset.id == asset_id
+                && !mew_image_shared::is_edit_mask(asset)
                 && !asset.metadata.contains_key("mask_base_asset_id")
                 && !is_theme_background(asset)
         });
@@ -31,6 +32,20 @@ fn submitted_reference_ids(
         }
     }
     ordered_ids
+}
+
+fn generation_dependency_ids(
+    references: &[String],
+    editing: Option<&mew_image_shared::ImageEditingSnapshot>,
+) -> Vec<String> {
+    // 此集合仅用于预算和资源保护，不能用它的排序改变上游 image[] 顺序。
+    let mut ids = references.to_vec();
+    if let Some(editing) = editing {
+        ids.extend(editing.asset_ids().cloned());
+    }
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn generation_byte_budget(device_memory_gib: Option<f64>) -> u64 {
@@ -45,7 +60,7 @@ fn generation_byte_budget(device_memory_gib: Option<f64>) -> u64 {
     )
 }
 
-fn browser_generation_byte_budget() -> u64 {
+pub(crate) fn browser_generation_byte_budget() -> u64 {
     let device_memory_gib = web_sys::window()
         .and_then(|window| {
             Reflect::get(
@@ -175,7 +190,9 @@ fn try_reserve_generation_bytes(
         .values()
         .map(|runtime| runtime.reserved_bytes)
         .fold(0_u64, u64::saturating_add);
-    let other_reserved_bytes = reserved_bytes.saturating_sub(current_reserved_bytes);
+    let other_reserved_bytes = reserved_bytes
+        .saturating_sub(current_reserved_bytes)
+        .saturating_add(crate::app::utils::editor_budget::reserved_editor_bytes());
     // 超过软预算的单项仍可独占执行，避免合法的 4K/去背任务永远无法开始。
     let can_reserve =
         budget_capacity_available(requested_bytes, budget_bytes, other_reserved_bytes);
@@ -576,9 +593,52 @@ pub(crate) fn build_generation_actions(
         commit_current_thread_draft();
         let selected_ids = selected_reference_ids.get_untracked();
         let continuation_id = continuation_asset_id.get_untracked();
+        let editing_snapshot = composer
+            .editing_by_thread
+            .with_untracked(|items| items.get(&thread_id).cloned());
+        let effective_prompt = mew_image_shared::compose_edit_prompt(
+            effective_prompt,
+            editing_snapshot
+                .as_ref()
+                .and_then(|editing| editing.instruction.as_deref()),
+        );
+        if editing_snapshot.is_some() && config.provider_kind != ProviderKind::OpenAiImage {
+            status_text
+                .set("当前服务商不支持编辑输入，请切回 OpenAI 图像接口；编辑草稿已保留。".into());
+            return;
+        }
+        if editing_snapshot.as_ref().is_some_and(|editing| {
+            continuation_id
+                .as_ref()
+                .is_some_and(|id| id != &editing.base_asset_id)
+        }) {
+            status_text.set("连续修改底图与当前编辑底图不一致，请重新建立编辑输入。".into());
+            return;
+        }
+        let first_reference_id = editing_snapshot
+            .as_ref()
+            .map(|editing| editing.base_asset_id.as_str())
+            .or(continuation_id.as_deref());
         let submitted_reference_ids = assets.with_untracked(|items| {
-            submitted_reference_ids(items, &selected_ids, continuation_id.as_deref())
+            submitted_reference_ids(items, &selected_ids, first_reference_id)
         });
+        let input_dependency_ids =
+            generation_dependency_ids(&submitted_reference_ids, editing_snapshot.as_ref());
+        if assets.with_untracked(|items| {
+            input_dependency_ids
+                .iter()
+                .any(|id| !items.iter().any(|asset| &asset.id == id))
+        }) {
+            status_text
+                .set("编辑输入资源缺失，未提交任务；请重新打开编辑器确认底图和遮罩。".into());
+            return;
+        }
+        // 先完整收集并校验，不能静默截断旧任务的参考图改变生成含义。
+        if submitted_reference_ids.len() > MAX_GENERATION_REFERENCE_ASSETS {
+            status_text
+                .set("单次生成最多使用 10 张参考图，请先取消多余选择；原有图片不会删除。".into());
+            return;
+        }
         let reference_size = assets.with_untracked(|items| {
             submitted_reference_ids.iter().find_map(|asset_id| {
                 items
@@ -587,6 +647,11 @@ pub(crate) fn build_generation_actions(
                     .and_then(|asset| asset.width.zip(asset.height))
             })
         });
+        let automatic_size = resolution_mode.get_untracked() == "model_auto";
+        if automatic_size && config.provider_kind != ProviderKind::OpenAiImage {
+            status_text.set("模型自动尺寸目前仅支持 OpenAI Image，请手动选择输出尺寸。".into());
+            return;
+        }
         let (resolved_width, resolved_height) = resolve_dimensions_from_reference_size(
             resolution_mode.get_untracked().as_str(),
             resolution_group.get_untracked().as_str(),
@@ -599,18 +664,28 @@ pub(crate) fn build_generation_actions(
         custom_width.set(resolved_width);
         custom_height.set(resolved_height);
         let quality_value = quality.get_untracked();
+        if let Err(error) = mew_image_shared::validate_openai_image_options(
+            &config,
+            &config.model,
+            resolved_width,
+            resolved_height,
+            Some(&quality_value),
+        ) {
+            status_text.set(error);
+            return;
+        }
         let count_value = count.get_untracked();
         let task_estimated_bytes = assets.with_untracked(|items| {
             estimated_generation_task_bytes(
                 items,
-                &submitted_reference_ids,
+                &input_dependency_ids,
                 resolved_width,
                 resolved_height,
                 count_value,
             )
         });
         let preparation_estimated_bytes = assets.with_untracked(|items| {
-            estimated_generation_preparation_bytes(items, &submitted_reference_ids)
+            estimated_generation_preparation_bytes(items, &input_dependency_ids)
         });
         let expected_proxy = generation_uses_proxy(&config, !submitted_reference_ids.is_empty());
         let initial_reserved_bytes = if expected_proxy {
@@ -631,7 +706,7 @@ pub(crate) fn build_generation_actions(
         let abort_signal = abort_controller.signal();
 
         let task_id = new_id();
-        let dependency_asset_ids = submitted_reference_ids.iter().cloned().collect();
+        let dependency_asset_ids = input_dependency_ids.iter().cloned().collect();
         let runtime_sequence = generation_runtimes.with_untracked(|items| {
             items
                 .values()
@@ -684,6 +759,7 @@ pub(crate) fn build_generation_actions(
         });
         tasks.update(|items| {
             items.push(LocalTaskRecord {
+                editing: editing_snapshot.clone(),
                 id: task_id.clone(),
                 thread_id: thread_id.clone(),
                 config_id: config.id.clone(),
@@ -691,6 +767,7 @@ pub(crate) fn build_generation_actions(
                 requested_model: config.model.clone(),
                 reference_asset_ids: submitted_reference_ids.clone(),
                 generation_settings: Some(GenerationSettingsSnapshot {
+                    automatic_size,
                     width: resolved_width,
                     height: resolved_height,
                     quality: Some(quality_value.clone()),
@@ -798,31 +875,42 @@ pub(crate) fn build_generation_actions(
 
             let payload_result = if expected_proxy {
                 // 代理上传优先使用 IndexedDB Blob URL，避免把全部参考图常驻为 Base64。
-                ensure_asset_display_sources_loaded(assets_signal, &reference_ids_for_request).await
+                ensure_asset_display_sources_loaded(assets_signal, &input_dependency_ids).await
             } else {
-                ensure_asset_payloads_loaded(assets_signal, &reference_ids_for_request).await
+                ensure_asset_payloads_loaded(assets_signal, &input_dependency_ids).await
             };
+            let editing_result = payload_result.and_then(|()| {
+                assets_signal.with_untracked(|items| {
+                    editing_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.restore(items))
+                        .transpose()
+                })
+            });
             if finish_cancelled() {
                 return;
             }
-            if let Err(error) = payload_result {
-                tasks_signal.update(|items| {
-                    if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
-                        task.status = TaskStatus::Failed;
-                        task.updated_at = now_rfc3339();
-                        task.error_message = Some(error.clone());
-                    }
-                });
-                persist();
-                let remaining = finish_runtime();
-                status_signal.set(if remaining == 0 {
-                    format!("生成失败：{error}")
-                } else {
-                    format!("生成失败：{error}；仍有 {remaining} 个任务等待结果。")
-                });
-                play_generation_notification(false);
-                return;
-            }
+            let editing_input = match editing_result {
+                Ok(input) => input,
+                Err(error) => {
+                    tasks_signal.update(|items| {
+                        if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
+                            task.status = TaskStatus::Failed;
+                            task.updated_at = now_rfc3339();
+                            task.error_message = Some(error.clone());
+                        }
+                    });
+                    persist();
+                    let remaining = finish_runtime();
+                    status_signal.set(if remaining == 0 {
+                        format!("生成失败：{error}")
+                    } else {
+                        format!("生成失败：{error}；仍有 {remaining} 个任务等待结果。")
+                    });
+                    play_generation_notification(false);
+                    return;
+                }
+            };
             let references = assets_signal.with_untracked(|items| {
                 selected_reference_assets(items, &reference_ids_for_request)
             });
@@ -836,6 +924,8 @@ pub(crate) fn build_generation_actions(
                 }
             });
             let request = mew_image_shared::GenerationRequest {
+                editing: editing_input,
+                automatic_size,
                 prompt: effective_prompt,
                 model: config.model.clone(),
                 width: resolved_width,
@@ -1267,40 +1357,55 @@ pub(crate) fn build_generation_actions(
             status_text.set("请先选择当前要用于重新生成的服务商配置。".into());
             return;
         };
-        let settings = generation_settings_for_rerun(&task, &config);
-        let thread_list = threads.get_untracked();
-        let target_thread_id =
-            task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
+        crate::app::components::reference_selection::choose_task_references(
+            ui,
+            assets,
+            task,
+            None,
+            move |task| {
+                let settings = generation_settings_for_rerun(&task, &config);
+                let thread_list = threads.get_untracked();
+                let target_thread_id =
+                    task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
 
-        current_thread_id.set(target_thread_id.clone());
-        draft_prompt.set(task.prompt.clone());
-        if let Some(textarea) = draft_prompt_ref.get() {
-            textarea.set_value(&task.prompt);
-        }
-        selected_reference_ids.set(task.reference_asset_ids.clone());
-        continuation_asset_id.set(None);
-        reference_menu_asset_id.set(None);
-        quality.set(settings.quality.clone().unwrap_or_else(|| "high".into()));
-        count.set(settings.count.clamp(1, 4));
-        resolution_mode.set("custom".into());
-        custom_width.set(settings.width);
-        custom_height.set(settings.height);
-        threads.update(|items| {
-            if let Some(thread) = items
-                .iter_mut()
-                .find(|thread| thread.id == target_thread_id)
-            {
-                thread.draft_prompt = task.prompt.clone();
-                thread.updated_at = now_rfc3339();
-            }
-        });
-        persist_state();
-        status_text.set("已恢复历史生成条件，正在使用当前服务商配置重新生成。".into());
+                current_thread_id.set(target_thread_id.clone());
+                draft_prompt.set(task.prompt.clone());
+                if let Some(textarea) = draft_prompt_ref.get() {
+                    textarea.set_value(&task.prompt);
+                }
+                selected_reference_ids.set(task.reference_asset_ids.clone());
+                continuation_asset_id.set(None);
+                reference_menu_asset_id.set(None);
+                quality.set(settings.quality.clone().unwrap_or_else(|| "high".into()));
+                count.set(settings.count.clamp(1, 4));
+                resolution_mode.set(
+                    if settings.automatic_size {
+                        "model_auto"
+                    } else {
+                        "custom"
+                    }
+                    .into(),
+                );
+                custom_width.set(settings.width);
+                custom_height.set(settings.height);
+                threads.update(|items| {
+                    if let Some(thread) = items
+                        .iter_mut()
+                        .find(|thread| thread.id == target_thread_id)
+                    {
+                        thread.draft_prompt = task.prompt.clone();
+                        thread.updated_at = now_rfc3339();
+                    }
+                });
+                persist_state();
+                status_text.set("已恢复历史生成条件，正在使用当前服务商配置重新生成。".into());
 
-        spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(0).await;
-            run_generation();
-        });
+                spawn_local(async move {
+                    gloo_timers::future::TimeoutFuture::new(0).await;
+                    run_generation();
+                });
+            },
+        );
     };
 
     let cancel_generation = move |task_id: String| {
@@ -1396,7 +1501,39 @@ mod tests {
     }
 
     #[test]
-    fn submitted_references_prioritize_continuation_filter_and_cap() {
+    fn edit_dependency_budget_keeps_mask_separate_from_ordered_references() {
+        let mut mask = test_asset("mask", 300);
+        mask.metadata
+            .insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+        let assets = [test_asset("base", 100), test_asset("other", 200), mask];
+        let references = submitted_reference_ids(
+            &assets,
+            &["other".into(), "mask".into(), "base".into()],
+            Some("base"),
+        );
+        assert_eq!(references, ["base", "other"]);
+        let editing = mew_image_shared::ImageEditingSnapshot {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: "base".into(),
+            mask_asset_id: Some("mask".into()),
+            instruction: None,
+        };
+        let dependencies = generation_dependency_ids(&references, Some(&editing));
+        assert_eq!(dependencies, ["base", "mask", "other"]);
+        assert_eq!(
+            estimated_generation_preparation_bytes(&assets, &dependencies)
+                - estimated_generation_preparation_bytes(&assets, &references),
+            400
+        );
+        assert_eq!(
+            estimated_generation_task_bytes(&assets, &dependencies, 1, 1, 1)
+                - estimated_generation_task_bytes(&assets, &references, 1, 1, 1),
+            600
+        );
+    }
+
+    #[test]
+    fn submitted_references_preserve_over_limit_selection_for_validation() {
         let mut assets = (0..18)
             .map(|index| test_asset(&format!("asset-{index}"), 1))
             .collect::<Vec<_>>();
@@ -1415,7 +1552,7 @@ mod tests {
         selected_ids.push("asset-5".into());
         let submitted = submitted_reference_ids(&assets, &selected_ids, Some("asset-5"));
 
-        assert_eq!(submitted.len(), MAX_GENERATION_REFERENCE_ASSETS);
+        assert_eq!(submitted.len(), 18);
         assert_eq!(submitted.first().map(String::as_str), Some("asset-5"));
         assert_eq!(
             submitted

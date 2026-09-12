@@ -17,7 +17,7 @@ use mew_image_shared::{
 };
 use serde_json::json;
 
-use crate::api::api_candidates;
+use crate::api::{api_candidates, api_url};
 use crate::app::{
     blob_from_bytes, decode_browser_data_url, reencode_asset_bytes, sha256_hex, strip_task_payloads,
 };
@@ -98,10 +98,16 @@ struct TransportAsset {
 struct ProxyGenerationEndpoint {
     submit_url: String,
     supports_status_only: bool,
+    supports_options_v2: bool,
+    supports_image_editing: bool,
 }
 
 #[derive(Default, serde::Deserialize)]
 struct ProxyHealthCapabilities {
+    #[serde(default)]
+    image_editing_v1: bool,
+    #[serde(default)]
+    image_generation_options_v2: bool,
     #[serde(default)]
     proxy_generation_status_only: bool,
 }
@@ -110,6 +116,39 @@ struct ProxyHealthCapabilities {
 struct ProxyHealthResponse {
     #[serde(default)]
     capabilities: ProxyHealthCapabilities,
+}
+
+pub(crate) fn sync_requires_image_editing_capability(state: &LocalAppState) -> bool {
+    state.tasks.iter().any(|task| task.editing.is_some())
+}
+
+pub(crate) async fn ensure_image_editing_sync_capability(
+    state: &LocalAppState,
+) -> Result<(), String> {
+    if !sync_requires_image_editing_capability(state) {
+        return Ok(());
+    }
+
+    let health_url = api_url("/api/health");
+    let response = Request::get(&health_url)
+        .credentials(web_sys::RequestCredentials::Include)
+        .send()
+        .await
+        .map_err(|error| format!("检查同步服务编辑能力失败：{error}"))?;
+    if !response.ok() {
+        return Err(format!(
+            "检查同步服务编辑能力失败：HTTP {}。",
+            response.status()
+        ));
+    }
+    let health = response
+        .json::<ProxyHealthResponse>()
+        .await
+        .map_err(|error| format!("同步服务健康响应无法解析：{error}"))?;
+    if !health.capabilities.image_editing_v1 {
+        return Err("当前后端不支持图像编辑数据同步，请先将前后端同时升级后再同步。".into());
+    }
+    Ok(())
 }
 
 enum ProxyGenerationSubmission {
@@ -416,6 +455,7 @@ pub async fn generate_with_strategy(
     abort_signal: Option<&web_sys::AbortSignal>,
     lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
+    mew_image_shared::validate_image_generation_request(config, request)?;
     let requested_count = request.count.max(1);
     if requested_count <= 1 {
         return generate_once_with_strategy(template, config, request, abort_signal, lifecycle)
@@ -620,6 +660,15 @@ async fn direct_generate(
                 .map_err(|error| error.to_string())?
         }
     } else {
+        if config.provider_kind == ProviderKind::OpenAiImage
+            && config.endpoint_mode == ProviderEndpointMode::ResponsesApi
+            && let Some(mask) = request
+                .editing
+                .as_ref()
+                .and_then(|editing| editing.mask.as_ref())
+        {
+            validated_responses_mask_data_url(mask)?;
+        }
         let body = match config.provider_kind {
             ProviderKind::OpenAiImage => build_openai_json(config, request),
             ProviderKind::CustomHttp => build_custom_json(template, request),
@@ -693,15 +742,77 @@ async fn proxy_generate(
         return Err("代理模式也需要当前浏览器里已有 API Key。".into());
     }
     let endpoint = select_proxy_generation_endpoint(abort_signal).await?;
+    if request.editing.is_some() && !endpoint.supports_image_editing {
+        return Err(
+            "后端尚不支持图片编辑协议，请同步更新前后端；未上传图片或发送生成请求。".into(),
+        );
+    }
+    if (request.automatic_size || config.endpoint_mode == ProviderEndpointMode::ResponsesApi)
+        && !endpoint.supports_options_v2
+    {
+        return Err("后端尚不支持新的图片参数协议，请更新后端后使用模型自动尺寸或 Responses 图片模型选择；未发送生成请求。".into());
+    }
     if !endpoint.supports_status_only {
         lifecycle.set_proxy_phase(ProxyGenerationPhase::LegacyProtected);
         lifecycle
             .reserve(ProxyBudgetRequest::LegacyFullTask)
             .await?;
     }
-    let reference_assets = prepare_transport_assets(&request.reference_assets).await?;
+    let mut reference_assets = Vec::with_capacity(request.reference_assets.len());
+    let mut exact_blobs = std::collections::HashMap::new();
+    let mut upload_bytes = 0;
+    // 遮罩与普通参考图共用总量上限，先检查元数据，再按实际传输文件逐项复核。
+    for asset in request
+        .reference_assets
+        .iter()
+        .chain(request.editing.as_ref().and_then(|edit| edit.mask.as_ref()))
+    {
+        upload_bytes = checked_proxy_upload_bytes(upload_bytes, asset.byte_len)?;
+    }
+    upload_bytes = 0;
+    for asset in &request.reference_assets {
+        if request
+            .editing
+            .as_ref()
+            .is_some_and(|edit| edit.mask.is_some() && edit.base_asset_id == asset.id)
+        {
+            let blob = validated_edit_blob(asset).await?;
+            upload_bytes = checked_proxy_upload_bytes(upload_bytes, blob.size() as u64)?;
+            exact_blobs.insert(asset.id.clone(), blob);
+            let mut meta = asset.clone();
+            meta.data_url = None;
+            meta.remote_url = None;
+            meta.remote_object_key = None;
+            reference_assets.push(TransportAsset {
+                meta,
+                bytes: Vec::new(),
+                mime_type: "image/png".into(),
+            });
+        } else {
+            let prepared = prepare_transport_asset(asset).await?;
+            upload_bytes = checked_proxy_upload_bytes(upload_bytes, prepared.bytes.len() as u64)?;
+            reference_assets.push(prepared);
+        }
+    }
+    let mask_blob = match request.editing.as_ref().and_then(|edit| edit.mask.as_ref()) {
+        Some(mask) => {
+            let blob = validated_edit_blob(mask).await?;
+            checked_proxy_upload_bytes(upload_bytes, blob.size() as u64)?;
+            Some(blob)
+        }
+        None => None,
+    };
     let mut request_payload = request.clone();
     request_payload.reference_assets = Vec::new();
+    if let Some(mask) = request_payload
+        .editing
+        .as_mut()
+        .and_then(|edit| edit.mask.as_mut())
+    {
+        mask.data_url = None;
+        mask.remote_url = None;
+        mask.remote_object_key = None;
+    }
     let payload = GenerateViaProxyRequest {
         template: template.clone(),
         config,
@@ -725,13 +836,20 @@ async fn proxy_generate(
     )
     .map_err(|error| format!("{error:?}"))?;
     for asset in &reference_assets {
-        let blob = blob_from_bytes(&asset.bytes, &asset.mime_type)?;
+        let blob = match exact_blobs.remove(&asset.meta.id) {
+            Some(blob) => blob,
+            None => blob_from_bytes(&asset.bytes, &asset.mime_type)?,
+        };
         form.append_with_blob_and_filename(
             "reference_asset_files",
             &blob,
             &format!("{}.{}", asset.meta.id, mime_extension(&asset.mime_type)),
         )
         .map_err(|error| format!("{error:?}"))?;
+    }
+    if let Some(mask) = mask_blob {
+        form.append_with_blob_and_filename("mask_file", &mask, "mask.png")
+            .map_err(|error| format!("遮罩加入上传失败：{error:?}"))?;
     }
     let response = Request::post(&endpoint.submit_url)
         .abort_signal(abort_signal)
@@ -803,14 +921,16 @@ async fn select_proxy_generation_endpoint(
             .await
         {
             Ok(response) if response.ok() => {
-                let supports_status_only = response
+                let capabilities = response
                     .json::<ProxyHealthResponse>()
                     .await
-                    .map(|health| health.capabilities.proxy_generation_status_only)
-                    .unwrap_or(false);
+                    .map(|health| health.capabilities)
+                    .unwrap_or_default();
                 return Ok(ProxyGenerationEndpoint {
                     submit_url,
-                    supports_status_only,
+                    supports_status_only: capabilities.proxy_generation_status_only,
+                    supports_options_v2: capabilities.image_generation_options_v2,
+                    supports_image_editing: capabilities.image_editing_v1,
                 });
             }
             Ok(response) => errors.push(format!("{health_url} -> HTTP {}", response.status())),
@@ -1009,6 +1129,36 @@ fn proxy_error_message(body: &str, fallback: &str) -> String {
         })
 }
 
+fn checked_proxy_upload_bytes(current: u64, file_bytes: u64) -> Result<u64, String> {
+    if file_bytes > 32 * 1024 * 1024 {
+        return Err("单张参考图或遮罩不能超过 32 MiB。".into());
+    }
+    let total = current
+        .checked_add(file_bytes)
+        .filter(|total| *total <= 160 * 1024 * 1024)
+        .ok_or_else(|| "参考图与遮罩的总大小不能超过 160 MiB。".to_string())?;
+    Ok(total)
+}
+
+async fn validated_edit_blob(asset: &ImageAssetRef) -> Result<web_sys::Blob, String> {
+    let blob = crate::storage::load_edit_asset_blob(&asset.id).await?;
+    if blob.size() != asset.byte_len as f64
+        || blob.size() > 32.0 * 1024.0 * 1024.0
+        || blob.type_() != "image/png"
+        || asset.mime_type != "image/png"
+    {
+        return Err("编辑输入 PNG 类型或大小与记录不一致。".into());
+    }
+    let buffer = wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(|error| format!("读取编辑原图失败：{error:?}"))?;
+    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || sha256_hex(&bytes) != asset.sha256 {
+        return Err("编辑原图 PNG 魔数或 SHA 校验失败。".into());
+    }
+    Ok(blob)
+}
+
 async fn prepare_transport_assets(assets: &[ImageAssetRef]) -> Result<Vec<TransportAsset>, String> {
     let mut prepared = Vec::with_capacity(assets.len());
     for asset in assets {
@@ -1067,7 +1217,7 @@ fn build_openai_json(
             let mut body = json!({
                 "prompt": request.prompt,
                 "model": request.model,
-                "size": format!("{}x{}", request.width, request.height),
+                "size": request.openai_size(),
                 "quality": request.quality,
                 "n": request.count,
                 "output_format": normalized_image_output_format(config.output_format.as_deref()),
@@ -1095,7 +1245,7 @@ fn build_openai_compatible_json(
         "aspect_ratio": aspect_ratio_from_dimensions(request.width, request.height),
         "response_format": "url",
         "image_size": nano_banana_image_size_from_dimensions(request.width, request.height),
-        "size": format!("{}x{}", request.width, request.height),
+        "size": request.openai_size(),
         "n": request.count,
     })
 }
@@ -1132,6 +1282,19 @@ fn transport_image_data_url(asset: &ImageAssetRef) -> Option<&str> {
             && header.ends_with(";base64")
             && !payload.trim().is_empty()
     })
+}
+
+fn validated_responses_mask_data_url(mask: &ImageAssetRef) -> Result<&str, String> {
+    let data_url =
+        transport_image_data_url(mask).ok_or("Responses 编辑遮罩原图尚未加载，未发送请求。")?;
+    let (mime_type, bytes) = decode_browser_data_url(data_url)?;
+    if mime_type != "image/png"
+        || bytes.len() as u64 != mask.byte_len
+        || sha256_hex(&bytes) != mask.sha256
+    {
+        return Err("Responses 编辑遮罩发送前校验失败，未发送请求。".into());
+    }
+    Ok(data_url)
 }
 
 fn build_openai_responses_json(
@@ -1172,13 +1335,22 @@ fn build_openai_responses_json(
 
     let mut tool = json!({
         "type": "image_generation",
+        "model": request.model,
         "action": if request.reference_assets.is_empty() { "generate" } else { "edit" },
-        "size": format!("{}x{}", request.width, request.height),
+        "size": request.openai_size(),
         "output_format": normalized_image_output_format(config.output_format.as_deref()),
         "background": normalized_openai_background(config.background.as_deref()),
         "moderation": config.moderation.clone().unwrap_or_else(|| "auto".into()),
         "partial_images": 1,
     });
+
+    if let Some(editing) = &request.editing
+        && let Some(mask) = &editing.mask
+        && let Some(data_url) = transport_image_data_url(mask)
+    {
+        tool["input_image_mask"] = json!({ "image_url": data_url });
+        tool["action"] = json!("edit");
+    }
 
     if let Some(quality) = &request.quality {
         tool["quality"] = json!(quality);
@@ -1244,7 +1416,7 @@ fn build_custom_json(
     set_json_path(
         &mut body,
         template.size_field.as_deref().unwrap_or("size"),
-        json!(format!("{}x{}", request.width, request.height)),
+        json!(request.openai_size()),
     );
     body
 }
@@ -1313,10 +1485,10 @@ fn extract_result(
     Ok(GenerationResult {
         images,
         parameter_snapshot: mew_image_shared::ParameterSnapshot {
-            requested_width: Some(request.width),
-            requested_height: Some(request.height),
-            actual_width: Some(request.width),
-            actual_height: Some(request.height),
+            requested_width: (!request.automatic_size).then_some(request.width),
+            requested_height: (!request.automatic_size).then_some(request.height),
+            actual_width: (!request.automatic_size).then_some(request.width),
+            actual_height: (!request.automatic_size).then_some(request.height),
             requested_quality: request.quality.clone(),
             actual_quality: request.quality.clone(),
             revised_prompt: template
@@ -1424,7 +1596,10 @@ fn mask_key(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mew_image_shared::{ParameterSnapshot, SyncEntityKind, SyncTombstone};
+    use mew_image_shared::{
+        ImageEditingMode, ImageEditingSnapshot, LocalTaskRecord, ParameterSnapshot, SyncEntityKind,
+        SyncTombstone, TaskStatus,
+    };
 
     fn test_reference_asset(data_url: Option<&str>, remote_url: Option<&str>) -> ImageAssetRef {
         ImageAssetRef {
@@ -1441,6 +1616,28 @@ mod tests {
             remote_url: remote_url.map(str::to_string),
             source_task_id: None,
             metadata: Default::default(),
+        }
+    }
+
+    fn test_task(editing: Option<ImageEditingSnapshot>) -> LocalTaskRecord {
+        LocalTaskRecord {
+            editing,
+            id: "task-1".into(),
+            thread_id: "thread-1".into(),
+            config_id: "config-1".into(),
+            prompt: "prompt".into(),
+            requested_model: "gpt-image-2.5-flare".into(),
+            reference_asset_ids: Vec::new(),
+            generation_settings: None,
+            result: None,
+            favorite: false,
+            favorite_folder_id: None,
+            detached_from_thread: false,
+            source_gallery_template_id: None,
+            status: TaskStatus::Succeeded,
+            error_message: None,
+            created_at: "2026-01-01T00:00:00+00:00".into(),
+            updated_at: "2026-01-01T00:00:00+00:00".into(),
         }
     }
 
@@ -1498,12 +1695,48 @@ mod tests {
     fn proxy_capability_defaults_off_for_old_health_responses() {
         let old: ProxyHealthResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         let current: ProxyHealthResponse = serde_json::from_str(
-            r#"{"ok":true,"capabilities":{"proxy_generation_status_only":true}}"#,
+            r#"{"ok":true,"capabilities":{"proxy_generation_status_only":true,"image_generation_options_v2":true,"image_editing_v1":true}}"#,
         )
         .unwrap();
 
         assert!(!old.capabilities.proxy_generation_status_only);
+        assert!(!old.capabilities.image_generation_options_v2);
+        assert!(!old.capabilities.image_editing_v1);
+        assert!(current.capabilities.image_editing_v1);
+        assert!(current.capabilities.image_generation_options_v2);
         assert!(current.capabilities.proxy_generation_status_only);
+    }
+
+    #[test]
+    fn sync_only_requires_editing_capability_for_persisted_edit_tasks() {
+        let mut state = LocalAppState::default();
+        state.tasks.push(test_task(None));
+        assert!(!sync_requires_image_editing_capability(&state));
+
+        state.tasks.push(test_task(Some(ImageEditingSnapshot {
+            mode: ImageEditingMode::Mask,
+            base_asset_id: "base-1".into(),
+            mask_asset_id: Some("mask-1".into()),
+            instruction: None,
+        })));
+        assert!(sync_requires_image_editing_capability(&state));
+    }
+
+    #[test]
+    fn proxy_upload_budget_includes_mask_and_rejects_overflow() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            checked_proxy_upload_bytes(128 * MIB, 32 * MIB).unwrap(),
+            160 * MIB
+        );
+        assert!(checked_proxy_upload_bytes(160 * MIB, 1).is_err());
+        assert!(checked_proxy_upload_bytes(0, 32 * MIB + 1).is_err());
+        assert!(checked_proxy_upload_bytes(u64::MAX, 1).is_err());
+        let mut total = 0;
+        for _ in 0..10 {
+            total = checked_proxy_upload_bytes(total, 16 * MIB).unwrap();
+        }
+        assert!(checked_proxy_upload_bytes(total, 1024).is_err());
     }
 
     #[test]
@@ -1606,6 +1839,8 @@ mod tests {
         config.responses_model = Some("gpt-5.6".into());
         config.background = Some("transparent".into());
         let request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-image-2".into(),
             width: 3840,
@@ -1620,8 +1855,22 @@ mod tests {
         assert_eq!(body["model"], "gpt-5.6");
         assert_eq!(body["tools"][0]["size"], "3840x2160");
         assert_eq!(body["tools"][0]["quality"], "high");
+        assert_eq!(body["tools"][0]["model"], "gpt-image-2");
         assert_eq!(body["tools"][0]["background"], "transparent");
         assert!(body["tools"][0].get("output_compression").is_none());
+        let mut automatic_request = request;
+        automatic_request.automatic_size = true;
+        automatic_request.model = "gpt-image-2.5-sunburst".into();
+        automatic_request.quality = Some("max".into());
+        let automatic = build_openai_responses_json(&config, &automatic_request);
+        assert_eq!(automatic["tools"][0]["size"], "auto");
+        assert_eq!(automatic["tools"][0]["model"], "gpt-image-2.5-sunburst");
+        assert_eq!(automatic["tools"][0]["quality"], "max");
+        assert_eq!(automatic["model"], "gpt-5.6");
+        config.endpoint_mode = ProviderEndpointMode::ImagesApi;
+        let images = build_openai_json(&config, &automatic_request);
+        assert_eq!(images["size"], "auto");
+        assert!(images.get("response_format").is_none());
     }
 
     #[test]
@@ -1629,6 +1878,8 @@ mod tests {
         let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
         config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
         let request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-image-2".into(),
             width: 1024,
@@ -1649,10 +1900,63 @@ mod tests {
     }
 
     #[test]
+    fn direct_responses_edit_keeps_mask_separate_from_input_images() {
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        config.responses_model = Some("gpt-5.6".into());
+        let base = test_reference_asset(Some("data:image/png;base64,YmFzZQ=="), None);
+        let mut mask = test_reference_asset(Some("data:image/png;base64,bWFzaw=="), None);
+        mask.id = "mask".into();
+        mask.byte_len = 4;
+        mask.sha256 = sha256_hex(b"mask");
+        mask.metadata
+            .insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+        let request = GenerationRequest {
+            editing: Some(mew_image_shared::ImageEditingInput {
+                mode: mew_image_shared::ImageEditingMode::Mask,
+                base_asset_id: base.id.clone(),
+                mask: Some(mask),
+                instruction: None,
+            }),
+            automatic_size: false,
+            prompt: "edit".into(),
+            model: "gpt-image-2.5-flare".into(),
+            width: 1024,
+            height: 1024,
+            quality: Some("high".into()),
+            count: 1,
+            endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            reference_assets: vec![base],
+        };
+        let body = build_openai_responses_json(&config, &request);
+        assert_eq!(body["model"], "gpt-5.6");
+        assert_eq!(body["tools"][0]["model"], "gpt-image-2.5-flare");
+        assert_eq!(body["tools"][0]["action"], "edit");
+        assert_eq!(
+            body["tools"][0]["input_image_mask"]["image_url"],
+            "data:image/png;base64,bWFzaw=="
+        );
+        assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 2);
+        assert!(!body["input"].to_string().contains("bWFzaw=="));
+        assert_eq!(
+            validated_responses_mask_data_url(
+                request.editing.as_ref().unwrap().mask.as_ref().unwrap()
+            )
+            .unwrap(),
+            "data:image/png;base64,bWFzaw=="
+        );
+        let mut invalid = request.editing.unwrap().mask.unwrap();
+        invalid.sha256 = "changed".into();
+        assert!(validated_responses_mask_data_url(&invalid).is_err());
+    }
+
+    #[test]
     fn images_request_omits_png_compression_and_keeps_webp_compression() {
         let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
         config.background = Some("transparent".into());
         let request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-image2-vip".into(),
             width: 1024,

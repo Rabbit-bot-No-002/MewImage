@@ -522,7 +522,9 @@ pub(crate) fn TemplatePlaza(
         });
     };
 
-    let use_template = move |template: GalleryTemplate| {
+    let apply_template = move |template: GalleryTemplate| {
+        let target_thread = workspace.current_thread_id.get_untracked();
+        let target_config = workspace.current_config_id.get_untracked();
         if composer
             .foreground_generation_task_id
             .get_untracked()
@@ -535,13 +537,8 @@ pub(crate) fn TemplatePlaza(
         }
         spawn_local(async move {
             message.set(Some("正在校验并载入模板参考图……".into()));
-            match prepare_local_assets(
-                &template.reference_assets,
-                None,
-                &workspace.current_thread_id.get_untracked(),
-                false,
-            )
-            .await
+            match prepare_local_assets(&template.reference_assets, None, &target_thread, false)
+                .await
             {
                 Ok((local_assets, payloads)) => {
                     let ids = local_assets
@@ -554,10 +551,26 @@ pub(crate) fn TemplatePlaza(
                         message.set(Some(format!("模板参考图保存失败：{error}")));
                         return;
                     }
+                    if workspace.current_thread_id.get_untracked() != target_thread
+                        || workspace.current_config_id.get_untracked() != target_config
+                        || composer
+                            .foreground_generation_task_id
+                            .get_untracked()
+                            .is_some()
+                    {
+                        let _ = apply_asset_payload_changes(&[], &ids).await;
+                        message.set(Some(
+                            "加载期间会话、配置或生成状态发生变化，未应用模板，请重试。".into(),
+                        ));
+                        return;
+                    }
                     workspace
                         .assets
                         .update(|assets| assets.extend(local_assets));
                     composer.selected_reference_ids.set(ids);
+                    composer.editing_by_thread.update(|items| {
+                        items.remove(&workspace.current_thread_id.get_untracked());
+                    });
                     composer.continuation_asset_id.set(None);
                     composer.draft_prompt.set(template.prompt.clone());
                     workspace.threads.update(|threads| {
@@ -575,7 +588,14 @@ pub(crate) fn TemplatePlaza(
                     );
                     composer.custom_width.set(size.width);
                     composer.custom_height.set(size.height);
-                    composer.resolution_mode.set("custom".into());
+                    composer.resolution_mode.set(
+                        if template.generation_settings.automatic_size {
+                            "model_auto"
+                        } else {
+                            "custom"
+                        }
+                        .into(),
+                    );
                     composer.quality.set(
                         template
                             .generation_settings
@@ -621,6 +641,30 @@ pub(crate) fn TemplatePlaza(
                 }
                 Err(error) => message.set(Some(error)),
             }
+        });
+    };
+
+    let use_template = move |template: GalleryTemplate| {
+        let original_thread = workspace.current_thread_id.get_untracked();
+        let choices = template
+            .reference_assets
+            .iter()
+            .map(|asset| super::reference_selection::ReferenceChoice {
+                id: asset.id.clone(),
+                preview: gallery_thumbnail_url(asset),
+                required: false,
+            })
+            .collect();
+        super::reference_selection::choose_references(ui, choices, move |ids| {
+            if workspace.current_thread_id.get_untracked() != original_thread {
+                message.set(Some("当前会话已切换，请重新选择要使用的模板。".into()));
+                return;
+            }
+            let mut selected = template.clone();
+            selected
+                .reference_assets
+                .retain(|asset| ids.contains(&asset.id));
+            apply_template(selected);
         });
     };
 
@@ -735,6 +779,7 @@ pub(crate) fn TemplatePlaza(
                 let now = now_rfc3339();
                 workspace.tasks.update(|tasks| {
                     tasks.push(LocalTaskRecord {
+                        editing: None,
                         id: task_id,
                         thread_id,
                         config_id: workspace.current_config_id.get_untracked(),
@@ -1471,20 +1516,21 @@ fn TemplateEditor(
             <label>"提示词"<textarea class="text-input template-editor-prompt" prop:value=draft.prompt on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.prompt = event_target_value(&event) }) /></label>
             <label>"说明"<textarea class="text-input" prop:value=draft.description on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.description = event_target_value(&event) }) /></label>
             <TemplateEditorTags editor picker_open=tag_picker_open ui_state=tag_ui available_tags loading=tags_loading load_error=tags_error />
+                <label><input type="checkbox" prop:checked=move || editor.with(|value| value.as_ref().is_some_and(|draft| draft.generation_settings.automatic_size)) on:change=move |event| editor.update(|value| if let Some(draft) = value { draft.generation_settings.automatic_size = event_target_checked(&event); }) />"模型自动尺寸（OpenAI Image）"</label>
             <div class="template-editor-fields">
                 <label class="template-editor-model-field">"推荐模型"<input class="text-input" prop:value=draft.recommended_model on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.recommended_model = event_target_value(&event) }) /></label>
                 <div class="template-editor-field template-editor-size-field">
                     <span>"尺寸"</span>
                     <div class="template-editor-size-inputs">
-                        <input class="text-input" type="number" min="1" aria-label="模板宽度" prop:value=draft.generation_settings.width on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.width = event_target_value(&event).parse().unwrap_or(1024) }) />
+                        <input class="text-input" type="number" disabled=move || editor.with(|value| value.as_ref().is_some_and(|draft| draft.generation_settings.automatic_size)) min="1" aria-label="模板宽度" prop:value=draft.generation_settings.width on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.width = event_target_value(&event).parse().unwrap_or(1024) }) />
                         <span aria-hidden="true">"×"</span>
-                        <input class="text-input" type="number" min="1" aria-label="模板高度" prop:value=draft.generation_settings.height on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.height = event_target_value(&event).parse().unwrap_or(1024) }) />
+                        <input class="text-input" type="number" disabled=move || editor.with(|value| value.as_ref().is_some_and(|draft| draft.generation_settings.automatic_size)) min="1" aria-label="模板高度" prop:value=draft.generation_settings.height on:input=move |event| editor.update(|draft| if let Some(draft) = draft { draft.generation_settings.height = event_target_value(&event).parse().unwrap_or(1024) }) />
                     </div>
                 </div>
                 <label class="template-editor-status-field">"状态"<select class="select-input" prop:value=status_value(draft.status) on:change=move |event| editor.update(|draft| if let Some(draft) = draft { draft.status = parse_status(&event_target_value(&event)) })><option value="draft">"草稿"</option><option value="published">"已发布"</option><option value="archived">"已归档"</option></select></label>
             </div>
             <EditorAssets title="预览图（最多 6 张）" assets=draft.preview_assets editor role=GalleryAssetRole::Preview max=6 max_edge=PREVIEW_MAX_EDGE editor_busy message />
-            <EditorAssets title="参考图（最多 16 张）" assets=draft.reference_assets editor role=GalleryAssetRole::Reference max=16 max_edge=REFERENCE_MAX_EDGE editor_busy message />
+            <EditorAssets title="参考图（最多 10 张；旧模板请精简后保存）" assets=draft.reference_assets editor role=GalleryAssetRole::Reference max=10 max_edge=REFERENCE_MAX_EDGE editor_busy message />
             <div class="row template-editor-actions">
                 {delete_id.get_value().map(|_| view! { <button class="button danger" disabled=move || editor_busy.get() on:click=move |_| { tag_picker_open.set(false); delete_confirm.set(true); }><MaterialSymbolIcon name="delete" filled=false />"删除模板"</button> })}
                 <span class="spacer"></span><button class="button ghost" on:click=move |_| { delete_confirm.set(false); tag_picker_open.set(false); editor.set(None); }>"取消"</button><button class="button primary" disabled=move || editor_busy.get() on:click=save>"保存模板"</button>
@@ -2078,6 +2124,7 @@ fn default_editor_draft(workspace: WorkspaceState, composer: ComposerState) -> T
             .map(|config| config.model.clone())
             .unwrap_or_default(),
         generation_settings: GenerationSettingsSnapshot {
+            automatic_size: composer.resolution_mode.get_untracked() == "model_auto",
             width: composer.custom_width.get_untracked(),
             height: composer.custom_height.get_untracked(),
             quality: Some(composer.quality.get_untracked()),
@@ -2348,6 +2395,16 @@ fn open_editor_from_task(
         message.set(Some("找不到用于发布的任务。".into()));
         return;
     };
+    if task
+        .editing
+        .as_ref()
+        .is_some_and(|editing| editing.mask_asset_id.is_some())
+    {
+        message.set(Some(
+            "带遮罩的任务暂不支持发布模板；请使用结果图新建普通模板，避免丢失局部修改输入。".into(),
+        ));
+        return;
+    }
     let mut draft = default_editor_draft(workspace, composer);
     draft.prompt = task.prompt.clone();
     draft.recommended_model = task.requested_model.clone();
@@ -2715,6 +2772,7 @@ mod tests {
             description: String::new(),
             tags,
             generation_settings: GenerationSettingsSnapshot {
+                automatic_size: false,
                 width: 1024,
                 height: 1024,
                 quality: None,
@@ -2861,6 +2919,7 @@ mod tests {
     #[test]
     fn gallery_template_favorite_state_requires_matching_active_snapshot() {
         let mut task = LocalTaskRecord {
+            editing: None,
             id: "snapshot".into(),
             thread_id: "thread".into(),
             config_id: "config".into(),

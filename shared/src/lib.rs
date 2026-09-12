@@ -4,6 +4,11 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+mod image_editing;
+mod image_options;
+pub use image_editing::*;
+pub use image_options::*;
+
 pub const SYNC_SCHEMA_VERSION: u32 = 3;
 
 pub fn now_rfc3339() -> String {
@@ -710,10 +715,10 @@ pub fn extract_gemini_generation_result(
     Ok(GenerationResult {
         images,
         parameter_snapshot: ParameterSnapshot {
-            requested_width: Some(request.width),
-            requested_height: Some(request.height),
-            actual_width: Some(request.width),
-            actual_height: Some(request.height),
+            requested_width: (!request.automatic_size).then_some(request.width),
+            requested_height: (!request.automatic_size).then_some(request.height),
+            actual_width: (!request.automatic_size).then_some(request.width),
+            actual_height: (!request.automatic_size).then_some(request.height),
             requested_quality: request.quality.clone(),
             actual_quality: Some("standard".into()),
             revised_prompt,
@@ -768,8 +773,8 @@ pub fn extract_openai_responses_result(
 ) -> Result<GenerationResult, String> {
     let mut images = Vec::new();
     let mut seen = HashSet::new();
-    let mut actual_width = Some(request.width);
-    let mut actual_height = Some(request.height);
+    let mut actual_width = (!request.automatic_size).then_some(request.width);
+    let mut actual_height = (!request.automatic_size).then_some(request.height);
     let mut actual_quality = request.quality.clone();
     let mut revised_prompt = None::<String>;
     let fallback_mime = image_mime_from_output_format(output_format);
@@ -808,8 +813,8 @@ pub fn extract_openai_responses_result(
     Ok(GenerationResult {
         images,
         parameter_snapshot: ParameterSnapshot {
-            requested_width: Some(request.width),
-            requested_height: Some(request.height),
+            requested_width: (!request.automatic_size).then_some(request.width),
+            requested_height: (!request.automatic_size).then_some(request.height),
             actual_width,
             actual_height,
             requested_quality: request.quality.clone(),
@@ -1079,8 +1084,8 @@ pub fn extract_nano_banana_result(
     let fallback_mime = image_mime_from_output_format(output_format);
     let mut images = Vec::new();
     let mut seen = HashSet::new();
-    let mut actual_width = Some(request.width);
-    let mut actual_height = Some(request.height);
+    let mut actual_width = (!request.automatic_size).then_some(request.width);
+    let mut actual_height = (!request.automatic_size).then_some(request.height);
     let mut actual_quality = Some("standard".into());
     let revised_prompt = find_first_string(&response_json, "revised_prompt");
 
@@ -1122,8 +1127,8 @@ pub fn extract_nano_banana_result(
     Ok(GenerationResult {
         images,
         parameter_snapshot: ParameterSnapshot {
-            requested_width: Some(request.width),
-            requested_height: Some(request.height),
+            requested_width: (!request.automatic_size).then_some(request.width),
+            requested_height: (!request.automatic_size).then_some(request.height),
             actual_width,
             actual_height,
             requested_quality: request.quality.clone(),
@@ -1331,6 +1336,11 @@ fn parse_size_label(value: &str) -> Option<(u32, u32)> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GenerationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editing: Option<ImageEditingInput>,
+    /// 宽高在自动模式下仅作为内存预算上界，不作为上游输出尺寸。
+    #[serde(default)]
+    pub automatic_size: bool,
     pub prompt: String,
     pub model: String,
     pub width: u32,
@@ -1373,6 +1383,8 @@ pub struct ProxyGenerationJobResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenerationSettingsSnapshot {
+    #[serde(default)]
+    pub automatic_size: bool,
     pub width: u32,
     pub height: u32,
     pub quality: Option<String>,
@@ -1388,6 +1400,8 @@ pub struct GenerationSettingsSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LocalTaskRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editing: Option<ImageEditingSnapshot>,
     pub id: String,
     pub thread_id: String,
     pub config_id: String,
@@ -1409,6 +1423,17 @@ pub struct LocalTaskRecord {
     pub error_message: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl LocalTaskRecord {
+    /// 删除保护、同步与备份需遍历全部输入；遮罩仍不属于普通参考图。
+    pub fn input_asset_ids(&self) -> impl Iterator<Item = &String> {
+        self.reference_asset_ids.iter().chain(
+            self.editing
+                .iter()
+                .flat_map(ImageEditingSnapshot::asset_ids),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2247,6 +2272,8 @@ mod tests {
 
     fn gemini_request() -> GenerationRequest {
         GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "参考这张图调整配色".into(),
             model: "gemini-3.1-flash-image".into(),
             width: 3840,
@@ -2514,6 +2541,7 @@ mod tests {
     #[test]
     fn newer_tombstone_removes_record_and_blocks_old_device_restore() {
         let task = LocalTaskRecord {
+            editing: None,
             id: "task-1".into(),
             thread_id: "thread-1".into(),
             config_id: "config-1".into(),
@@ -2573,6 +2601,7 @@ mod tests {
     #[test]
     fn legacy_task_without_detached_flag_remains_readable() {
         let task = LocalTaskRecord {
+            editing: None,
             id: "task-1".into(),
             thread_id: "thread-1".into(),
             config_id: "config-1".into(),
@@ -2659,6 +2688,7 @@ mod tests {
     #[test]
     fn record_newer_than_tombstone_can_be_explicitly_restored() {
         let mut task = LocalTaskRecord {
+            editing: None,
             id: "task-1".into(),
             thread_id: "thread-1".into(),
             config_id: "config-1".into(),
@@ -2713,6 +2743,8 @@ mod tests {
     #[test]
     fn responses_result_only_scans_result_subtree() {
         let request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-5.5".into(),
             width: 1024,
@@ -2755,6 +2787,8 @@ mod tests {
     #[test]
     fn responses_result_reads_gateway_wrapped_output() {
         let request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-5.5".into(),
             width: 1024,
@@ -2877,6 +2911,7 @@ mod tests {
     #[test]
     fn successful_task_payloads_are_removed_without_losing_image_count() {
         let mut tasks = vec![LocalTaskRecord {
+            editing: None,
             id: "task-1".into(),
             thread_id: "thread-1".into(),
             config_id: "config-1".into(),

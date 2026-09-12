@@ -1,3 +1,4 @@
+mod edit_png;
 mod gallery_templates;
 mod migrations;
 mod security_headers;
@@ -91,7 +92,7 @@ const AUTH_BODY_LIMIT: usize = 64 * 1024;
 const SYNC_BODY_LIMIT: usize = 32 * 1024 * 1024;
 const GENERATION_BODY_LIMIT: usize = 192 * 1024 * 1024;
 const IMAGE_FETCH_BODY_LIMIT: usize = 32 * 1024;
-const MAX_GENERATION_REFERENCE_COUNT: usize = 16;
+const MAX_GENERATION_REFERENCE_COUNT: usize = mew_image_shared::MAX_GENERATION_REFERENCE_IMAGES;
 const MAX_GENERATION_REFERENCE_FILE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_GENERATION_REFERENCE_TOTAL_BYTES: usize = 160 * 1024 * 1024;
 const MAX_GENERATION_METADATA_BYTES: usize = 2 * 1024 * 1024;
@@ -132,6 +133,7 @@ struct ResponseMemoryPermit {
 struct ParsedGeneratePayload {
     payload: GenerateViaProxyRequest,
     reference_files: Vec<TemporaryReferenceFile>,
+    mask_file: Option<TemporaryReferenceFile>,
 }
 
 struct TemporaryReferenceFile {
@@ -185,6 +187,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
+    if config.dev_bypass_upstream_ssrf {
+        if dev_upstream_ssrf_bypass_allowed(&config) {
+            warn!(
+                "本机开发已开启 MEW_DEV_BYPASS_UPSTREAM_SSRF：生成与图片下载允许访问本机、私网和保留地址。"
+            );
+        } else {
+            warn!("MEW_DEV_BYPASS_UPSTREAM_SSRF 未生效：后端必须通过 MEW_LISTEN 监听环回地址。");
+        }
+    }
     prepare_proxy_temp_dir().await?;
     ensure_sqlite_parent_dir(&config.database_url)?;
     ensure_asset_store_ready(&config)?;
@@ -696,6 +707,8 @@ async fn health() -> impl IntoResponse {
         "ok": true,
         "capabilities": {
             "proxy_generation_status_only": true,
+            "image_generation_options_v2": true,
+            "image_editing_v1": true,
             "gallery_import_conflict": true
         }
     }))
@@ -2231,18 +2244,31 @@ fn estimate_generation_memory_permits(
     let reference_bytes = request
         .reference_assets
         .iter()
+        .chain(request.editing.as_ref().and_then(|edit| edit.mask.as_ref()))
         .map(|asset| asset.byte_len)
         .fold(0_u64, u64::saturating_add);
-    let output_bytes = u64::from(request.width)
-        .saturating_mul(u64::from(request.height))
+    let (width, height) = request.budget_dimensions();
+    let output_bytes = u64::from(width)
+        .saturating_mul(u64::from(height))
         .saturating_mul(4)
         .saturating_mul(u64::from(request.count));
+    let edit_decode_bytes = request
+        .editing
+        .as_ref()
+        .and_then(|edit| edit.mask.as_ref())
+        .and_then(|mask| mask.width.zip(mask.height))
+        .map_or(0, |(width, height)| {
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(8)
+        });
     // 参考图在 data URL、JSON/multipart 和解码缓冲之间会短暂重复；结果也会同时
     // 存在于上游响应、提取结果与序列化轮询正文中，预算需覆盖峰值而非文件净大小。
     bytes_to_budget_permits(
         reference_bytes
             .saturating_mul(3)
             .saturating_add(output_bytes.saturating_mul(2))
+            .saturating_add(edit_decode_bytes)
             .saturating_add(32 * 1024 * 1024),
         state.config.proxy_memory_budget_mib,
     )
@@ -2365,7 +2391,7 @@ async fn run_proxy_generation_job(
         // 参考图即将载入受执行预算约束的内存，此时再释放排队临时磁盘预算。
         drop(temp_budget_permit);
         update_proxy_generation_job(&state, &job_id, ProxyGenerationJobState::Running).await;
-        hydrate_temporary_reference_files(&mut payload).await?;
+        let memory_permit = hydrate_temporary_reference_files(&mut payload, memory_permit).await?;
         let generated = execute_proxy_generation(&state, &payload.payload).await?;
         Ok::<_, AppError>((generated, memory_permit))
     })
@@ -2617,6 +2643,7 @@ async fn parse_generate_multipart(
     let mut payload = None;
     let mut reference_assets_meta = None;
     let mut reference_assets_files = Vec::new();
+    let mut mask_file = None;
     let mut reference_total_bytes = 0usize;
 
     while let Some(field) = multipart.next_field().await.map_err(AppError::internal)? {
@@ -2682,6 +2709,26 @@ async fn parse_generate_multipart(
                 }
                 reference_assets_files.push(temporary_file);
             }
+            "mask_file" => {
+                if mask_file.is_some() {
+                    return Err(AppError::bad_request("编辑遮罩文件不能重复。"));
+                }
+                if !content_type.eq_ignore_ascii_case("image/png") {
+                    return Err(AppError::bad_request("编辑遮罩必须使用 PNG。"));
+                }
+                let temporary_file = write_multipart_field_to_temp_file(
+                    field,
+                    MAX_GENERATION_REFERENCE_FILE_BYTES,
+                    "编辑遮罩",
+                    content_type,
+                )
+                .await?;
+                reference_total_bytes = reference_total_bytes
+                    .checked_add(temporary_file.byte_len as usize)
+                    .filter(|bytes| *bytes <= MAX_GENERATION_REFERENCE_TOTAL_BYTES)
+                    .ok_or_else(|| AppError::bad_request("参考图与遮罩合计不能超过 160 MiB。"))?;
+                mask_file = Some(temporary_file);
+            }
             _ => {}
         }
     }
@@ -2732,9 +2779,35 @@ async fn parse_generate_multipart(
     }
 
     payload.request.reference_assets = reference_assets;
+    match (
+        payload
+            .request
+            .editing
+            .as_ref()
+            .and_then(|editing| editing.mask.as_ref()),
+        mask_file.as_ref(),
+    ) {
+        (Some(mask), Some(file)) => {
+            if mask.sha256 != file.sha256 || mask.byte_len != file.byte_len {
+                return Err(AppError::bad_request(
+                    "遮罩文件大小或 SHA-256 与元数据不一致。",
+                ));
+            }
+            payload
+                .request
+                .editing
+                .as_ref()
+                .unwrap()
+                .validate(&payload.request)
+                .map_err(AppError::bad_request)?;
+        }
+        (None, None) => (),
+        _ => return Err(AppError::bad_request("遮罩文件与编辑元数据必须同时提供。")),
+    }
     Ok(ParsedGeneratePayload {
         payload,
         reference_files: reference_assets_files,
+        mask_file,
     })
 }
 
@@ -2816,7 +2889,37 @@ async fn write_multipart_field_to_temp_file(
 
 async fn hydrate_temporary_reference_files(
     parsed: &mut ParsedGeneratePayload,
-) -> Result<(), AppError> {
+    mut memory_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+    // 解码只发生在取得生成内存预算后，不能在上传阶段放大 PNG。
+    if let Some(file) = parsed.mask_file.as_ref() {
+        let expected = parsed
+            .payload
+            .request
+            .editing
+            .as_ref()
+            .and_then(|edit| edit.mask.as_ref())
+            .and_then(|mask| mask.width.zip(mask.height))
+            .ok_or_else(|| AppError::bad_request("遮罩尺寸缺失。"))?;
+        let base_file = parsed
+            .reference_files
+            .first()
+            .ok_or_else(|| AppError::bad_request("编辑底图文件缺失。"))?;
+        memory_permit =
+            validate_temporary_edit_png(base_file, expected, false, memory_permit).await?;
+        memory_permit = validate_temporary_edit_png(file, expected, true, memory_permit).await?;
+        let mask = parsed
+            .payload
+            .request
+            .editing
+            .as_mut()
+            .and_then(|edit| edit.mask.as_mut())
+            .ok_or_else(|| AppError::bad_request("遮罩元数据缺失。"))?;
+        mask.data_url = Some(load_temporary_reference_data_url(mask, file).await?);
+        mask.remote_url = None;
+        mask.remote_object_key = None;
+    }
+    parsed.mask_file = None;
     if parsed.payload.request.reference_assets.len() != parsed.reference_files.len() {
         return Err(AppError::internal_message(
             "代理生成参考图快照与临时文件数量不一致。",
@@ -2833,7 +2936,7 @@ async fn hydrate_temporary_reference_files(
         asset.data_url = Some(load_temporary_reference_data_url(asset, temporary_file).await?);
     }
     parsed.reference_files.clear();
-    Ok(())
+    Ok(memory_permit)
 }
 
 async fn load_temporary_reference_data_url(
@@ -2856,6 +2959,39 @@ async fn load_temporary_reference_data_url(
         temporary_file.mime_type,
         BASE64.encode(bytes)
     ))
+}
+
+async fn validate_temporary_edit_png(
+    file: &TemporaryReferenceFile,
+    expected: (u32, u32),
+    mask: bool,
+    memory_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+    let bytes = tokio::fs::read(&file.path)
+        .await
+        .map_err(AppError::internal)?;
+    if bytes.len() as u64 != file.byte_len || hex_sha256(&bytes) != file.sha256 {
+        return Err(AppError::bad_request("编辑临时文件大小或哈希已改变。"));
+    }
+    run_budgeted_image_validation(memory_permit, move || {
+        edit_png::validate(&bytes, expected, mask)
+    })
+    .await
+}
+
+async fn run_budgeted_image_validation(
+    memory_permit: tokio::sync::OwnedSemaphorePermit,
+    validate: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
+    // spawn_blocking 无法中止已开始的解码；预算必须随线程持有，不能随等待任务取消而释放。
+    let (result, memory_permit) = tokio::task::spawn_blocking(move || {
+        let result = validate();
+        (result, memory_permit)
+    })
+    .await
+    .map_err(AppError::internal)?;
+    result.map_err(AppError::bad_request)?;
+    Ok(memory_permit)
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4126,6 +4262,8 @@ fn validate_generate_request(
     user: Option<&UserSummary>,
     payload: &GenerateViaProxyRequest,
 ) -> Result<(), AppError> {
+    mew_image_shared::validate_image_generation_request(&payload.config, &payload.request)
+        .map_err(AppError::bad_request)?;
     let user_is_approved = user.is_some_and(|user| user.status == "approved");
     if !user_is_approved && !state.config.enable_guest_proxy {
         return Err(AppError::unauthorized(
@@ -4207,7 +4345,9 @@ fn resolve_upstream_target(
         .host_str()
         .ok_or_else(|| AppError::provider_target_blocked("当前上游地址缺少主机名。"))?
         .to_ascii_lowercase();
-    reject_unsafe_host(&host, loopback_upstream_allowed(&state.config, &host))?;
+    if !dev_upstream_ssrf_bypass_allowed(&state.config) {
+        reject_unsafe_host(&host, loopback_upstream_allowed(&state.config, &host))?;
+    }
 
     let mut allowed_hosts = BTreeSet::new();
     match kind {
@@ -4239,10 +4379,19 @@ fn resolve_upstream_target(
 fn loopback_upstream_allowed(config: &AppConfig, host: &str) -> bool {
     config.allow_loopback_upstreams
         && is_explicit_loopback_host(host)
-        && config
-            .listen_addr
-            .parse::<SocketAddr>()
-            .is_ok_and(|address| is_loopback_ip(address.ip()))
+        && backend_listens_on_loopback(config)
+}
+
+fn dev_upstream_ssrf_bypass_allowed(config: &AppConfig) -> bool {
+    // 依据后端实际绑定配置，避免仅因网页从 localhost 打开就放宽部署环境。
+    config.dev_bypass_upstream_ssrf && backend_listens_on_loopback(config)
+}
+
+fn backend_listens_on_loopback(config: &AppConfig) -> bool {
+    config
+        .listen_addr
+        .parse::<SocketAddr>()
+        .is_ok_and(|address| is_loopback_ip(address.ip()))
 }
 
 fn is_explicit_loopback_host(host: &str) -> bool {
@@ -4277,7 +4426,7 @@ fn reject_unsafe_host(host: &str, allow_explicit_loopback: bool) -> Result<(), A
             "不允许访问本地或内部网络地址。",
         ));
     }
-    if let Ok(ip) = host.parse::<IpAddr>()
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>()
         && is_private_ip(ip)
     {
         if is_loopback_ip(ip) {
@@ -4367,13 +4516,16 @@ async fn prepare_upstream_request(
         .ok_or_else(|| AppError::provider_target_blocked("上游地址缺少主机名。"))?
         .to_ascii_lowercase();
     let allow_loopback_target = loopback_upstream_allowed(&state.config, &host);
-    reject_unsafe_host(&host, allow_loopback_target)?;
+    let bypass_ssrf = dev_upstream_ssrf_bypass_allowed(&state.config);
+    if !bypass_ssrf {
+        reject_unsafe_host(&host, allow_loopback_target)?;
+    }
     let port = url
         .port_or_known_default()
         .ok_or_else(|| AppError::provider_target_blocked("无法确定上游端口。"))?;
     let lookup = tokio::time::timeout(
         StdDuration::from_secs(5),
-        tokio::net::lookup_host((host.as_str(), port)),
+        tokio::net::lookup_host((host.trim_matches(['[', ']']), port)),
     )
     .await
     .map_err(|_| AppError::bad_gateway("上游 DNS 解析超时。"))?
@@ -4387,14 +4539,16 @@ async fn prepare_upstream_request(
     if addresses.is_empty() {
         return Err(AppError::bad_gateway("上游域名没有可用的解析地址。"));
     }
-    if !resolved_upstream_addresses_are_allowed(&addresses, allow_loopback_target) {
-        return Err(AppError::provider_target_blocked(
-            if allow_loopback_target {
-                "显式环回上游解析出了非环回地址，已拒绝连接。"
-            } else {
-                "上游域名解析到了本机、私网、保留或链路本地地址。"
-            },
-        ));
+    if !bypass_ssrf && !resolved_upstream_addresses_are_allowed(&addresses, allow_loopback_target) {
+        warn!(host = %host, ?addresses, "上游地址被 SSRF 策略拒绝");
+        let reason = if allow_loopback_target {
+            "显式环回上游解析出了非环回地址，已拒绝连接。"
+        } else {
+            "上游域名解析到了本机、私网、保留或链路本地地址。"
+        };
+        return Err(AppError::provider_target_blocked(format!(
+            "{reason}目标主机：{host}；本机开发可设置 MEW_DEV_BYPASS_UPSTREAM_SSRF=true，后端监听环回地址并重启。"
+        )));
     }
 
     // 固定本次请求已校验的地址，避免校验后再次解析造成 DNS rebinding。
@@ -4975,6 +5129,99 @@ fn normalize_google_image_model(model: &str) -> String {
     trimmed.to_string()
 }
 
+fn attach_openai_edit_mask(
+    form: reqwest::multipart::Form,
+    request: &mew_image_shared::GenerationRequest,
+) -> Result<reqwest::multipart::Form, AppError> {
+    let Some(editing) = &request.editing else {
+        return Ok(form);
+    };
+    editing.validate(request).map_err(AppError::bad_request)?;
+    let Some(mask) = &editing.mask else {
+        return Ok(form);
+    };
+    // 遮罩只从已验证的上传内容构造，不能另行下载远程地址或有损重编码。
+    let (mime, bytes) = decode_data_url(
+        mask.data_url
+            .as_deref()
+            .ok_or_else(|| AppError::bad_request("遮罩上传内容尚未加载。"))?,
+    )?;
+    if mime != "image/png"
+        || bytes.len() as u64 != mask.byte_len
+        || hex_sha256(&bytes) != mask.sha256
+    {
+        return Err(AppError::bad_request("遮罩发送前内容校验失败。"));
+    }
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name("mask.png")
+        .mime_str("image/png")
+        .map_err(AppError::internal)?;
+    Ok(form.part("mask", part))
+}
+
+fn build_openai_responses_image_tool(
+    payload: &GenerateViaProxyRequest,
+) -> Result<serde_json::Value, AppError> {
+    let mut tool = json!({
+        "type": "image_generation",
+        "model": payload.request.model,
+        "action": if payload.request.reference_assets.is_empty() { "generate" } else { "edit" },
+        "size": payload.request.openai_size(),
+        "output_format": normalized_image_output_format(payload.config.output_format.as_deref()),
+        "background": normalized_openai_background(payload.config.background.as_deref()),
+        "moderation": payload.config.moderation.clone().unwrap_or_else(|| "auto".into()),
+        "partial_images": 1,
+    });
+    if let Some(editing) = &payload.request.editing {
+        editing
+            .validate(&payload.request)
+            .map_err(AppError::bad_request)?;
+        if let Some(mask) = &editing.mask {
+            let data_url = mask
+                .data_url
+                .as_deref()
+                .ok_or_else(|| AppError::bad_request("Responses 遮罩内容未加载。"))?;
+            let (mime, bytes) = decode_data_url(data_url)?;
+            if mime != "image/png"
+                || bytes.len() as u64 != mask.byte_len
+                || hex_sha256(&bytes) != mask.sha256
+            {
+                return Err(AppError::bad_request("Responses 遮罩发送前校验失败。"));
+            }
+            tool["input_image_mask"] = json!({ "image_url": data_url });
+            tool["action"] = json!("edit");
+        }
+    }
+    if let Some(quality) = &payload.request.quality {
+        tool["quality"] = json!(quality);
+    }
+    if let Some(compression) = openai_output_compression(
+        payload.config.output_format.as_deref(),
+        payload.config.output_compression,
+    ) {
+        tool["output_compression"] = json!(compression);
+    }
+    Ok(tool)
+}
+
+fn build_openai_responses_body(
+    payload: &GenerateViaProxyRequest,
+    content: Vec<serde_json::Value>,
+    tool: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "model": resolve_responses_main_model(&payload.config, &payload.request.model),
+        "input": if payload.request.reference_assets.is_empty() {
+            content[0]["text"].clone()
+        } else {
+            json!([{ "role": "user", "content": content }])
+        },
+        "tools": [tool],
+        "tool_choice": "required",
+        "stream": true,
+    })
+}
+
 async fn invoke_openai_image(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
@@ -5003,46 +5250,7 @@ async fn invoke_openai_image(
     let response = if payload.config.endpoint_mode == ProviderEndpointMode::ImagesApi
         && !payload.request.reference_assets.is_empty()
     {
-        let mut form = reqwest::multipart::Form::new()
-            .text("prompt", payload.request.prompt.clone())
-            .text("model", payload.request.model.clone())
-            .text(
-                "size",
-                format!("{}x{}", payload.request.width, payload.request.height),
-            )
-            .text("n", payload.request.count.to_string());
-        if let Some(quality) = &payload.request.quality {
-            form = form.text("quality", quality.clone());
-        }
-        form = form
-            .text(
-                "output_format",
-                normalized_image_output_format(payload.config.output_format.as_deref()),
-            )
-            .text(
-                "background",
-                normalized_openai_background(payload.config.background.as_deref()),
-            );
-        if let Some(compression) = openai_output_compression(
-            payload.config.output_format.as_deref(),
-            payload.config.output_compression,
-        ) {
-            form = form.text("output_compression", compression.to_string());
-        }
-        if let Some(moderation) = &payload.config.moderation {
-            form = form.text("moderation", moderation.clone());
-        }
-        for asset in &payload.request.reference_assets {
-            let (mime, bytes) = resolve_asset_bytes(state, asset).await?;
-            let part = reqwest::multipart::Part::bytes(bytes)
-                .file_name(format!("{}.png", asset.id))
-                .mime_str(&mime)
-                .map_err(AppError::internal)?;
-            form = form.part(OPENAI_EDIT_IMAGE_FIELD, part);
-        }
-        if supports_configurable_input_fidelity(&payload.request.model) {
-            form = form.text("input_fidelity", "high");
-        }
+        let form = build_openai_images_edit_form(state, payload).await?;
         request
             .multipart(form)
             .send()
@@ -5069,38 +5277,8 @@ async fn invoke_openai_image(
                 }));
             }
         }
-        let mut tool = json!({
-            "type": "image_generation",
-            "action": if payload.request.reference_assets.is_empty() { "generate" } else { "edit" },
-            "size": format!("{}x{}", payload.request.width, payload.request.height),
-            "output_format": normalized_image_output_format(payload.config.output_format.as_deref()),
-            "background": normalized_openai_background(payload.config.background.as_deref()),
-            "moderation": payload.config.moderation.clone().unwrap_or_else(|| "auto".into()),
-            "partial_images": 1,
-        });
-        if let Some(quality) = &payload.request.quality {
-            tool["quality"] = json!(quality);
-        }
-        if let Some(compression) = openai_output_compression(
-            payload.config.output_format.as_deref(),
-            payload.config.output_compression,
-        ) {
-            tool["output_compression"] = json!(compression);
-        }
-        let body = json!({
-            "model": resolve_responses_main_model(&payload.config, &payload.request.model),
-            "input": if payload.request.reference_assets.is_empty() {
-                content[0]["text"].clone()
-            } else {
-                json!([{
-                    "role": "user",
-                    "content": content,
-                }])
-            },
-            "tools": [tool],
-            "tool_choice": "required",
-            "stream": true,
-        });
+        let tool = build_openai_responses_image_tool(payload)?;
+        let body = build_openai_responses_body(payload, content, tool);
         request
             .json(&body)
             .send()
@@ -5110,7 +5288,7 @@ async fn invoke_openai_image(
         let mut body = json!({
             "prompt": payload.request.prompt,
             "model": payload.request.model,
-            "size": format!("{}x{}", payload.request.width, payload.request.height),
+            "size": payload.request.openai_size(),
             "quality": payload.request.quality,
             "n": payload.request.count,
             "output_format": normalized_image_output_format(payload.config.output_format.as_deref()),
@@ -5187,6 +5365,53 @@ async fn invoke_openai_image(
     parse_upstream_json_response(response, "Images API", &api_key).await
 }
 
+async fn build_openai_images_edit_form(
+    state: &AppState,
+    payload: &GenerateViaProxyRequest,
+) -> Result<reqwest::multipart::Form, AppError> {
+    if payload.request.reference_assets.is_empty() {
+        return Err(AppError::bad_request("Images 编辑请求缺少底图。"));
+    }
+    let mut form = reqwest::multipart::Form::new()
+        .text("prompt", payload.request.prompt.clone())
+        .text("model", payload.request.model.clone())
+        .text("size", payload.request.openai_size())
+        .text("n", payload.request.count.to_string());
+    if let Some(quality) = &payload.request.quality {
+        form = form.text("quality", quality.clone());
+    }
+    form = form
+        .text(
+            "output_format",
+            normalized_image_output_format(payload.config.output_format.as_deref()),
+        )
+        .text(
+            "background",
+            normalized_openai_background(payload.config.background.as_deref()),
+        );
+    if let Some(compression) = openai_output_compression(
+        payload.config.output_format.as_deref(),
+        payload.config.output_compression,
+    ) {
+        form = form.text("output_compression", compression.to_string());
+    }
+    if let Some(moderation) = &payload.config.moderation {
+        form = form.text("moderation", moderation.clone());
+    }
+    for asset in &payload.request.reference_assets {
+        let (mime, bytes) = resolve_asset_bytes(state, asset).await?;
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(format!("{}.png", asset.id))
+            .mime_str(&mime)
+            .map_err(AppError::internal)?;
+        form = form.part(OPENAI_EDIT_IMAGE_FIELD, part);
+    }
+    if supports_configurable_input_fidelity(&payload.request.model) {
+        form = form.text("input_fidelity", "high");
+    }
+    attach_openai_edit_mask(form, &payload.request)
+}
+
 async fn invoke_openai_compatible_image(
     state: &AppState,
     payload: &GenerateViaProxyRequest,
@@ -5216,7 +5441,7 @@ async fn invoke_openai_compatible_image(
                 "aspect_ratio": aspect_ratio_from_dimensions(payload.request.width, payload.request.height),
                 "response_format": "url",
                 "image_size": nano_banana_image_size_from_dimensions(payload.request.width, payload.request.height),
-                "size": format!("{}x{}", payload.request.width, payload.request.height),
+                "size": payload.request.openai_size(),
                 "n": payload.request.count,
             }))
             .send()
@@ -5468,7 +5693,9 @@ fn validate_remote_image_target(state: &AppState, url: &Url) -> Result<(), AppEr
         .host_str()
         .ok_or_else(|| AppError::provider_target_blocked("上游返回的图片地址缺少主机名。"))?
         .to_ascii_lowercase();
-    reject_unsafe_host(&host, loopback_upstream_allowed(&state.config, &host))?;
+    if !dev_upstream_ssrf_bypass_allowed(&state.config) {
+        reject_unsafe_host(&host, loopback_upstream_allowed(&state.config, &host))?;
+    }
 
     let mut allowed_hosts = BTreeSet::new();
     for value in &state.config.trusted_provider_hosts {
@@ -5523,10 +5750,10 @@ fn extract_generation_result(
             .unwrap_or_else(|error| GenerationResult {
                 images: Vec::new(),
                 parameter_snapshot: ParameterSnapshot {
-                    requested_width: Some(request.width),
-                    requested_height: Some(request.height),
-                    actual_width: Some(request.width),
-                    actual_height: Some(request.height),
+                    requested_width: (!request.automatic_size).then_some(request.width),
+                    requested_height: (!request.automatic_size).then_some(request.height),
+                    actual_width: (!request.automatic_size).then_some(request.width),
+                    actual_height: (!request.automatic_size).then_some(request.height),
                     requested_quality: request.quality.clone(),
                     actual_quality: Some("standard".into()),
                     revised_prompt: None,
@@ -5542,10 +5769,10 @@ fn extract_generation_result(
             .unwrap_or_else(|error| GenerationResult {
                 images: Vec::new(),
                 parameter_snapshot: ParameterSnapshot {
-                    requested_width: Some(request.width),
-                    requested_height: Some(request.height),
-                    actual_width: Some(request.width),
-                    actual_height: Some(request.height),
+                    requested_width: (!request.automatic_size).then_some(request.width),
+                    requested_height: (!request.automatic_size).then_some(request.height),
+                    actual_width: (!request.automatic_size).then_some(request.width),
+                    actual_height: (!request.automatic_size).then_some(request.height),
                     requested_quality: request.quality.clone(),
                     actual_quality: Some("standard".into()),
                     revised_prompt: None,
@@ -5563,10 +5790,10 @@ fn extract_generation_result(
                 Err(error) => GenerationResult {
                     images: Vec::new(),
                     parameter_snapshot: ParameterSnapshot {
-                        requested_width: Some(request.width),
-                        requested_height: Some(request.height),
-                        actual_width: Some(request.width),
-                        actual_height: Some(request.height),
+                        requested_width: (!request.automatic_size).then_some(request.width),
+                        requested_height: (!request.automatic_size).then_some(request.height),
+                        actual_width: (!request.automatic_size).then_some(request.width),
+                        actual_height: (!request.automatic_size).then_some(request.height),
                         requested_quality: request.quality.clone(),
                         actual_quality: request.quality.clone(),
                         revised_prompt: None,
@@ -5618,10 +5845,10 @@ fn extract_generation_result(
     GenerationResult {
         images,
         parameter_snapshot: ParameterSnapshot {
-            requested_width: Some(request.width),
-            requested_height: Some(request.height),
-            actual_width: Some(request.width),
-            actual_height: Some(request.height),
+            requested_width: (!request.automatic_size).then_some(request.width),
+            requested_height: (!request.automatic_size).then_some(request.height),
+            actual_width: (!request.automatic_size).then_some(request.width),
+            actual_height: (!request.automatic_size).then_some(request.height),
             requested_quality: request.quality.clone(),
             actual_quality: request.quality.clone(),
             revised_prompt,
@@ -5881,6 +6108,7 @@ mod tests {
             enforce_provider_host_whitelist: false,
             allow_insecure_upstreams: false,
             allow_loopback_upstreams: false,
+            dev_bypass_upstream_ssrf: false,
             enable_guest_proxy: true,
             guest_generation_concurrency: 4,
             guest_image_concurrency: 2,
@@ -6043,6 +6271,8 @@ mod tests {
                 updated_at: now,
             },
             request: GenerationRequest {
+                editing: None,
+                automatic_size: false,
                 prompt: "test".into(),
                 model: "test-model".into(),
                 width: 1024,
@@ -6444,10 +6674,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_image_validation_holds_budget_until_blocking_work_finishes() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = budget.clone().acquire_owned().await.unwrap();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_budgeted_image_validation(permit, move || {
+            let _ = started.send(());
+            finish_rx.recv().map_err(|error| error.to_string())?;
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.available_permits(), 0);
+        finish.send(()).unwrap();
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            budget.clone().acquire_owned(),
+        )
+        .await
+        .expect("解码结束后应释放预算")
+        .unwrap();
+        drop(released);
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_validation_returns_budget_on_success_and_releases_it_on_error() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = budget.clone().acquire_owned().await.unwrap();
+        let permit = run_budgeted_image_validation(permit, || Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        assert!(
+            run_budgeted_image_validation(permit, || Err("无效 PNG".into()))
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn generation_memory_estimate_uses_references_pixels_and_fixed_overhead() {
         let mut state = test_app_state(String::new()).await;
         state.config.proxy_memory_budget_mib = 512;
         let request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-image-2".into(),
             width: 1024,
@@ -6515,6 +6790,8 @@ mod tests {
 
         assert_eq!(value["capabilities"]["proxy_generation_status_only"], true);
         assert_eq!(value["capabilities"]["gallery_import_conflict"], true);
+        assert_eq!(value["capabilities"]["image_generation_options_v2"], true);
+        assert_eq!(value["capabilities"]["image_editing_v1"], true);
     }
 
     #[test]
@@ -6531,6 +6808,8 @@ mod tests {
     #[test]
     fn regular_openai_compatible_endpoints_remain_unchanged() {
         let mut request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gemini-2.5-flash-image".into(),
             width: 1024,
@@ -6566,6 +6845,8 @@ mod tests {
     #[test]
     fn openai_edit_keeps_official_multipart_field_and_skips_image2_fidelity() {
         let mut request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-image2-vip".into(),
             width: 1024,
@@ -6599,6 +6880,433 @@ mod tests {
         assert!(supports_configurable_input_fidelity(
             "openai/gpt-image-1.5-vip"
         ));
+    }
+
+    #[test]
+    fn responses_edit_tool_keeps_image_model_and_exact_mask_data() {
+        let bytes = b"mask";
+        let data_url = format!("data:image/png;base64,{}", BASE64.encode(bytes));
+        let mut payload = test_proxy_request(ProviderKind::OpenAiImage);
+        payload.config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        payload.config.responses_model = Some("gpt-5.6".into());
+        payload.request.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        payload.request.model = "gpt-image-2.5-flare".into();
+        let mut base = ImageAssetRef {
+            id: "base".into(),
+            sha256: "base-hash".into(),
+            mime_type: "image/png".into(),
+            byte_len: 10,
+            width: Some(1024),
+            height: Some(1024),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            data_url: None,
+            remote_object_key: None,
+            remote_url: None,
+            source_task_id: None,
+            metadata: Default::default(),
+        };
+        payload.request.reference_assets.push(base.clone());
+        base.id = "mask".into();
+        base.sha256 = hex_sha256(bytes);
+        base.byte_len = bytes.len() as u64;
+        base.data_url = Some(data_url.clone());
+        base.metadata
+            .insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+        payload.request.editing = Some(mew_image_shared::ImageEditingInput {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: "base".into(),
+            mask: Some(base),
+            instruction: None,
+        });
+        let tool = build_openai_responses_image_tool(&payload).unwrap();
+        assert_eq!(tool["model"], "gpt-image-2.5-flare");
+        assert_eq!(tool["action"], "edit");
+        assert_eq!(tool["input_image_mask"]["image_url"], data_url);
+        let body = build_openai_responses_body(
+            &payload,
+            vec![
+                json!({ "type": "input_text", "text": "edit" }),
+                json!({ "type": "input_image", "image_url": "data:image/png;base64,YmFzZQ==" }),
+            ],
+            tool,
+        );
+        assert_eq!(body["model"], "gpt-5.6");
+        assert_eq!(body["tools"][0]["model"], "gpt-image-2.5-flare");
+        assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 2);
+        assert!(!body["input"].to_string().contains("bWFzaw=="));
+        assert!(body["tools"].to_string().contains("bWFzaw=="));
+        let mask = payload
+            .request
+            .editing
+            .as_mut()
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap();
+        mask.sha256 = "changed".into();
+        assert!(build_openai_responses_image_tool(&payload).is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_images_edit_form_keeps_parameters_base_and_mask_separate() {
+        use axum::{Json, Router, extract::Multipart, routing::post};
+        async fn receive(mut multipart: Multipart) -> Json<Vec<serde_json::Value>> {
+            let mut fields = Vec::new();
+            while let Some(field) = multipart.next_field().await.unwrap() {
+                let name = field.name().unwrap_or_default().to_string();
+                let filename = field.file_name().map(str::to_string);
+                let bytes = field.bytes().await.unwrap();
+                fields.push(json!({
+                    "name": name, "filename": filename,
+                    "value": filename.is_none().then(|| String::from_utf8_lossy(&bytes).to_string()),
+                    "sha": hex_sha256(&bytes), "length": bytes.len()
+                }));
+            }
+            Json(fields)
+        }
+
+        let state = test_app_state(String::new()).await;
+        let mut payload = test_proxy_request(ProviderKind::OpenAiImage);
+        payload.request.model = "gpt-image-2.5-flare".into();
+        payload.request.quality = Some("max".into());
+        let asset = |id: &str, bytes: &[u8], role: bool| {
+            let mut metadata = std::collections::BTreeMap::new();
+            if role {
+                metadata.insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+            }
+            ImageAssetRef {
+                id: id.into(),
+                sha256: hex_sha256(bytes),
+                mime_type: "image/png".into(),
+                byte_len: bytes.len() as u64,
+                width: Some(1024),
+                height: Some(1024),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                data_url: Some(format!("data:image/png;base64,{}", BASE64.encode(bytes))),
+                remote_object_key: None,
+                remote_url: None,
+                source_task_id: None,
+                metadata,
+            }
+        };
+        let base = asset("base", b"base", false);
+        let mask = asset("mask", b"mask", true);
+        payload.request.reference_assets.push(base);
+        payload.request.editing = Some(mew_image_shared::ImageEditingInput {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: "base".into(),
+            mask: Some(mask),
+            instruction: None,
+        });
+        let form = build_openai_images_edit_form(&state, &payload)
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/edit", post(receive)))
+                .await
+                .unwrap();
+        });
+        let fields: Vec<serde_json::Value> = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{address}/edit"))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        server.abort();
+        let names = fields
+            .iter()
+            .map(|field| field["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names.iter().filter(|name| **name == "image[]").count(), 1);
+        assert_eq!(names.iter().filter(|name| **name == "mask").count(), 1);
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"] == "model" && field["value"] == "gpt-image-2.5-flare")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"] == "quality" && field["value"] == "max")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"] == "size" && field["value"] == "1024x1024")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"] == "image[]" && field["sha"] == hex_sha256(b"base"))
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["name"] == "mask" && field["sha"] == hex_sha256(b"mask"))
+        );
+    }
+
+    fn multipart_edit_payload() -> (GenerateViaProxyRequest, ImageAssetRef, Vec<u8>, Vec<u8>) {
+        let base_bytes = b"base-png".to_vec();
+        let mask_bytes = b"mask-png".to_vec();
+        let asset = |id: &str, bytes: &[u8], mask: bool| {
+            let mut metadata = std::collections::BTreeMap::new();
+            if mask {
+                metadata.insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+            }
+            ImageAssetRef {
+                id: id.into(),
+                sha256: hex_sha256(bytes),
+                mime_type: "image/png".into(),
+                byte_len: bytes.len() as u64,
+                width: Some(32),
+                height: Some(32),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                data_url: None,
+                remote_object_key: None,
+                remote_url: None,
+                source_task_id: None,
+                metadata,
+            }
+        };
+        let base = asset("base", &base_bytes, false);
+        let mask = asset("mask", &mask_bytes, true);
+        let mut payload = test_proxy_request(ProviderKind::OpenAiImage);
+        payload.request.width = 32;
+        payload.request.height = 32;
+        payload.request.editing = Some(mew_image_shared::ImageEditingInput {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: base.id.clone(),
+            mask: Some(mask),
+            instruction: None,
+        });
+        (payload, base, base_bytes, mask_bytes)
+    }
+
+    async fn multipart_parser_url() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, extract::Multipart, http::StatusCode, routing::post};
+        async fn parse(multipart: Multipart) -> Result<StatusCode, AppError> {
+            let _parsed = parse_generate_multipart(multipart).await?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/parse", post(parse)))
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}/parse"), server)
+    }
+
+    #[derive(Clone, Copy)]
+    enum MaskUploadCase {
+        Valid,
+        Missing,
+        Duplicate,
+        HashMismatch,
+        WrongMime,
+    }
+
+    fn edit_upload_form(case: MaskUploadCase) -> reqwest::multipart::Form {
+        let (mut payload, base, base_bytes, mask_bytes) = multipart_edit_payload();
+        if matches!(case, MaskUploadCase::HashMismatch) {
+            payload
+                .request
+                .editing
+                .as_mut()
+                .unwrap()
+                .mask
+                .as_mut()
+                .unwrap()
+                .sha256 = "changed".into();
+        }
+        let mut form = reqwest::multipart::Form::new()
+            .text("payload", serde_json::to_string(&payload).unwrap())
+            .text(
+                "reference_assets_meta",
+                serde_json::to_string(&[base]).unwrap(),
+            )
+            .part(
+                "reference_asset_files",
+                reqwest::multipart::Part::bytes(base_bytes)
+                    .file_name("base.png")
+                    .mime_str("image/png")
+                    .unwrap(),
+            );
+        let mask_count = match case {
+            MaskUploadCase::Missing => 0,
+            MaskUploadCase::Duplicate => 2,
+            _ => 1,
+        };
+        let mask_mime = if matches!(case, MaskUploadCase::WrongMime) {
+            "image/jpeg"
+        } else {
+            "image/png"
+        };
+        for _ in 0..mask_count {
+            form = form.part(
+                "mask_file",
+                reqwest::multipart::Part::bytes(mask_bytes.clone())
+                    .file_name("mask.png")
+                    .mime_str(mask_mime)
+                    .unwrap(),
+            );
+        }
+        form
+    }
+
+    #[tokio::test]
+    async fn multipart_parser_rejects_invalid_edit_mask_uploads() {
+        let (url, server) = multipart_parser_url().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (case, expected) in [
+            (MaskUploadCase::Valid, reqwest::StatusCode::NO_CONTENT),
+            (MaskUploadCase::Missing, reqwest::StatusCode::BAD_REQUEST),
+            (MaskUploadCase::Duplicate, reqwest::StatusCode::BAD_REQUEST),
+            (
+                MaskUploadCase::HashMismatch,
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (MaskUploadCase::WrongMime, reqwest::StatusCode::BAD_REQUEST),
+        ] {
+            let response = client
+                .post(&url)
+                .multipart(edit_upload_form(case))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        server.abort();
+    }
+
+    fn transport_ready_edit_payload(
+        endpoint_mode: ProviderEndpointMode,
+    ) -> GenerateViaProxyRequest {
+        let bytes = |label| test_png_bytes(label);
+        let asset = |id: &str, bytes: Vec<u8>, mask: bool| {
+            let mut metadata = std::collections::BTreeMap::new();
+            if mask {
+                metadata.insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+            }
+            ImageAssetRef {
+                id: id.into(),
+                sha256: hex_sha256(&bytes),
+                mime_type: "image/png".into(),
+                byte_len: bytes.len() as u64,
+                width: Some(32),
+                height: Some(32),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                data_url: Some(format!("data:image/png;base64,{}", BASE64.encode(bytes))),
+                remote_object_key: None,
+                remote_url: None,
+                source_task_id: None,
+                metadata,
+            }
+        };
+        let base = asset("base", bytes(b"base"), false);
+        let mask = asset("mask", bytes(b"mask"), true);
+        let mut payload = test_proxy_request(ProviderKind::OpenAiImage);
+        payload.config.endpoint_mode = endpoint_mode;
+        payload.config.responses_model = Some("gpt-5.6".into());
+        payload.request.endpoint_mode = endpoint_mode;
+        payload.request.model = "gpt-image-2.5-flare".into();
+        payload.request.width = 32;
+        payload.request.height = 32;
+        payload.request.reference_assets.push(base);
+        payload.request.editing = Some(mew_image_shared::ImageEditingInput {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: "base".into(),
+            mask: Some(mask),
+            instruction: None,
+        });
+        payload
+    }
+
+    #[tokio::test]
+    async fn invoke_openai_image_sends_edit_fields_to_actual_protocol_routes() {
+        use axum::{Json, Router, extract::Multipart, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captures {
+            images: Arc<Mutex<Vec<String>>>,
+            responses: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+        async fn images(
+            axum::extract::State(captures): axum::extract::State<Captures>,
+            mut multipart: Multipart,
+        ) -> Json<serde_json::Value> {
+            let mut fields = Vec::new();
+            while let Some(field) = multipart.next_field().await.unwrap() {
+                fields.push(field.name().unwrap_or_default().to_string());
+            }
+            *captures.images.lock().unwrap() = fields;
+            Json(json!({"data": []}))
+        }
+        async fn responses(
+            axum::extract::State(captures): axum::extract::State<Captures>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *captures.responses.lock().unwrap() = Some(body);
+            Json(json!({"output": []}))
+        }
+
+        let captures = Captures::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/images/edits", post(images))
+            .route("/v1/responses", post(responses))
+            .with_state(captures.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = test_app_state(String::new()).await;
+        state.config.allow_insecure_upstreams = true;
+        state.config.allow_loopback_upstreams = true;
+        for endpoint_mode in [
+            ProviderEndpointMode::ImagesApi,
+            ProviderEndpointMode::ResponsesApi,
+        ] {
+            let mut payload = transport_ready_edit_payload(endpoint_mode);
+            payload.config.base_url = format!("http://{address}");
+            invoke_openai_image(&state, &payload).await.unwrap();
+        }
+        server.abort();
+
+        let image_fields = captures.images.lock().unwrap();
+        assert_eq!(
+            image_fields
+                .iter()
+                .filter(|name| *name == "image[]")
+                .count(),
+            1
+        );
+        assert_eq!(
+            image_fields.iter().filter(|name| *name == "mask").count(),
+            1
+        );
+        let responses = captures.responses.lock().unwrap();
+        let body = responses.as_ref().unwrap();
+        assert_eq!(body["model"], "gpt-5.6");
+        assert_eq!(body["tools"][0]["model"], "gpt-image-2.5-flare");
+        assert_eq!(body["tools"][0]["action"], "edit");
+        assert!(body["tools"][0].get("input_image_mask").is_some());
+        assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -6662,6 +7370,115 @@ mod tests {
 
         config.listen_addr = "0.0.0.0:3000".into();
         assert!(!loopback_upstream_allowed(&config, "127.0.0.1"));
+    }
+
+    #[test]
+    fn dev_ssrf_bypass_requires_explicit_opt_in_and_loopback_listener() {
+        let mut config = test_config(String::new());
+        assert!(!dev_upstream_ssrf_bypass_allowed(&config));
+        config.dev_bypass_upstream_ssrf = true;
+        for listener in ["127.0.0.1:3000", "[::1]:3000"] {
+            config.listen_addr = listener.into();
+            assert!(dev_upstream_ssrf_bypass_allowed(&config));
+        }
+        for listener in ["0.0.0.0:3000", "[::]:3000", "192.168.1.2:3000", "invalid"] {
+            config.listen_addr = listener.into();
+            assert!(!dev_upstream_ssrf_bypass_allowed(&config));
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_ssrf_bypass_covers_provider_and_image_request_preparation() {
+        let mut state = test_app_state(String::new()).await;
+        state.config.allow_insecure_upstreams = true;
+        // 仅准备请求，不连接这些地址；覆盖私网、Fake-IP 与 IPv6 DNS 校验路径。
+        for target in [
+            "http://10.0.0.8/v1",
+            "http://198.18.0.1/image.png",
+            "http://[::1]/image.png",
+        ] {
+            for enabled in [false, true] {
+                state.config.dev_bypass_upstream_ssrf = enabled;
+                assert_eq!(
+                    resolve_provider_base_url(&state, ProviderKind::OpenAiCompatible, target)
+                        .is_ok(),
+                    enabled
+                );
+                for kind in [UpstreamRequestKind::Generation, UpstreamRequestKind::Image] {
+                    assert_eq!(
+                        prepare_upstream_request(&state, target, kind).await.is_ok(),
+                        enabled,
+                        "target={target}, bypass={enabled}"
+                    );
+                }
+            }
+        }
+
+        state.config.listen_addr = "0.0.0.0:3000".into();
+        assert!(
+            prepare_upstream_request(&state, "http://198.18.0.1", UpstreamRequestKind::Image)
+                .await
+                .is_err()
+        );
+        state.config.listen_addr = "127.0.0.1:3000".into();
+        state.config.allow_insecure_upstreams = false;
+        assert!(
+            prepare_upstream_request(&state, "http://127.0.0.1", UpstreamRequestKind::Generation)
+                .await
+                .is_err()
+        );
+        for target in [
+            "file:///image.png",
+            "https://user:secret@127.0.0.1/image.png",
+        ] {
+            assert!(
+                prepare_upstream_request(&state, target, UpstreamRequestKind::Image)
+                    .await
+                    .is_err()
+            );
+        }
+        state.config.enforce_provider_host_whitelist = true;
+        assert!(
+            resolve_provider_base_url(&state, ProviderKind::OpenAiCompatible, "https://10.0.0.8")
+                .is_err()
+        );
+        assert!(
+            validate_remote_image_target(
+                &state,
+                &Url::parse("https://10.0.0.8/image.png").unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_ssrf_bypass_downloads_images_through_local_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let image_bytes = BASE64
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aA1cAAAAASUVORK5CYII=")
+            .unwrap();
+        let response_bytes = image_bytes.clone();
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { axum::response::Redirect::temporary("/image.png") }),
+            )
+            .route(
+                "/image.png",
+                get(move || async move { ([(header::CONTENT_TYPE, "image/png")], response_bytes) }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut state = test_app_state(String::new()).await;
+        state.config.allow_insecure_upstreams = true;
+        let image_url = format!("http://{address}/redirect");
+        assert!(fetch_remote_image_bytes(&state, &image_url).await.is_err());
+        state.config.dev_bypass_upstream_ssrf = true;
+        let downloaded = fetch_remote_image_bytes(&state, &image_url).await;
+        server.abort();
+        let (mime_type, bytes) = downloaded.unwrap();
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(bytes, image_bytes);
     }
 
     #[test]
@@ -7370,6 +8187,8 @@ mod tests {
     #[test]
     fn responses_result_can_find_nested_base64() {
         let request = GenerationRequest {
+            editing: None,
+            automatic_size: false,
             prompt: "test".into(),
             model: "gpt-5.5".into(),
             width: 1024,

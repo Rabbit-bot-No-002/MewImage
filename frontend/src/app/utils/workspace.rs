@@ -38,6 +38,9 @@ pub(crate) fn gallery_items(
         .map(|config| (config.id.as_str(), config.name.as_str()))
         .collect();
     for asset in assets {
+        if mew_image_shared::is_edit_mask(asset) {
+            continue;
+        }
         if let Some(task_id) = asset.source_task_id.as_deref() {
             assets_by_task.entry(task_id).or_default().push(asset);
         }
@@ -314,11 +317,22 @@ pub(crate) struct ThreadDeletionResult {
     pub(crate) retained_favorite_count: usize,
 }
 
+#[cfg(test)]
 pub(crate) fn delete_thread_preserving_favorites(
+    tasks: Vec<LocalTaskRecord>,
+    assets: Vec<ImageAssetRef>,
+    thread_id: &str,
+    updated_at: &str,
+) -> ThreadDeletionResult {
+    delete_thread_preserving_inputs(tasks, assets, thread_id, updated_at, &HashSet::new())
+}
+
+pub(crate) fn delete_thread_preserving_inputs(
     mut tasks: Vec<LocalTaskRecord>,
     mut assets: Vec<ImageAssetRef>,
     thread_id: &str,
     updated_at: &str,
+    protected_draft_ids: &HashSet<String>,
 ) -> ThreadDeletionResult {
     let thread_tasks = tasks
         .iter()
@@ -337,13 +351,14 @@ pub(crate) fn delete_thread_preserving_favorites(
     let removed_task_id_set = removed_task_ids.iter().cloned().collect::<HashSet<_>>();
     let protected_reference_ids = tasks
         .iter()
-        .filter(|task| task.favorite)
-        .flat_map(|task| task.reference_asset_ids.iter().cloned())
+        .filter(|task| task.favorite || task.thread_id != thread_id)
+        .flat_map(|task| task.input_asset_ids().cloned())
+        .chain(protected_draft_ids.iter().cloned())
         .collect::<HashSet<_>>();
     let removed_reference_ids = thread_tasks
         .iter()
         .filter(|task| !task.favorite)
-        .flat_map(|task| task.reference_asset_ids.iter().cloned())
+        .flat_map(|task| task.input_asset_ids().cloned())
         .collect::<HashSet<_>>();
 
     for task in &mut tasks {
@@ -429,6 +444,7 @@ pub(crate) fn selected_reference_assets(
     for selected_id in selected_reference_ids {
         if let Some(asset) = assets.iter().find(|asset| {
             asset.id == *selected_id
+                && !mew_image_shared::is_edit_mask(asset)
                 && !asset.metadata.contains_key("mask_base_asset_id")
                 && !is_theme_background(asset)
         }) {
@@ -452,7 +468,9 @@ pub(crate) fn thread_reference_assets(
     let assets_by_id = assets
         .iter()
         .filter(|asset| {
-            !asset.metadata.contains_key("mask_base_asset_id") && !is_theme_background(asset)
+            !asset.metadata.contains_key("mask_base_asset_id")
+                && !mew_image_shared::is_edit_mask(asset)
+                && !is_theme_background(asset)
         })
         .map(|asset| (asset.id.as_str(), asset))
         .collect::<HashMap<_, _>>();
@@ -475,6 +493,7 @@ pub(crate) fn thread_reference_assets(
     // 仅补充本会话独立上传的资源，避免把从未用作参考的生成结果混入列表。
     for asset in assets.iter().filter(|asset| {
         asset.source_task_id.is_none()
+            && !mew_image_shared::is_edit_mask(asset)
             && asset.metadata.get("thread_id").map(String::as_str) == Some(thread_id)
             && !asset.metadata.contains_key("mask_base_asset_id")
             && !asset.metadata.contains_key(FAVORITE_ARCHIVE_ASSET_KEY)
@@ -535,6 +554,62 @@ mod tests {
         LOCAL_BACKGROUND_ROLE_KEY, LOCAL_BACKGROUND_ROLE_RESULT,
     };
 
+    #[test]
+    fn deleting_thread_retains_base_referenced_only_by_another_local_draft() {
+        let result = delete_thread_preserving_inputs(
+            vec![test_task("task", "thread", false, &[])],
+            vec![
+                test_asset("base", Some("task"), None),
+                test_asset("unused", Some("task"), None),
+            ],
+            "thread",
+            "2026-09-11T00:00:00+00:00",
+            &HashSet::from(["base".into()]),
+        );
+        assert!(result.tasks.is_empty());
+        assert_eq!(result.removed_asset_ids, ["unused"]);
+        assert_eq!(result.assets.len(), 1);
+        assert_eq!(result.assets[0].id, "base");
+        assert!(result.assets[0].source_task_id.is_none());
+    }
+
+    #[test]
+    fn edit_masks_are_not_gallery_results_or_reference_choices() {
+        let task = test_task("task", "thread", false, &["mask"]);
+        let mut mask = test_asset("mask", Some("task"), Some("thread"));
+        mask.metadata
+            .insert("asset_role".into(), mew_image_shared::EDIT_MASK_ROLE.into());
+        let assets = [mask];
+        assert!(gallery_items(std::slice::from_ref(&task), &[], &assets).is_empty());
+        assert!(selected_reference_assets(&assets, &["mask".into()]).is_empty());
+        assert!(thread_reference_assets(&assets, &[task], "thread", &[]).is_empty());
+    }
+
+    #[test]
+    fn deleting_thread_preserves_edit_inputs_used_by_another_thread() {
+        let original = test_task("source", "old", false, &[]);
+        let mut editor = test_task("edit", "other", false, &["base"]);
+        editor.editing = Some(mew_image_shared::ImageEditingSnapshot {
+            mode: mew_image_shared::ImageEditingMode::Mask,
+            base_asset_id: "base".into(),
+            mask_asset_id: Some("mask".into()),
+            instruction: None,
+        });
+        let result = delete_thread_preserving_favorites(
+            vec![original, editor],
+            vec![
+                test_asset("base", Some("source"), None),
+                test_asset("mask", None, Some("old")),
+            ],
+            "old",
+            "2026-09-11T00:00:00+00:00",
+        );
+        assert!(result.removed_asset_ids.is_empty());
+        assert_eq!(result.assets.len(), 2);
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].id, "edit");
+    }
+
     fn test_task(
         id: &str,
         thread_id: &str,
@@ -542,6 +617,7 @@ mod tests {
         reference_asset_ids: &[&str],
     ) -> LocalTaskRecord {
         LocalTaskRecord {
+            editing: None,
             id: id.into(),
             thread_id: thread_id.into(),
             config_id: "config-1".into(),

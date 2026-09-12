@@ -155,6 +155,10 @@ pub(super) fn AppController() -> impl IntoView {
                 .collect::<Vec<_>>()
         });
         Some(PreviewPanelState {
+            editing_instruction: task
+                .editing
+                .as_ref()
+                .and_then(|editing| editing.instruction.clone()),
             task_id: task.id.clone(),
             asset_id: asset.as_ref().map(|asset| asset.id.clone()),
             prompt: task.prompt.clone(),
@@ -455,6 +459,8 @@ pub(super) fn AppController() -> impl IntoView {
             </Show>
 
             <ReferenceMenuOverlay delete_asset=delete_asset />
+            <super::components::reference_selection::ReferenceSelectionOverlay />
+            <super::components::image_editor::ImageEditorOverlay />
 
             <PreviewOverlay
                 close_preview=close_preview

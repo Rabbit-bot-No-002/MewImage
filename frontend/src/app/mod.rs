@@ -16,8 +16,8 @@ use std::{
 use crate::crypto::derive_trusted_sync_secret;
 use crate::providers::{
     GenerationLifecycle, ProxyBudgetRequest, ProxyGenerationPhase, default_config,
-    generate_with_strategy, generation_uses_proxy, hydrate_local_state, load_templates,
-    prepare_sync_envelope,
+    ensure_image_editing_sync_capability, generate_with_strategy, generation_uses_proxy,
+    hydrate_local_state, load_templates, prepare_sync_envelope,
 };
 use crate::storage::{
     GenerationStagingManifest, apply_asset_payload_changes, clear_asset_payloads,
@@ -97,7 +97,7 @@ const VISIBLE_THREAD_LIMIT: usize = 5;
 const ASSET_PAYLOAD_CACHE_MAX_ITEMS: usize = 6;
 const ASSET_PAYLOAD_CACHE_MAX_BYTES: u64 = 48 * 1024 * 1024;
 pub(crate) const MAX_ACTIVE_GENERATION_TASKS: usize = 20;
-const MAX_GENERATION_REFERENCE_ASSETS: usize = 16;
+const MAX_GENERATION_REFERENCE_ASSETS: usize = mew_image_shared::MAX_GENERATION_REFERENCE_IMAGES;
 const DEFAULT_ACTIVE_GENERATION_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
 const MIN_ACTIVE_GENERATION_BYTE_BUDGET: u64 = 192 * 1024 * 1024;
 const MAX_ACTIVE_GENERATION_BYTE_BUDGET: u64 = 512 * 1024 * 1024;
