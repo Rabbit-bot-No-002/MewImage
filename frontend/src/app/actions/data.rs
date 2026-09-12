@@ -37,6 +37,8 @@ pub(crate) fn build_data_actions(
     let selected_reference_ids = composer.selected_reference_ids;
     let reference_menu_asset_id = composer.reference_menu_asset_id;
     let continuation_asset_id = composer.continuation_asset_id;
+    let continuation_task_id = composer.continuation_task_id;
+    let conversation_rebase_requested = composer.conversation_rebase_requested;
     let queue_mode_enabled = composer.queue_mode_enabled;
     let draft_prompt = composer.draft_prompt;
     let status_text = composer.status_text;
@@ -283,6 +285,8 @@ pub(crate) fn build_data_actions(
                     composer.editing_by_thread.update(HashMap::clear);
                     selected_reference_ids.set(Vec::new());
                     continuation_asset_id.set(None);
+                    continuation_task_id.set(None);
+                    conversation_rebase_requested.set(false);
                     reference_menu_asset_id.set(None);
                     apply_local_state(
                         imported.state,
@@ -357,6 +361,8 @@ pub(crate) fn build_data_actions(
             draft_prompt.set(String::new());
             selected_reference_ids.set(Vec::new());
             continuation_asset_id.set(None);
+            continuation_task_id.set(None);
+            conversation_rebase_requested.set(false);
             reference_menu_asset_id.set(None);
             preview_state.set(None);
             preview_panel_state.set(None);

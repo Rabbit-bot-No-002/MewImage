@@ -49,6 +49,8 @@ pub(crate) fn build_workspace_actions(
     let dragging_reference_id = composer.dragging_reference_id;
     let reference_menu_asset_id = composer.reference_menu_asset_id;
     let continuation_asset_id = composer.continuation_asset_id;
+    let continuation_task_id = composer.continuation_task_id;
+    let conversation_rebase_requested = composer.conversation_rebase_requested;
     let queue_mode_enabled = composer.queue_mode_enabled;
     let generation_runtimes = composer.generation_runtimes;
     let draft_prompt = composer.draft_prompt;
@@ -70,6 +72,8 @@ pub(crate) fn build_workspace_actions(
         selected_reference_ids.set(Vec::new());
         reference_menu_asset_id.set(None);
         continuation_asset_id.set(None);
+        continuation_task_id.set(None);
+        conversation_rebase_requested.set(false);
         threads.update(|items| items.push(thread));
         persist_state();
         status_text.set("已新建会话，可以开始新的连续修改。".into());
@@ -195,6 +199,8 @@ pub(crate) fn build_workspace_actions(
                 .unwrap_or(false)
             {
                 continuation_asset_id.set(None);
+                continuation_task_id.set(None);
+                conversation_rebase_requested.set(false);
             }
             if current_thread_id.get_untracked() == thread_id {
                 let fallback = threads
@@ -207,6 +213,8 @@ pub(crate) fn build_workspace_actions(
                 selected_reference_ids.set(Vec::new());
                 reference_menu_asset_id.set(None);
                 continuation_asset_id.set(None);
+                continuation_task_id.set(None);
+                conversation_rebase_requested.set(false);
             }
             persist_state();
             status_text.set(if retained_favorite_count == 0 {
@@ -247,6 +255,8 @@ pub(crate) fn build_workspace_actions(
         selected_reference_ids.set(Vec::new());
         reference_menu_asset_id.set(None);
         continuation_asset_id.set(None);
+        continuation_task_id.set(None);
+        conversation_rebase_requested.set(false);
         show_thread_archive_menu.set(false);
     };
 
@@ -456,6 +466,8 @@ pub(crate) fn build_workspace_actions(
             }
             if continuation_asset_id.get_untracked().as_deref() == Some(asset_id.as_str()) {
                 continuation_asset_id.set(None);
+                continuation_task_id.set(None);
+                conversation_rebase_requested.set(false);
             }
             let removed_asset_ids = vec![asset_id.clone()];
             record_sync_tombstones(tombstones, [(SyncEntityKind::Asset, asset_id.clone())]);
@@ -503,6 +515,8 @@ pub(crate) fn build_workspace_actions(
                 current_thread_id.set(target_thread_id.clone());
                 draft_prompt.set(task.prompt.clone());
                 continuation_asset_id.set(None);
+                continuation_task_id.set(None);
+                conversation_rebase_requested.set(false);
                 threads.update(|items| {
                     if let Some(thread) = items
                         .iter_mut()
@@ -534,8 +548,12 @@ pub(crate) fn build_workspace_actions(
                     task_target_thread_id(&task, &thread_list, &current_thread_id.get_untracked());
                 current_thread_id.set(target_thread_id.clone());
                 draft_prompt.set(task.prompt.clone());
-                selected_reference_ids.set(task.reference_asset_ids.clone());
-                continuation_asset_id.set(Some(asset_id.clone()));
+                selected_reference_ids.set(task.ordinary_reference_asset_ids().cloned().collect());
+                batch(|| {
+                    continuation_asset_id.set(Some(asset_id.clone()));
+                    continuation_task_id.set(Some(task.id.clone()));
+                    conversation_rebase_requested.set(false);
+                });
                 queue_mode_enabled.set(false);
                 let _ = save_generation_queue_mode(false);
                 reference_menu_asset_id.set(None);
@@ -562,6 +580,8 @@ pub(crate) fn build_workspace_actions(
 
     let perform_delete_task = move |task_id: String| {
         spawn_local(async move {
+            let deleting_conversation_anchor =
+                continuation_task_id.get_untracked().as_deref() == Some(task_id.as_str());
             let mut protected_ids = match crate::image_editor::draft_asset_ids(None).await {
                 Ok(ids) => ids,
                 Err(error) => {
@@ -644,10 +664,13 @@ pub(crate) fn build_workspace_actions(
                 }
             });
             selected_reference_ids.update(|ids| ids.retain(|id| !removed_asset_ids.contains(id)));
-            if let Some(asset_id) = continuation_asset_id.get_untracked()
-                && removed_asset_ids.contains(&asset_id)
-            {
+            let removed_conversation_asset = continuation_asset_id
+                .get_untracked()
+                .is_some_and(|asset_id| removed_asset_ids.contains(&asset_id));
+            if deleting_conversation_anchor || removed_conversation_asset {
                 continuation_asset_id.set(None);
+                continuation_task_id.set(None);
+                conversation_rebase_requested.set(false);
             }
             if !removed_asset_ids.is_empty() {
                 enqueue_payload_deletes(removed_asset_ids.clone());

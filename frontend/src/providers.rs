@@ -100,6 +100,7 @@ struct ProxyGenerationEndpoint {
     supports_status_only: bool,
     supports_options_v2: bool,
     supports_image_editing: bool,
+    supports_image_conversation: bool,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -110,6 +111,8 @@ struct ProxyHealthCapabilities {
     image_generation_options_v2: bool,
     #[serde(default)]
     proxy_generation_status_only: bool,
+    #[serde(default)]
+    image_conversation_v1: bool,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -184,6 +187,7 @@ impl GenerationExecutionResult {
 struct GenerationResultAccumulator {
     images: Vec<mew_image_shared::GeneratedImageResult>,
     first_parameter_snapshot: Option<mew_image_shared::ParameterSnapshot>,
+    first_upstream_response_id: Option<String>,
     used_proxy: bool,
     pending_proxy_poll_urls: Vec<String>,
 }
@@ -193,6 +197,7 @@ impl GenerationResultAccumulator {
         self.used_proxy |= execution.used_proxy;
         if self.first_parameter_snapshot.is_none() {
             self.first_parameter_snapshot = Some(execution.result.parameter_snapshot);
+            self.first_upstream_response_id = execution.result.upstream_response_id.take();
         }
         self.pending_proxy_poll_urls
             .append(&mut execution.pending_proxy_poll_urls);
@@ -207,6 +212,7 @@ impl GenerationResultAccumulator {
             result: GenerationResult {
                 images: self.images,
                 parameter_snapshot: self.first_parameter_snapshot.unwrap_or_default(),
+                upstream_response_id: self.first_upstream_response_id,
                 raw_response_json: None,
             },
             used_proxy: self.used_proxy,
@@ -742,6 +748,18 @@ async fn proxy_generate(
         return Err("代理模式也需要当前浏览器里已有 API Key。".into());
     }
     let endpoint = select_proxy_generation_endpoint(abort_signal).await?;
+    let mut compatibility_request;
+    let request = if request.previous_response_id.is_some() && !endpoint.supports_image_conversation
+    {
+        compatibility_request = request.clone();
+        if let Some(prompt) = compatibility_request.compatibility_prompt.take() {
+            compatibility_request.prompt = prompt;
+        }
+        compatibility_request.previous_response_id = None;
+        &compatibility_request
+    } else {
+        request
+    };
     if request.editing.is_some() && !endpoint.supports_image_editing {
         return Err(
             "后端尚不支持图片编辑协议，请同步更新前后端；未上传图片或发送生成请求。".into(),
@@ -931,6 +949,7 @@ async fn select_proxy_generation_endpoint(
                     supports_status_only: capabilities.proxy_generation_status_only,
                     supports_options_v2: capabilities.image_generation_options_v2,
                     supports_image_editing: capabilities.image_editing_v1,
+                    supports_image_conversation: capabilities.image_conversation_v1,
                 });
             }
             Ok(response) => errors.push(format!("{health_url} -> HTTP {}", response.status())),
@@ -1336,7 +1355,11 @@ fn build_openai_responses_json(
     let mut tool = json!({
         "type": "image_generation",
         "model": request.model,
-        "action": if request.reference_assets.is_empty() { "generate" } else { "edit" },
+        "action": if request.previous_response_id.is_some() || !request.reference_assets.is_empty() {
+            "edit"
+        } else {
+            "generate"
+        },
         "size": request.openai_size(),
         "output_format": normalized_image_output_format(config.output_format.as_deref()),
         "background": normalized_openai_background(config.background.as_deref()),
@@ -1361,13 +1384,17 @@ fn build_openai_responses_json(
         tool["output_compression"] = json!(compression);
     }
 
-    json!({
+    let mut body = json!({
         "model": resolve_responses_main_model(config, &request.model),
         "input": input,
         "tools": [tool],
         "tool_choice": "required",
         "stream": true,
-    })
+    });
+    if let Some(response_id) = &request.previous_response_id {
+        body["previous_response_id"] = json!(response_id);
+    }
+    body
 }
 
 fn build_gemini_json(request: &GenerationRequest, model: &str) -> serde_json::Value {
@@ -1498,6 +1525,7 @@ fn extract_result(
                 .and_then(|value| value.as_str().map(str::to_string)),
             duration_ms: None,
         },
+        upstream_response_id: None,
         // 图片已提取到 images，避免成功任务重复持有完整 Base64 JSON。
         raw_response_json: None,
     })
@@ -1628,6 +1656,7 @@ mod tests {
             prompt: "prompt".into(),
             requested_model: "gpt-image-2.5-flare".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite: false,
@@ -1652,6 +1681,7 @@ mod tests {
         let expected = GenerationResult {
             images: Vec::new(),
             parameter_snapshot: ParameterSnapshot::default(),
+            upstream_response_id: None,
             raw_response_json: None,
         };
         let body = serde_json::to_string(&expected).unwrap();
@@ -1695,16 +1725,18 @@ mod tests {
     fn proxy_capability_defaults_off_for_old_health_responses() {
         let old: ProxyHealthResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         let current: ProxyHealthResponse = serde_json::from_str(
-            r#"{"ok":true,"capabilities":{"proxy_generation_status_only":true,"image_generation_options_v2":true,"image_editing_v1":true}}"#,
+            r#"{"ok":true,"capabilities":{"proxy_generation_status_only":true,"image_generation_options_v2":true,"image_editing_v1":true,"image_conversation_v1":true}}"#,
         )
         .unwrap();
 
         assert!(!old.capabilities.proxy_generation_status_only);
         assert!(!old.capabilities.image_generation_options_v2);
         assert!(!old.capabilities.image_editing_v1);
+        assert!(!old.capabilities.image_conversation_v1);
         assert!(current.capabilities.image_editing_v1);
         assert!(current.capabilities.image_generation_options_v2);
         assert!(current.capabilities.proxy_generation_status_only);
+        assert!(current.capabilities.image_conversation_v1);
     }
 
     #[test]
@@ -1782,6 +1814,7 @@ mod tests {
                 requested_width: Some(marker),
                 ..Default::default()
             },
+            upstream_response_id: None,
             raw_response_json: Some(serde_json::json!({ "large": marker })),
         };
         let direct = GenerationExecutionResult::direct(result(1));
@@ -1842,12 +1875,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-image-2".into(),
             width: 3840,
             height: 2160,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         };
 
@@ -1858,6 +1893,11 @@ mod tests {
         assert_eq!(body["tools"][0]["model"], "gpt-image-2");
         assert_eq!(body["tools"][0]["background"], "transparent");
         assert!(body["tools"][0].get("output_compression").is_none());
+        let mut continued_request = request.clone();
+        continued_request.previous_response_id = Some("resp_previous".into());
+        let continued = build_openai_responses_json(&config, &continued_request);
+        assert_eq!(continued["previous_response_id"], "resp_previous");
+        assert_eq!(continued["tools"][0]["action"], "edit");
         let mut automatic_request = request;
         automatic_request.automatic_size = true;
         automatic_request.model = "gpt-image-2.5-sunburst".into();
@@ -1881,12 +1921,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-image-2".into(),
             width: 1024,
             height: 1024,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            previous_response_id: None,
             reference_assets: vec![test_reference_asset(
                 Some("blob:http://127.0.0.1/runtime-only"),
                 Some("https://example.test/reference.png"),
@@ -1920,12 +1962,14 @@ mod tests {
             }),
             automatic_size: false,
             prompt: "edit".into(),
+            compatibility_prompt: None,
             model: "gpt-image-2.5-flare".into(),
             width: 1024,
             height: 1024,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            previous_response_id: None,
             reference_assets: vec![base],
         };
         let body = build_openai_responses_json(&config, &request);
@@ -1958,12 +2002,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-image2-vip".into(),
             width: 1024,
             height: 1024,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::ImagesApi,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         };
 

@@ -5,6 +5,7 @@ use mew_image_shared::{ImageAssetRef, MAX_GENERATION_REFERENCE_IMAGES, now_rfc33
 use sha2::{Digest, Sha256};
 use wasm_bindgen_futures::JsFuture;
 
+use crate::image_editor::runtime::EditorRuntime;
 use crate::{
     app::{
         state::{ComposerState, PersistenceState, UiState, WorkspaceState},
@@ -25,6 +26,7 @@ use persistence::{
 pub(super) struct EditorInputs {
     pub(super) base: Option<std::rc::Rc<EditorBase>>,
     pub(super) imported_mask: Option<std::rc::Rc<crate::image_editor::EditorMask>>,
+    pub(super) apply_as_continuation: bool,
 }
 
 fn can_apply(
@@ -86,6 +88,35 @@ fn retained_references(
         .collect()
 }
 
+fn update_runtime_for_applied_edit(
+    runtime: &mut EditorRuntime,
+    draft: &EditorDraft,
+    mut references: Vec<String>,
+    image_id: &str,
+    editing: Option<mew_image_shared::ImageEditingSnapshot>,
+    apply_as_continuation: bool,
+) {
+    if draft.mode == EditMode::Sketch {
+        references.push(image_id.to_string());
+    } else if !apply_as_continuation {
+        references.insert(0, image_id.to_string());
+    }
+    runtime.reference_ids = references;
+    if let Some(editing) = editing {
+        runtime
+            .editing_by_thread
+            .insert(draft.thread_id.clone(), editing);
+    } else {
+        runtime.editing_by_thread.remove(&draft.thread_id);
+    }
+    if draft.mode != EditMode::Sketch && apply_as_continuation {
+        runtime.continuation_id = Some(image_id.to_string());
+    } else if draft.mode != EditMode::Sketch {
+        runtime.continuation_id = None;
+        runtime.continuation_task_id = None;
+    }
+}
+
 pub(super) async fn apply_edit(
     draft: EditorDraft,
     inputs: EditorInputs,
@@ -98,6 +129,7 @@ pub(super) async fn apply_edit(
     let EditorInputs {
         base,
         imported_mask,
+        apply_as_continuation,
     } = inputs;
     if draft.mode != EditMode::Sketch && base.is_none() {
         return Err("编辑底图尚未就绪，未改变工作台。".into());
@@ -183,12 +215,7 @@ pub(super) async fn apply_edit(
         Err(error) => return Err(cleanup_failed_application(&staging_key, &ids, &id, error).await),
     };
     let previous_runtime = current_runtime(workspace, composer);
-    let mut references = can_apply(&draft, workspace, composer, ui)?;
-    if draft.mode == EditMode::Sketch {
-        references.push(id.clone());
-    } else {
-        references.insert(0, id.clone());
-    }
+    let references = can_apply(&draft, workspace, composer, ui)?;
     let editing = match draft.mode {
         EditMode::Sketch => None,
         mode => Some(mew_image_shared::ImageEditingSnapshot {
@@ -204,17 +231,14 @@ pub(super) async fn apply_edit(
         }),
     };
     let mut next_runtime = previous_runtime.clone();
-    next_runtime.reference_ids = references;
-    if let Some(editing) = editing {
-        next_runtime
-            .editing_by_thread
-            .insert(draft.thread_id.clone(), editing);
-    } else {
-        next_runtime.editing_by_thread.remove(&draft.thread_id);
-    }
-    if draft.mode != EditMode::Sketch {
-        next_runtime.continuation_id = None;
-    }
+    update_runtime_for_applied_edit(
+        &mut next_runtime,
+        &draft,
+        references,
+        &id,
+        editing,
+        apply_as_continuation,
+    );
     let mut snapshot = snapshot_workspace_state(
         workspace.tasks,
         workspace.threads,
@@ -268,6 +292,9 @@ pub(super) async fn apply_edit(
             composer
                 .continuation_asset_id
                 .set(next_runtime.continuation_id);
+            composer
+                .continuation_task_id
+                .set(next_runtime.continuation_task_id);
         }
     });
     if !apply_selection {
@@ -384,5 +411,36 @@ mod tests {
             Some("previous-copy"),
         );
         assert_eq!(retained, ["previous-copy", "base"]);
+    }
+
+    #[test]
+    fn editing_continuation_replaces_base_without_reordering_ordinary_references() {
+        let mut draft =
+            EditorDraft::new("thread".into(), Some("old-result".into()), 32, 32).unwrap();
+        draft.mode = EditMode::Annotation;
+        let mut runtime = EditorRuntime {
+            thread_id: "thread".into(),
+            reference_ids: vec!["reference-a".into(), "reference-b".into()],
+            continuation_id: Some("old-result".into()),
+            continuation_task_id: Some("parent-task".into()),
+            ..Default::default()
+        };
+        let editing = mew_image_shared::ImageEditingSnapshot {
+            mode: mew_image_shared::ImageEditingMode::Annotation,
+            base_asset_id: "edited-result".into(),
+            mask_asset_id: None,
+            instruction: Some("follow marks".into()),
+        };
+        update_runtime_for_applied_edit(
+            &mut runtime,
+            &draft,
+            vec!["reference-a".into(), "reference-b".into()],
+            "edited-result",
+            Some(editing),
+            true,
+        );
+        assert_eq!(runtime.reference_ids, ["reference-a", "reference-b"]);
+        assert_eq!(runtime.continuation_id.as_deref(), Some("edited-result"));
+        assert_eq!(runtime.continuation_task_id.as_deref(), Some("parent-task"));
     }
 }

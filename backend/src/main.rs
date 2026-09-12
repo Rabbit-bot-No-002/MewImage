@@ -709,6 +709,7 @@ async fn health() -> impl IntoResponse {
             "proxy_generation_status_only": true,
             "image_generation_options_v2": true,
             "image_editing_v1": true,
+            "image_conversation_v1": true,
             "gallery_import_conflict": true
         }
     }))
@@ -5165,7 +5166,13 @@ fn build_openai_responses_image_tool(
     let mut tool = json!({
         "type": "image_generation",
         "model": payload.request.model,
-        "action": if payload.request.reference_assets.is_empty() { "generate" } else { "edit" },
+        "action": if payload.request.previous_response_id.is_some()
+            || !payload.request.reference_assets.is_empty()
+        {
+            "edit"
+        } else {
+            "generate"
+        },
         "size": payload.request.openai_size(),
         "output_format": normalized_image_output_format(payload.config.output_format.as_deref()),
         "background": normalized_openai_background(payload.config.background.as_deref()),
@@ -5209,7 +5216,7 @@ fn build_openai_responses_body(
     content: Vec<serde_json::Value>,
     tool: serde_json::Value,
 ) -> serde_json::Value {
-    json!({
+    let mut body = json!({
         "model": resolve_responses_main_model(&payload.config, &payload.request.model),
         "input": if payload.request.reference_assets.is_empty() {
             content[0]["text"].clone()
@@ -5219,7 +5226,11 @@ fn build_openai_responses_body(
         "tools": [tool],
         "tool_choice": "required",
         "stream": true,
-    })
+    });
+    if let Some(response_id) = &payload.request.previous_response_id {
+        body["previous_response_id"] = json!(response_id);
+    }
+    body
 }
 
 async fn invoke_openai_image(
@@ -5759,6 +5770,7 @@ fn extract_generation_result(
                     revised_prompt: None,
                     duration_ms: Some(duration_ms),
                 },
+                upstream_response_id: None,
                 raw_response_json: Some(serde_json::json!({ "error": error })),
             });
         result.parameter_snapshot.duration_ms = Some(duration_ms);
@@ -5778,6 +5790,7 @@ fn extract_generation_result(
                     revised_prompt: None,
                     duration_ms: Some(duration_ms),
                 },
+                upstream_response_id: None,
                 raw_response_json: Some(serde_json::json!({ "error": error })),
             });
         result.parameter_snapshot.duration_ms = Some(duration_ms);
@@ -5799,6 +5812,7 @@ fn extract_generation_result(
                         revised_prompt: None,
                         duration_ms: Some(duration_ms),
                     },
+                    upstream_response_id: None,
                     raw_response_json: Some(serde_json::json!({
                         "parse_error": error,
                     })),
@@ -5854,6 +5868,7 @@ fn extract_generation_result(
             revised_prompt,
             duration_ms: Some(duration_ms),
         },
+        upstream_response_id: None,
         // Base64/URL 已提取到 images，避免代理结果再次携带整份上游 JSON。
         raw_response_json: None,
     }
@@ -6274,12 +6289,14 @@ mod tests {
                 editing: None,
                 automatic_size: false,
                 prompt: "test".into(),
+                compatibility_prompt: None,
                 model: "test-model".into(),
                 width: 1024,
                 height: 1024,
                 quality: None,
                 count: 1,
                 endpoint_mode: ProviderEndpointMode::ImagesApi,
+                previous_response_id: None,
                 reference_assets: Vec::new(),
             },
             template,
@@ -6724,12 +6741,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-image-2".into(),
             width: 1024,
             height: 1024,
             quality: None,
             count: 2,
             endpoint_mode: ProviderEndpointMode::ImagesApi,
+            previous_response_id: None,
             reference_assets: vec![ImageAssetRef {
                 id: "asset".into(),
                 sha256: "hash".into(),
@@ -6755,6 +6774,7 @@ mod tests {
         let body = serialize_proxy_generation_result(GenerationResult {
             images: Vec::new(),
             parameter_snapshot: ParameterSnapshot::default(),
+            upstream_response_id: None,
             raw_response_json: None,
         })
         .unwrap();
@@ -6789,6 +6809,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["capabilities"]["proxy_generation_status_only"], true);
+        assert_eq!(value["capabilities"]["image_conversation_v1"], true);
         assert_eq!(value["capabilities"]["gallery_import_conflict"], true);
         assert_eq!(value["capabilities"]["image_generation_options_v2"], true);
         assert_eq!(value["capabilities"]["image_editing_v1"], true);
@@ -6811,12 +6832,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gemini-2.5-flash-image".into(),
             width: 1024,
             height: 1024,
             quality: None,
             count: 1,
             endpoint_mode: ProviderEndpointMode::CustomJson,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         };
         assert_eq!(
@@ -6848,12 +6871,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-image2-vip".into(),
             width: 1024,
             height: 1024,
             quality: None,
             count: 1,
             endpoint_mode: ProviderEndpointMode::ImagesApi,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         };
         assert_eq!(openai_images_endpoint(&request), "/v1/images/generations");
@@ -6933,6 +6958,18 @@ mod tests {
         );
         assert_eq!(body["model"], "gpt-5.6");
         assert_eq!(body["tools"][0]["model"], "gpt-image-2.5-flare");
+        let mut continuation = test_proxy_request(ProviderKind::OpenAiImage);
+        continuation.config.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        continuation.request.endpoint_mode = ProviderEndpointMode::ResponsesApi;
+        continuation.request.previous_response_id = Some("resp_previous".into());
+        let continuation_tool = build_openai_responses_image_tool(&continuation).unwrap();
+        assert_eq!(continuation_tool["action"], "edit");
+        let continuation_body = build_openai_responses_body(
+            &continuation,
+            vec![json!({ "type": "input_text", "text": "continue" })],
+            continuation_tool,
+        );
+        assert_eq!(continuation_body["previous_response_id"], "resp_previous");
         assert_eq!(body["input"][0]["content"].as_array().unwrap().len(), 2);
         assert!(!body["input"].to_string().contains("bWFzaw=="));
         assert!(body["tools"].to_string().contains("bWFzaw=="));
@@ -8190,12 +8227,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-5.5".into(),
             width: 1024,
             height: 1024,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         };
         let response_json = serde_json::json!({

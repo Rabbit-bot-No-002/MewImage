@@ -627,6 +627,7 @@ mod tests {
                 .iter()
                 .map(|id| (*id).to_string())
                 .collect(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite,

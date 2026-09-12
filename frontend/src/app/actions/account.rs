@@ -33,6 +33,8 @@ pub(crate) fn build_account_actions(
     let status_text = composer.status_text;
     let selected_reference_ids = composer.selected_reference_ids;
     let continuation_asset_id = composer.continuation_asset_id;
+    let continuation_task_id = composer.continuation_task_id;
+    let conversation_rebase_requested = composer.conversation_rebase_requested;
     let reference_menu_asset_id = composer.reference_menu_asset_id;
     let draft_prompt = composer.draft_prompt;
     let auth_user = account.auth_user;
@@ -108,6 +110,8 @@ pub(crate) fn build_account_actions(
         let enqueue_deleted_payloads = enqueue_payload_deletes;
         let selected_reference_ids_signal = selected_reference_ids;
         let continuation_asset_id_signal = continuation_asset_id;
+        let continuation_task_id_signal = continuation_task_id;
+        let conversation_rebase_requested_signal = conversation_rebase_requested;
         let reference_menu_asset_id_signal = reference_menu_asset_id;
         let preview_state_signal = preview_state;
         let preview_panel_state_signal = preview_panel_state;
@@ -365,6 +369,8 @@ pub(crate) fn build_account_actions(
                                 .unwrap_or(false)
                             {
                                 continuation_asset_id_signal.set(None);
+                                continuation_task_id_signal.set(None);
+                                conversation_rebase_requested_signal.set(false);
                             }
                             if reference_menu_asset_id_signal
                                 .get_untracked()
@@ -384,6 +390,16 @@ pub(crate) fn build_account_actions(
                                 preview_state_signal.set(None);
                                 preview_panel_state_signal.set(None);
                             }
+                        }
+                        let continuation_task_missing = continuation_task_id_signal
+                            .get_untracked()
+                            .is_some_and(|task_id| {
+                                !hydrated.tasks.iter().any(|task| task.id == task_id)
+                            });
+                        if continuation_task_missing {
+                            continuation_asset_id_signal.set(None);
+                            continuation_task_id_signal.set(None);
+                            conversation_rebase_requested_signal.set(false);
                         }
                         let current_config_id_value = current_config_id_signal.get_untracked();
                         if !hydrated
@@ -410,6 +426,8 @@ pub(crate) fn build_account_actions(
                             draft_prompt_signal.set(thread.draft_prompt.clone());
                             selected_reference_ids_signal.set(Vec::new());
                             continuation_asset_id_signal.set(None);
+                            continuation_task_id_signal.set(None);
+                            conversation_rebase_requested_signal.set(false);
                         }
                         apply_local_state(
                             hydrated,

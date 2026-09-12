@@ -21,7 +21,6 @@ pub(crate) struct AppDerived {
     pub(crate) visible_threads: Memo<Vec<ConversationThread>>,
     pub(crate) archived_threads: Memo<Vec<ConversationThread>>,
     pub(crate) reference_assets: Memo<Vec<ImageAssetRef>>,
-    pub(crate) continuation_asset: Memo<Option<ImageAssetRef>>,
     pub(crate) dimension_reference_assets: Memo<Vec<ImageAssetRef>>,
     pub(crate) current_preview: Memo<Option<(LocalTaskRecord, Option<ImageAssetRef>)>>,
     pub(crate) gallery_entries: Memo<Vec<GalleryItem>>,
@@ -88,12 +87,6 @@ impl AppDerived {
                     .tasks
                     .with(|tasks| thread_reference_assets(assets, tasks, &thread_id, &selected_ids))
             })
-        });
-        let continuation_asset = Memo::new(move |_| {
-            let asset_id = composer.continuation_asset_id.get()?;
-            workspace
-                .assets
-                .with(|assets| assets.iter().find(|asset| asset.id == asset_id).cloned())
         });
         let dimension_reference_assets = Memo::new(move |_| {
             let selected_ids = composer.selected_reference_ids.get();
@@ -225,7 +218,6 @@ impl AppDerived {
             visible_threads,
             archived_threads,
             reference_assets,
-            continuation_asset,
             dimension_reference_assets,
             current_preview,
             gallery_entries,

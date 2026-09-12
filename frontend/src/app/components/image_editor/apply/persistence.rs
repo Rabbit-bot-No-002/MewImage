@@ -12,6 +12,7 @@ pub(super) fn current_runtime(workspace: WorkspaceState, composer: ComposerState
         thread_id: workspace.current_thread_id.get_untracked(),
         reference_ids: composer.selected_reference_ids.get_untracked(),
         continuation_id: composer.continuation_asset_id.get_untracked(),
+        continuation_task_id: composer.continuation_task_id.get_untracked(),
     }
 }
 
@@ -29,6 +30,9 @@ pub(super) fn runtime_matches(
         && composer
             .continuation_asset_id
             .with_untracked(|id| id == &runtime.continuation_id)
+        && composer
+            .continuation_task_id
+            .with_untracked(|id| id == &runtime.continuation_task_id)
         && composer
             .editing_by_thread
             .with_untracked(|items| items == &runtime.editing_by_thread)

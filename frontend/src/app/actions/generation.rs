@@ -507,6 +507,8 @@ pub(crate) fn build_generation_actions(
     let selected_reference_ids = composer.selected_reference_ids;
     let reference_menu_asset_id = composer.reference_menu_asset_id;
     let continuation_asset_id = composer.continuation_asset_id;
+    let continuation_task_id = composer.continuation_task_id;
+    let conversation_rebase_requested = composer.conversation_rebase_requested;
     let draft_prompt = composer.draft_prompt;
     let draft_prompt_ref = composer.draft_prompt_ref;
     let custom_width = composer.custom_width;
@@ -593,6 +595,7 @@ pub(crate) fn build_generation_actions(
         commit_current_thread_draft();
         let selected_ids = selected_reference_ids.get_untracked();
         let continuation_id = continuation_asset_id.get_untracked();
+        let parent_task_id = continuation_task_id.get_untracked();
         let editing_snapshot = composer
             .editing_by_thread
             .with_untracked(|items| items.get(&thread_id).cloned());
@@ -602,6 +605,32 @@ pub(crate) fn build_generation_actions(
                 .as_ref()
                 .and_then(|editing| editing.instruction.as_deref()),
         );
+        let prepared_conversation = (!queued_submission).then(|| {
+            tasks.with_untracked(|tasks| {
+                prepare_conversation(
+                    tasks,
+                    &config,
+                    parent_task_id.as_deref(),
+                    continuation_id.as_deref(),
+                    &selected_ids,
+                    effective_prompt.clone(),
+                    conversation_rebase_requested.get_untracked(),
+                )
+            })
+        });
+        let request_prompt = prepared_conversation
+            .as_ref()
+            .map(|conversation| conversation.prompt.clone())
+            .unwrap_or(effective_prompt);
+        let compatibility_prompt = prepared_conversation
+            .as_ref()
+            .and_then(|conversation| conversation.compatibility_prompt.clone());
+        let previous_response_id = prepared_conversation
+            .as_ref()
+            .and_then(|conversation| conversation.previous_response_id.clone());
+        let conversation_snapshot = prepared_conversation
+            .as_ref()
+            .map(|conversation| conversation.snapshot.clone());
         if editing_snapshot.is_some() && config.provider_kind != ProviderKind::OpenAiImage {
             status_text
                 .set("当前服务商不支持编辑输入，请切回 OpenAI 图像接口；编辑草稿已保留。".into());
@@ -619,13 +648,39 @@ pub(crate) fn build_generation_actions(
             .as_ref()
             .map(|editing| editing.base_asset_id.as_str())
             .or(continuation_id.as_deref());
-        let submitted_reference_ids = assets.with_untracked(|items| {
+        let task_reference_ids = assets.with_untracked(|items| {
             submitted_reference_ids(items, &selected_ids, first_reference_id)
         });
-        let input_dependency_ids =
-            generation_dependency_ids(&submitted_reference_ids, editing_snapshot.as_ref());
+        let native_conversation = previous_response_id.is_some();
+        let request_selected_ids = if native_conversation {
+            let inherited = prepared_conversation
+                .as_ref()
+                .map(|conversation| conversation.inherited_reference_ids.as_slice())
+                .unwrap_or_default();
+            selected_ids
+                .iter()
+                .filter(|id| !inherited.contains(id))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            selected_ids.clone()
+        };
+        let request_base_id = if native_conversation {
+            editing_snapshot
+                .as_ref()
+                .map(|editing| editing.base_asset_id.as_str())
+        } else {
+            first_reference_id
+        };
+        let request_reference_ids = assets.with_untracked(|items| {
+            submitted_reference_ids(items, &request_selected_ids, request_base_id)
+        });
+        let task_dependency_ids =
+            generation_dependency_ids(&task_reference_ids, editing_snapshot.as_ref());
+        let request_dependency_ids =
+            generation_dependency_ids(&request_reference_ids, editing_snapshot.as_ref());
         if assets.with_untracked(|items| {
-            input_dependency_ids
+            task_dependency_ids
                 .iter()
                 .any(|id| !items.iter().any(|asset| &asset.id == id))
         }) {
@@ -634,13 +689,13 @@ pub(crate) fn build_generation_actions(
             return;
         }
         // 先完整收集并校验，不能静默截断旧任务的参考图改变生成含义。
-        if submitted_reference_ids.len() > MAX_GENERATION_REFERENCE_ASSETS {
+        if task_reference_ids.len() > MAX_GENERATION_REFERENCE_ASSETS {
             status_text
                 .set("单次生成最多使用 10 张参考图，请先取消多余选择；原有图片不会删除。".into());
             return;
         }
         let reference_size = assets.with_untracked(|items| {
-            submitted_reference_ids.iter().find_map(|asset_id| {
+            task_reference_ids.iter().find_map(|asset_id| {
                 items
                     .iter()
                     .find(|asset| asset.id == *asset_id)
@@ -678,16 +733,16 @@ pub(crate) fn build_generation_actions(
         let task_estimated_bytes = assets.with_untracked(|items| {
             estimated_generation_task_bytes(
                 items,
-                &input_dependency_ids,
+                &request_dependency_ids,
                 resolved_width,
                 resolved_height,
                 count_value,
             )
         });
         let preparation_estimated_bytes = assets.with_untracked(|items| {
-            estimated_generation_preparation_bytes(items, &input_dependency_ids)
+            estimated_generation_preparation_bytes(items, &request_dependency_ids)
         });
-        let expected_proxy = generation_uses_proxy(&config, !submitted_reference_ids.is_empty());
+        let expected_proxy = generation_uses_proxy(&config, !request_reference_ids.is_empty());
         let initial_reserved_bytes = if expected_proxy {
             preparation_estimated_bytes
         } else {
@@ -706,7 +761,7 @@ pub(crate) fn build_generation_actions(
         let abort_signal = abort_controller.signal();
 
         let task_id = new_id();
-        let dependency_asset_ids = input_dependency_ids.iter().cloned().collect();
+        let dependency_asset_ids = task_dependency_ids.iter().cloned().collect();
         let runtime_sequence = generation_runtimes.with_untracked(|items| {
             items
                 .values()
@@ -765,7 +820,8 @@ pub(crate) fn build_generation_actions(
                 config_id: config.id.clone(),
                 prompt: prompt.clone(),
                 requested_model: config.model.clone(),
-                reference_asset_ids: submitted_reference_ids.clone(),
+                reference_asset_ids: task_reference_ids.clone(),
+                conversation: conversation_snapshot,
                 generation_settings: Some(GenerationSettingsSnapshot {
                     automatic_size,
                     width: resolved_width,
@@ -801,10 +857,11 @@ pub(crate) fn build_generation_actions(
         let generation_runtimes_signal = generation_runtimes;
         let foreground_generation_task_id_signal = foreground_generation_task_id;
         let continuation_signal = continuation_asset_id;
+        let continuation_task_signal = continuation_task_id;
         let threads_signal = threads;
         let tombstones_signal = tombstones;
         let persist = persist_state;
-        let reference_ids_for_request = submitted_reference_ids;
+        let reference_ids_for_request = request_reference_ids;
         spawn_local(async move {
             let finish_runtime = || {
                 // 删除运行时记录即释放该任务持有的浏览器字节预算。
@@ -875,9 +932,9 @@ pub(crate) fn build_generation_actions(
 
             let payload_result = if expected_proxy {
                 // 代理上传优先使用 IndexedDB Blob URL，避免把全部参考图常驻为 Base64。
-                ensure_asset_display_sources_loaded(assets_signal, &input_dependency_ids).await
+                ensure_asset_display_sources_loaded(assets_signal, &request_dependency_ids).await
             } else {
-                ensure_asset_payloads_loaded(assets_signal, &input_dependency_ids).await
+                ensure_asset_payloads_loaded(assets_signal, &request_dependency_ids).await
             };
             let editing_result = payload_result.and_then(|()| {
                 assets_signal.with_untracked(|items| {
@@ -893,6 +950,13 @@ pub(crate) fn build_generation_actions(
             let editing_input = match editing_result {
                 Ok(input) => input,
                 Err(error) => {
+                    let error = if native_conversation {
+                        format!(
+                            "{error}；本轮使用了原生 Responses 会话。如 Response ID 已过期或被中转站拒绝，可在连续时间线点击“重建上下文”后手动重试。"
+                        )
+                    } else {
+                        error
+                    };
                     tasks_signal.update(|items| {
                         if let Some(task) = items.iter_mut().find(|task| task.id == task_id) {
                             task.status = TaskStatus::Failed;
@@ -926,13 +990,15 @@ pub(crate) fn build_generation_actions(
             let request = mew_image_shared::GenerationRequest {
                 editing: editing_input,
                 automatic_size,
-                prompt: effective_prompt,
+                prompt: request_prompt,
+                compatibility_prompt,
                 model: config.model.clone(),
                 width: resolved_width,
                 height: resolved_height,
                 quality: Some(quality_value),
                 count: count_value,
                 endpoint_mode: config.endpoint_mode,
+                previous_response_id,
                 reference_assets: references,
             };
             trim_asset_payload_cache(assets_signal);
@@ -1256,8 +1322,16 @@ pub(crate) fn build_generation_actions(
                             strip_task_payloads(std::slice::from_mut(task));
                         }
                     });
-                    if !queued_submission {
-                        continuation_signal.set(first_generated_id);
+                    if !queued_submission && first_generated_id.is_some() {
+                        batch(|| {
+                            continuation_signal.set(first_generated_id);
+                            continuation_task_signal.set(Some(task_id.clone()));
+                            conversation_rebase_requested.set(false);
+                            // 编辑输入只属于刚完成的这一轮；锚点前移后不能继续绑定旧底图。
+                            composer.editing_by_thread.update(|items| {
+                                items.remove(&thread_id);
+                            });
+                        });
                     }
                     persist();
                     // 原图和元数据使用两个独立事务；必须等包含成功任务的工作区修订真正落盘，
@@ -1375,6 +1449,8 @@ pub(crate) fn build_generation_actions(
                 }
                 selected_reference_ids.set(task.reference_asset_ids.clone());
                 continuation_asset_id.set(None);
+                continuation_task_id.set(None);
+                conversation_rebase_requested.set(false);
                 reference_menu_asset_id.set(None);
                 quality.set(settings.quality.clone().unwrap_or_else(|| "high".into()));
                 count.set(settings.count.clamp(1, 4));

@@ -80,6 +80,8 @@ fn LoadEditor(thread_id: String) -> impl IntoView {
         }
     });
     let requested_base = ui.image_editor_base_id.get_untracked();
+    let apply_as_continuation = requested_base.is_some()
+        && requested_base == composer.continuation_asset_id.get_untracked();
     // 入口用途必须在异步读取草稿前固定，避免旧草稿的最后模式改变本次入口语义。
     let purpose = EditorPurpose::from_requested_base(requested_base.as_deref());
     spawn_local(async move {
@@ -114,7 +116,9 @@ fn LoadEditor(thread_id: String) -> impl IntoView {
     });
     view! {
         <div class="image-editor-backdrop">
-            {move || loaded.get().map(|draft| view! { <EditorDialog initial=draft purpose /> })}
+            {move || loaded.get().map(|draft| view! {
+                <EditorDialog initial=draft purpose apply_as_continuation />
+            })}
             <Show when=move || loaded.with(Option::is_none)>
                 <section node_ref=loading_dialog tabindex="-1" class="image-editor-dialog image-editor-loading-dialog stack" role="dialog" aria-modal="true" aria-label="加载编辑草稿"
                     on:keydown=move |event: web_sys::KeyboardEvent| {
@@ -263,7 +267,9 @@ mod tests {
         )
         .unwrap();
         assert!(!confirm);
-        assert_eq!(restored, previous);
+        assert_eq!(restored.base_asset_id, previous.base_asset_id);
+        assert_eq!(restored.layers, previous.layers);
+        assert_eq!(restored.mode, crate::image_editor::EditMode::Annotation);
         assert!(
             prepare_editor_draft(
                 "thread",
@@ -310,7 +316,11 @@ mod tests {
 }
 
 #[component]
-fn EditorDialog(initial: EditorDraft, purpose: EditorPurpose) -> impl IntoView {
+fn EditorDialog(
+    initial: EditorDraft,
+    purpose: EditorPurpose,
+    apply_as_continuation: bool,
+) -> impl IntoView {
     let ui = expect_context::<UiState>();
     let workspace = expect_context::<WorkspaceState>();
     let composer = expect_context::<ComposerState>();
@@ -592,6 +602,7 @@ fn EditorDialog(initial: EditorDraft, purpose: EditorPurpose) -> impl IntoView {
                 apply::EditorInputs {
                     base: base.get_untracked(),
                     imported_mask: imported_mask.get_untracked(),
+                    apply_as_continuation,
                 },
                 workspace,
                 composer,

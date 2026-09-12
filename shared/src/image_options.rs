@@ -130,6 +130,25 @@ pub fn validate_image_generation_request(
     config: &EncryptedApiConfig,
     request: &GenerationRequest,
 ) -> Result<(), String> {
+    if request
+        .compatibility_prompt
+        .as_ref()
+        .is_some_and(|prompt| prompt.chars().count() > 64_000)
+    {
+        return Err("连续对话兼容上下文最多 64000 个字符。".into());
+    }
+    if let Some(response_id) = request.previous_response_id.as_deref()
+        && (config.provider_kind != ProviderKind::OpenAiImage
+            || config.endpoint_mode != ProviderEndpointMode::ResponsesApi
+            || request.endpoint_mode != ProviderEndpointMode::ResponsesApi
+            || response_id.is_empty()
+            || response_id.len() > 512
+            || response_id.chars().any(char::is_control))
+    {
+        return Err(
+            "连续会话标识仅允许用于 Responses API，且必须是不超过 512 字符的有效标识。".into(),
+        );
+    }
     if request.reference_assets.len() > MAX_GENERATION_REFERENCE_IMAGES {
         return Err("单次生成最多使用 10 张参考图，请先精简选择；原有图片不会删除。".into());
     }

@@ -603,6 +603,7 @@ fn apply_generation_staging_manifests(
                 })
                 .collect(),
             parameter_snapshot,
+            upstream_response_id: None,
             raw_response_json: None,
         });
         task.updated_at = now_rfc3339();
@@ -1183,6 +1184,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "gpt-image-2".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite: false,

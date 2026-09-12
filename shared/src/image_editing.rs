@@ -271,12 +271,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "x".into(),
+            compatibility_prompt: None,
             model: "gpt-image-2".into(),
             width: 1024,
             height: 1024,
             quality: None,
             count: 1,
             endpoint_mode: ProviderEndpointMode::ImagesApi,
+            previous_response_id: None,
             reference_assets: vec![asset("base", "image/png", 1024, 1024)],
         }
     }

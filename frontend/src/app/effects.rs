@@ -21,6 +21,7 @@ pub(crate) fn install_app_effects() {
             thread_id: workspace.current_thread_id.get(),
             reference_ids: composer.selected_reference_ids.get(),
             continuation_id: composer.continuation_asset_id.get(),
+            continuation_task_id: composer.continuation_task_id.get(),
         };
         let save = crate::image_editor::runtime::save_runtime(runtime);
         spawn_local(async move {
@@ -366,6 +367,9 @@ async fn initialize_app_state(
     composer
         .continuation_asset_id
         .set(editor_runtime.continuation_id);
+    composer
+        .continuation_task_id
+        .set(editor_runtime.continuation_task_id);
     workspace.current_thread_id.set(initial_thread_id.clone());
     workspace.current_config_id.set(
         state

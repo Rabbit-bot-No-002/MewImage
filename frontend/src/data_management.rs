@@ -658,6 +658,21 @@ fn import_session_backup(
         if let Some(editing) = task.editing.as_mut() {
             editing.remap_asset_ids(&asset_id_remap);
         }
+        if let Some(conversation) = task.conversation.as_mut() {
+            conversation.parent_task_id = conversation
+                .parent_task_id
+                .as_ref()
+                .and_then(|task_id| task_id_remap.get(task_id).cloned());
+            conversation.source_result_asset_id = conversation
+                .source_result_asset_id
+                .as_ref()
+                .and_then(|asset_id| asset_id_remap.get(asset_id).cloned());
+            // Response ID 只对原站点的服务商会话有效；跨会话包导入后必须安全重建。
+            conversation.mode = mew_image_shared::ConversationContextMode::Rebased;
+        }
+        if let Some(result) = task.result.as_mut() {
+            result.upstream_response_id = None;
+        }
         task.favorite = false;
         task.favorite_folder_id = None;
         task.detached_from_thread = false;
@@ -769,6 +784,14 @@ fn remap_asset_references(state: &mut LocalAppState, remap: &HashMap<String, Str
         if let Some(editing) = task.editing.as_mut() {
             editing.remap_asset_ids(remap);
         }
+        if let Some(source_id) = task
+            .conversation
+            .as_mut()
+            .and_then(|conversation| conversation.source_result_asset_id.as_mut())
+            && let Some(mapped) = remap.get(source_id)
+        {
+            *source_id = mapped.clone();
+        }
         for id in &mut task.reference_asset_ids {
             if let Some(mapped) = remap.get(id) {
                 *id = mapped.clone();
@@ -850,7 +873,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use mew_image_shared::{
-        ConversationThread, ImageAssetRef, LocalTaskRecord, SyncTombstone, TaskStatus,
+        ConversationContextMode, ConversationThread, ConversationTurnSnapshot, GenerationResult,
+        ImageAssetRef, LocalTaskRecord, ParameterSnapshot, SyncTombstone, TaskStatus,
         ThemePreference,
     };
 
@@ -898,6 +922,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "test".into(),
             reference_asset_ids: vec!["imported-asset".into()],
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite: false,
@@ -1120,6 +1145,84 @@ mod tests {
     }
 
     #[test]
+    fn session_import_remaps_conversation_links_and_invalidates_upstream_ids() {
+        let mut parent = test_task("parent", "project", &[], false);
+        parent.result = Some(GenerationResult {
+            images: Vec::new(),
+            parameter_snapshot: ParameterSnapshot::default(),
+            upstream_response_id: Some("resp_parent".into()),
+            raw_response_json: None,
+        });
+        let mut child = test_task("child", "project", &["parent-output"], false);
+        child.conversation = Some(ConversationTurnSnapshot {
+            parent_task_id: Some("parent".into()),
+            source_result_asset_id: Some("parent-output".into()),
+            mode: ConversationContextMode::NativeResponses,
+            provider_context_revision: Some("revision".into()),
+            included_history_turns: 1,
+        });
+        child.result = Some(GenerationResult {
+            images: Vec::new(),
+            parameter_snapshot: ParameterSnapshot::default(),
+            upstream_response_id: Some("resp_child".into()),
+            raw_response_json: None,
+        });
+        let mut thread = test_thread("project", "连续项目");
+        thread.task_ids = vec!["parent".into(), "child".into()];
+        let source = LocalAppState {
+            threads: vec![thread],
+            tasks: vec![parent, child],
+            assets: vec![
+                test_scoped_asset("parent-output", b"parent", Some("parent"), None),
+                test_scoped_asset("child-output", b"child", Some("child"), None),
+            ],
+            ..Default::default()
+        };
+
+        let prepared = prepare_session_backup(&source, "project").unwrap();
+        let zip = build_session_backup(prepared, &HashMap::new()).unwrap();
+        let imported = import_backup(&zip, &LocalAppState::default()).unwrap();
+        let imported_parent = imported
+            .state
+            .tasks
+            .iter()
+            .find(|task| {
+                task.conversation
+                    .as_ref()
+                    .and_then(|turn| turn.parent_task_id.as_ref())
+                    .is_none()
+            })
+            .unwrap();
+        let imported_child = imported
+            .state
+            .tasks
+            .iter()
+            .find(|task| {
+                task.conversation
+                    .as_ref()
+                    .and_then(|turn| turn.parent_task_id.as_ref())
+                    .is_some()
+            })
+            .unwrap();
+        let conversation = imported_child.conversation.as_ref().unwrap();
+        assert_eq!(
+            conversation.parent_task_id.as_deref(),
+            Some(imported_parent.id.as_str())
+        );
+        assert_eq!(conversation.mode, ConversationContextMode::Rebased);
+        assert_ne!(
+            conversation.source_result_asset_id.as_deref(),
+            Some("parent-output")
+        );
+        assert!(imported.state.tasks.iter().all(|task| {
+            task.result
+                .as_ref()
+                .and_then(|result| result.upstream_response_id.as_ref())
+                .is_none()
+        }));
+    }
+
+    #[test]
     fn old_tasks_default_to_no_editing_and_remapping_preserves_edit_mode() {
         let task = test_task("task", "thread", &["base"], false);
         let json = serde_json::to_value(&task).unwrap();
@@ -1245,6 +1348,7 @@ mod tests {
                 .iter()
                 .map(|id| (*id).to_string())
                 .collect(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite,

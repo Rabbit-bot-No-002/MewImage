@@ -12,34 +12,34 @@ pub(crate) fn choose_task_references(
 ) {
     let workspace = expect_context::<crate::app::state::WorkspaceState>();
     let composer = expect_context::<crate::app::state::ComposerState>();
-    if let Some(editing) = &task.editing
-        && continuation
-            .as_ref()
-            .is_some_and(|id| id != &editing.base_asset_id)
-    {
-        composer
-            .status_text
-            .set("更换编辑底图需要重新建立遮罩，不能沿用原图的选区。".into());
-        return;
-    }
+    let is_continuation = continuation.is_some();
     let original_thread = workspace.current_thread_id.get_untracked();
+    let reference_ids = if is_continuation {
+        task.ordinary_reference_asset_ids()
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        task.reference_asset_ids.clone()
+    };
     let choices = continuation
         .iter()
-        .chain(task.reference_asset_ids.iter())
+        .cloned()
+        .chain(reference_ids)
         .map(|id| ReferenceChoice {
             id: id.clone(),
             preview: assets.with_untracked(|assets| {
                 assets
                     .iter()
-                    .find(|asset| asset.id == *id)
+                    .find(|asset| asset.id == id)
                     .map(crate::app::asset_display_src)
                     .unwrap_or_default()
             }),
-            required: continuation.as_ref() == Some(id)
-                || task
-                    .editing
-                    .as_ref()
-                    .is_some_and(|editing| &editing.base_asset_id == id),
+            required: continuation.as_ref() == Some(&id)
+                || (!is_continuation
+                    && task
+                        .editing
+                        .as_ref()
+                        .is_some_and(|editing| editing.base_asset_id == id)),
         })
         .collect();
     choose_references(ui, choices, move |ids| {
@@ -56,6 +56,10 @@ pub(crate) fn choose_task_references(
         }
         let mut selected = task.clone();
         selected.reference_asset_ids.retain(|id| ids.contains(id));
+        if is_continuation {
+            // 历史遮罩和标记只属于原轮次，不能绑定到新选择的输出结果。
+            selected.editing = None;
+        }
         if let Some(editing) = &selected.editing
             && let Err(error) = assets.with_untracked(|items| editing.validate_resources(items))
         {

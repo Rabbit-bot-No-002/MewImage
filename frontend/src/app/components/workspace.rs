@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use leptos::{prelude::*, task::spawn_local};
-use mew_image_shared::{EncryptedApiConfig, now_rfc3339};
+use mew_image_shared::{
+    ConversationContextMode, EncryptedApiConfig, ImageAssetRef, LocalTaskRecord, now_rfc3339,
+};
 use web_sys::{DragEvent, FileList, MouseEvent};
 
 use crate::storage::save_generation_queue_mode;
@@ -20,6 +22,14 @@ use crate::app::{
 
 use super::{asset_drop_zone::AssetDropZone, common::MaterialSymbolIcon};
 
+#[derive(Clone, PartialEq)]
+struct ConversationTimelineTurn {
+    index: usize,
+    task: LocalTaskRecord,
+    asset: Option<ImageAssetRef>,
+    branched: bool,
+}
+
 #[component]
 pub(crate) fn WorkspaceMain(
     commit_current_thread_draft: impl Fn() + Copy + Send + Sync + 'static,
@@ -30,6 +40,8 @@ pub(crate) fn WorkspaceMain(
     import_reference_assets: impl Fn(FileList) + Copy + Send + Sync + 'static,
     new_thread: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     open_reference_menu: impl Fn(String) + Copy + Send + Sync + 'static,
+    open_preview: impl Fn(String, Option<String>) + Copy + Send + Sync + 'static,
+    enter_continuation_context: impl Fn(String, String) + Copy + Send + Sync + 'static,
     persist_state: impl Fn() + Copy + Send + Sync + 'static,
     persist_ui_state: impl Fn() + Copy + Send + Sync + 'static,
     rename_thread: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
@@ -46,6 +58,8 @@ pub(crate) fn WorkspaceMain(
     let ui = expect_context::<UiState>();
     let derived = expect_context::<AppDerived>();
     let configs = workspace.configs;
+    let tasks = workspace.tasks;
+    let assets = workspace.assets;
     let threads = workspace.threads;
     let current_thread_id = workspace.current_thread_id;
     let current_config_id = workspace.current_config_id;
@@ -54,6 +68,8 @@ pub(crate) fn WorkspaceMain(
     let dragging_reference_id = composer.dragging_reference_id;
     let drag_over_reference_id = composer.drag_over_reference_id;
     let continuation_asset_id = composer.continuation_asset_id;
+    let continuation_task_id = composer.continuation_task_id;
+    let conversation_rebase_requested = composer.conversation_rebase_requested;
     let draft_prompt = composer.draft_prompt;
     let draft_prompt_ref = composer.draft_prompt_ref;
     let custom_width = composer.custom_width;
@@ -79,8 +95,91 @@ pub(crate) fn WorkspaceMain(
     let visible_threads = derived.visible_threads;
     let archived_threads = derived.archived_threads;
     let reference_assets = derived.reference_assets;
-    let continuation_asset = derived.continuation_asset;
     let dimension_reference_assets = derived.dimension_reference_assets;
+    let conversation_turns = Memo::new(move |_| {
+        let Some(anchor_task_id) = continuation_task_id.get() else {
+            return Vec::new();
+        };
+        let current_asset_id = continuation_asset_id.get();
+        tasks.with(|task_items| {
+            let chain =
+                crate::app::utils::conversation::conversation_chain(task_items, &anchor_task_id);
+            assets.with(|asset_items| {
+                chain
+                    .iter()
+                    .enumerate()
+                    .map(|(index, task)| {
+                        let selected_by_child = chain.get(index + 1).and_then(|child| {
+                            child
+                                .conversation
+                                .as_ref()
+                                .filter(|turn| turn.parent_task_id.as_deref() == Some(&task.id))
+                                .and_then(|turn| turn.source_result_asset_id.as_deref())
+                        });
+                        let selected_id = if task.id == anchor_task_id {
+                            current_asset_id.as_deref().or(selected_by_child)
+                        } else {
+                            selected_by_child
+                        };
+                        let asset = selected_id
+                            .and_then(|id| asset_items.iter().find(|asset| asset.id == id))
+                            .or_else(|| {
+                                asset_items.iter().find(|asset| {
+                                    asset.source_task_id.as_deref() == Some(task.id.as_str())
+                                })
+                            })
+                            .cloned();
+                        let child_count = task_items
+                            .iter()
+                            .filter(|candidate| {
+                                candidate
+                                    .conversation
+                                    .as_ref()
+                                    .and_then(|turn| turn.parent_task_id.as_deref())
+                                    == Some(task.id.as_str())
+                            })
+                            .count();
+                        ConversationTimelineTurn {
+                            index,
+                            task: (*task).clone(),
+                            asset,
+                            branched: child_count > 1,
+                        }
+                    })
+                    .collect()
+            })
+        })
+    });
+    let conversation_reference_assets = Memo::new(move |_| {
+        let selected = selected_reference_ids.get();
+        let inherited = continuation_task_id
+            .get()
+            .and_then(|task_id| {
+                tasks.with(|items| {
+                    items.iter().find(|task| task.id == task_id).map(|task| {
+                        task.ordinary_reference_asset_ids()
+                            .cloned()
+                            .collect::<HashSet<_>>()
+                    })
+                })
+            })
+            .unwrap_or_default();
+        assets.with(|items| {
+            selected
+                .iter()
+                .filter_map(|id| {
+                    items
+                        .iter()
+                        .find(|asset| &asset.id == id)
+                        .cloned()
+                        .map(|asset| {
+                            let is_new = !inherited.contains(id);
+                            (asset, is_new)
+                        })
+                })
+                .collect::<Vec<_>>()
+        })
+    });
 
     Effect::new(move |_| {
         let missing_source_ids = reference_assets
@@ -121,6 +220,8 @@ pub(crate) fn WorkspaceMain(
                                     queue_mode_enabled.set(next);
                                     if next {
                                         continuation_asset_id.set(None);
+                                        continuation_task_id.set(None);
+                                        conversation_rebase_requested.set(false);
                                         status_text.set("已开启队列模式，可以继续编辑并并发提交任务。".into());
                                     } else {
                                         status_text.set("已关闭队列模式。后台任务会继续运行。".into());
@@ -345,36 +446,141 @@ pub(crate) fn WorkspaceMain(
                         }
                     />
 
-                    {move || continuation_asset.get().map(|asset| {
-                        let clear_asset = asset.id.clone();
-                        let edit_asset = asset.id.clone();
-                        view! {
-                            <div class="continuation-banner">
-                                <div class="row">
-                                    <div class="row">
-                                        <button type="button" class="continuation-thumb-button" title="编辑上一轮结果" aria-label="编辑上一轮结果"
-                                            on:click=move |_| {
-                                                ui.image_editor_base_id.set(Some(edit_asset.clone()));
-                                                ui.image_editor_thread.set(Some(current_thread_id.get_untracked()));
-                                            }>
-                                            <img class="continuation-thumb" src=asset_display_src(&asset) alt="连续修改底图" />
-                                            <span class="continuation-thumb-edit"><MaterialSymbolIcon name="edit" filled=false /></span>
-                                        </button>
-                                        <div class="stack">
-                                            <strong>"连续修改模式"</strong>
-                                            <span class="status">"下一次会基于上一张输出继续生成，不会加入参考图队列。"</span>
-                                        </div>
-                                    </div>
-                                    <button class="button ghost" on:click=move |_| {
-                                        if continuation_asset_id.get_untracked().as_deref() == Some(clear_asset.as_str()) {
-                                            continuation_asset_id.set(None);
-                                            status_text.set("已退出连续修改模式，当前参考图选择已保留。".into());
+                    <Show when=move || continuation_task_id.get().is_some()>
+                        <section class="conversation-timeline-panel" aria-label="连续图像对话">
+                            <div class="conversation-timeline-header">
+                                <div class="conversation-mode-summary">
+                                    <strong>{move || {
+                                        if conversation_rebase_requested.get() {
+                                            return "下轮重建";
                                         }
-                                    }>"清除上下文"</button>
+                                        conversation_turns
+                                            .get()
+                                            .last()
+                                            .and_then(|turn| turn.task.conversation.as_ref())
+                                            .map(|turn| match turn.mode {
+                                                ConversationContextMode::NativeResponses => "原生 Responses",
+                                                ConversationContextMode::Compatibility => "兼容上下文",
+                                                ConversationContextMode::Rebased => "本轮重建",
+                                            })
+                                            .unwrap_or("连续图像对话")
+                                    }}</strong>
+                                    <span>{move || {
+                                        if conversation_rebase_requested.get() {
+                                            return "等待你手动生成；不会自动重发上一轮请求。".to_string();
+                                        }
+                                        conversation_turns
+                                            .get()
+                                            .last()
+                                            .and_then(|turn| turn.task.conversation.as_ref())
+                                            .map(|turn| match turn.mode {
+                                                ConversationContextMode::NativeResponses => "保留上游会话，后续只发送本轮新增输入。".into(),
+                                                ConversationContextMode::Compatibility => format!("携带整理后的历史要求与最新结果；实际历史 {} 轮。", turn.included_history_turns),
+                                                ConversationContextMode::Rebased => format!("配置或参考图发生变化，已从当前结果重建上下文；实际历史 {} 轮。", turn.included_history_turns),
+                                            })
+                                            .unwrap_or_else(|| "从当前结果继续修改。".into())
+                                    }}</span>
                                 </div>
+                                <button class="button ghost conversation-exit" on:click=move |_| {
+                                    batch(|| {
+                                        continuation_asset_id.set(None);
+                                        continuation_task_id.set(None);
+                                        conversation_rebase_requested.set(false);
+                                    });
+                                    status_text.set("已退出连续对话，当前普通参考图选择已保留。".into());
+                                }>"退出连续对话"</button>
+                                <button
+                                    class="button ghost conversation-rebase"
+                                    class:is-active=move || conversation_rebase_requested.get()
+                                    title="下一次手动生成时不使用旧 Response ID，并从当前结果重建会话"
+                                    on:click=move |_| {
+                                        conversation_rebase_requested.set(true);
+                                        status_text.set("已标记为下轮重建；请确认要求后手动生成，不会自动重试或重复计费。".into());
+                                    }
+                                >"重建上下文"</button>
                             </div>
-                        }.into_any()
-                    }).unwrap_or_else(|| ().into_any())}
+                            <Show when=move || !conversation_reference_assets.get().is_empty()>
+                                <div class="conversation-reference-row">
+                                    <span>"当前参考图"</span>
+                                    <For
+                                        each=move || conversation_reference_assets.get()
+                                        key=|(asset, _)| asset.id.clone()
+                                        children=move |(asset, is_new)| {
+                                            let remove_id = asset.id.clone();
+                                            view! {
+                                                <button
+                                                    class="conversation-reference-chip"
+                                                    class:is-new=is_new
+                                                    title=if is_new { "本轮新增；点击移除" } else { "从父轮继承；点击移除并触发上下文重建" }
+                                                    on:click=move |_| {
+                                                        selected_reference_ids.update(|ids| ids.retain(|id| id != &remove_id));
+                                                        status_text.set("已从下一轮输入移除该参考图；若它来自父轮，将在生成时重建上下文。".into());
+                                                    }
+                                                >
+                                                    <img src=asset_display_src(&asset) alt="当前参考图" />
+                                                    {is_new.then(|| view! { <span>"新"</span> })}
+                                                </button>
+                                            }
+                                        }
+                                    />
+                                </div>
+                            </Show>
+                            <div class="conversation-timeline" role="list">
+                                <For
+                                    each=move || conversation_turns.get()
+                                    key=|turn| turn.task.id.clone()
+                                    children=move |turn| {
+                                        let task_id = turn.task.id.clone();
+                                        let current_task_id = task_id.clone();
+                                        let prompt = turn.task.prompt.clone();
+                                        let turn_number = turn.index + 1;
+                                        let asset = turn.asset.clone();
+                                        let branched = turn.branched;
+                                        let preview_task_id = task_id.clone();
+                                        let preview_asset_id = asset.as_ref().map(|asset| asset.id.clone());
+                                        let edit_asset_id = preview_asset_id.clone();
+                                        let continue_asset_id = preview_asset_id.clone();
+                                        let continue_task_id = task_id.clone();
+                                        view! {
+                                            <article
+                                                class="conversation-turn"
+                                                class:is-current=move || continuation_task_id.get().as_deref() == Some(current_task_id.as_str())
+                                                class:has-branch=branched
+                                                role="listitem"
+                                            >
+                                                <div class="conversation-turn-copy">
+                                                    <span class="conversation-turn-number">{format!("第 {turn_number} 轮")}</span>
+                                                    <span class="conversation-turn-prompt">{prompt}</span>
+                                                </div>
+                                                {asset.map(|asset| {
+                                                    let src = asset_display_src(&asset);
+                                                    view! {
+                                                        <img class="conversation-turn-thumb" src=src alt="该轮结果" />
+                                                        <div class="conversation-turn-actions">
+                                                            <button class="button ghost icon-action" title="查看大图" on:click=move |_| {
+                                                                open_preview(preview_task_id.clone(), preview_asset_id.clone());
+                                                            }><MaterialSymbolIcon name="zoom_in" filled=false /></button>
+                                                            <button class="button ghost icon-action" title="编辑此图" on:click=move |_| {
+                                                                ui.image_editor_base_id.set(edit_asset_id.clone());
+                                                                ui.image_editor_thread.set(Some(current_thread_id.get_untracked()));
+                                                            }><MaterialSymbolIcon name="edit" filled=false /></button>
+                                                            <button class="button ghost icon-action" title="从此继续" on:click=move |_| {
+                                                                if let Some(asset_id) = continue_asset_id.clone() {
+                                                                    enter_continuation_context(continue_task_id.clone(), asset_id);
+                                                                }
+                                                            }><MaterialSymbolIcon name="fork_right" filled=false /></button>
+                                                        </div>
+                                                    }.into_any()
+                                                }).unwrap_or_else(|| view! {
+                                                    <span class="conversation-turn-missing">"结果不可用"</span>
+                                                }.into_any())}
+                                            </article>
+                                        }
+                                    }
+                                />
+                            </div>
+                        </section>
+                    </Show>
 
                     <div class="settings-inline">
                         <button
@@ -829,7 +1035,13 @@ pub(crate) fn WorkspaceMain(
                                     }>
                                     <MaterialSymbolIcon name="draw" filled=false />"绘制草图"
                                 </button>
-                                <span class="tag">{move || format!("已选参考图 {} 张", selected_reference_ids.get().len())}</span>
+                                <span class="tag">{move || {
+                                    let selected = selected_reference_ids.get();
+                                    let continuation = continuation_asset_id.get();
+                                    let total = selected.len()
+                                        + usize::from(continuation.as_ref().is_some_and(|id| !selected.contains(id)));
+                                    format!("输入图片 {total}/10 · 普通参考图 {} 张", selected.len())
+                                }}</span>
                                 <button
                                     type="button"
                                     class="button ghost compact-toggle"

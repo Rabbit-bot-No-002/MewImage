@@ -392,6 +392,9 @@ pub struct GeneratedImageResult {
 pub struct GenerationResult {
     pub images: Vec<GeneratedImageResult>,
     pub parameter_snapshot: ParameterSnapshot,
+    /// Responses API 的不透明响应标识，仅用于同一服务商配置下继续原生会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_response_id: Option<String>,
     pub raw_response_json: Option<serde_json::Value>,
 }
 
@@ -724,6 +727,7 @@ pub fn extract_gemini_generation_result(
             revised_prompt,
             duration_ms: None,
         },
+        upstream_response_id: None,
         // 图片 Base64 已提取到 images；成功结果不再重复保留完整上游 JSON。
         raw_response_json: None,
     })
@@ -778,6 +782,11 @@ pub fn extract_openai_responses_result(
     let mut actual_quality = request.quality.clone();
     let mut revised_prompt = None::<String>;
     let fallback_mime = image_mime_from_output_format(output_format);
+    let upstream_response_id = response_json
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control))
+        .map(str::to_owned);
 
     let mut output_groups = Vec::new();
     collect_responses_output_groups(response_json, &mut output_groups);
@@ -822,6 +831,7 @@ pub fn extract_openai_responses_result(
             revised_prompt,
             duration_ms: None,
         },
+        upstream_response_id,
         // 成功响应中的 Base64 已进入 images，不再重复保留整份原始载荷。
         raw_response_json: None,
     })
@@ -1136,6 +1146,7 @@ pub fn extract_nano_banana_result(
             revised_prompt,
             duration_ms: None,
         },
+        upstream_response_id: None,
         // 图片 Base64 已提取到 images；成功结果不再重复保留完整上游 JSON。
         raw_response_json: None,
     })
@@ -1342,12 +1353,18 @@ pub struct GenerationRequest {
     #[serde(default)]
     pub automatic_size: bool,
     pub prompt: String,
+    /// 原生会话不可用时使用的确定性本地上下文；不会与原生提示词同时发送。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_prompt: Option<String>,
     pub model: String,
     pub width: u32,
     pub height: u32,
     pub quality: Option<String>,
     pub count: u32,
     pub endpoint_mode: ProviderEndpointMode,
+    /// 仅供 Responses API 原生多轮使用；其他接口必须忽略或拒绝该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
     pub reference_assets: Vec<ImageAssetRef>,
 }
 
@@ -1408,6 +1425,9 @@ pub struct LocalTaskRecord {
     pub prompt: String,
     pub requested_model: String,
     pub reference_asset_ids: Vec<String>,
+    /// 连续图像对话的父轮次信息；旧任务没有该字段时仍按独立任务处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationTurnSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_settings: Option<GenerationSettingsSnapshot>,
     pub result: Option<GenerationResult>,
@@ -1425,14 +1445,56 @@ pub struct LocalTaskRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationContextMode {
+    NativeResponses,
+    #[default]
+    Compatibility,
+    Rebased,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationTurnSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_result_asset_id: Option<String>,
+    #[serde(default)]
+    pub mode: ConversationContextMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_context_revision: Option<String>,
+    #[serde(default)]
+    pub included_history_turns: u32,
+}
+
 impl LocalTaskRecord {
     /// 删除保护、同步与备份需遍历全部输入；遮罩仍不属于普通参考图。
     pub fn input_asset_ids(&self) -> impl Iterator<Item = &String> {
-        self.reference_asset_ids.iter().chain(
-            self.editing
-                .iter()
-                .flat_map(ImageEditingSnapshot::asset_ids),
-        )
+        self.reference_asset_ids
+            .iter()
+            .chain(
+                self.editing
+                    .iter()
+                    .flat_map(ImageEditingSnapshot::asset_ids),
+            )
+            .chain(
+                self.conversation
+                    .iter()
+                    .filter_map(|turn| turn.source_result_asset_id.as_ref()),
+            )
+    }
+
+    /// 连续底图和编辑底图独立展示，不混入工作台普通参考图集合。
+    pub fn ordinary_reference_asset_ids(&self) -> impl Iterator<Item = &String> {
+        let conversation_base = self
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.source_result_asset_id.as_ref());
+        let editing_base = self.editing.as_ref().map(|editing| &editing.base_asset_id);
+        self.reference_asset_ids
+            .iter()
+            .filter(move |id| Some(*id) != conversation_base && Some(*id) != editing_base)
     }
 }
 
@@ -2275,12 +2337,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "参考这张图调整配色".into(),
+            compatibility_prompt: None,
             model: "gemini-3.1-flash-image".into(),
             width: 3840,
             height: 2160,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::CustomJson,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         }
     }
@@ -2548,6 +2612,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "test".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite: false,
@@ -2608,6 +2673,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "test".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite: true,
@@ -2629,6 +2695,7 @@ mod tests {
 
         assert!(!decoded.detached_from_thread);
         assert!(decoded.source_gallery_template_id.is_none());
+        assert!(decoded.conversation.is_none());
     }
 
     #[test]
@@ -2695,6 +2762,7 @@ mod tests {
             prompt: "restored".into(),
             requested_model: "test".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite: false,
@@ -2746,15 +2814,18 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-5.5".into(),
             width: 1024,
             height: 1024,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         };
         let response_json = serde_json::json!({
+            "id": "resp_result",
             "output": [{
                 "type": "image_generation_call",
                 "revised_prompt": "这里不是图片",
@@ -2781,6 +2852,7 @@ mod tests {
             result.parameter_snapshot.actual_quality.as_deref(),
             Some("medium")
         );
+        assert_eq!(result.upstream_response_id.as_deref(), Some("resp_result"));
         assert!(result.raw_response_json.is_none());
     }
 
@@ -2790,12 +2862,14 @@ mod tests {
             editing: None,
             automatic_size: false,
             prompt: "test".into(),
+            compatibility_prompt: None,
             model: "gpt-5.5".into(),
             width: 1024,
             height: 1024,
             quality: Some("high".into()),
             count: 1,
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
+            previous_response_id: None,
             reference_assets: Vec::new(),
         };
         let response_json = serde_json::json!({
@@ -2818,11 +2892,12 @@ mod tests {
     fn responses_sse_prefers_completed_response() {
         let stream = concat!(
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"ZG9uZQ==\"}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"output\":[{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\"}]}}\n\n",
             "data: [DONE]\n\n",
         );
         let payload = parse_openai_responses_event_stream(stream).unwrap();
         assert_eq!(payload["output"][0]["result"], "ZmluYWw=");
+        assert_eq!(payload["id"], "resp_stream");
     }
 
     #[test]
@@ -2918,6 +2993,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "model".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: Some(GenerationResult {
                 images: vec![GeneratedImageResult {
@@ -2925,6 +3001,7 @@ mod tests {
                     data_url: Some("data:image/png;base64,aGVsbG8=".into()),
                 }],
                 parameter_snapshot: ParameterSnapshot::default(),
+                upstream_response_id: None,
                 raw_response_json: Some(serde_json::json!({ "result": "aGVsbG8=" })),
             }),
             favorite: false,

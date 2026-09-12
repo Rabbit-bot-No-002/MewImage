@@ -782,6 +782,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "gpt-image-2".into(),
             reference_asset_ids: vec!["asset-1".into()],
+            conversation: None,
             generation_settings: Some(expected.clone()),
             result: None,
             favorite: false,
@@ -906,6 +907,7 @@ mod tests {
             prompt: "test".into(),
             requested_model: "gpt-image-2".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: Some(GenerationResult {
                 images: vec![GeneratedImageResult {
@@ -913,6 +915,7 @@ mod tests {
                     data_url: Some("data:image/png;base64,AAAA".into()),
                 }],
                 parameter_snapshot: ParameterSnapshot::default(),
+                upstream_response_id: None,
                 raw_response_json: Some(serde_json::json!({ "image": "large" })),
             }),
             favorite: false,

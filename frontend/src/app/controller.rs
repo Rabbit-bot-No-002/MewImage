@@ -444,6 +444,8 @@ pub(super) fn AppController() -> impl IntoView {
                     import_reference_assets=import_reference_assets
                     new_thread=new_thread
                     open_reference_menu=open_reference_menu
+                    open_preview=open_preview
+                    enter_continuation_context=enter_continuation_context
                     persist_state=persist_state
                     persist_ui_state=persist_ui_state
                     rename_thread=rename_thread

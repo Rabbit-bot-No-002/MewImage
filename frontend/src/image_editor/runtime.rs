@@ -15,6 +15,8 @@ pub struct EditorRuntime {
     pub thread_id: String,
     pub reference_ids: Vec<String>,
     pub continuation_id: Option<String>,
+    #[serde(default)]
+    pub continuation_task_id: Option<String>,
 }
 
 impl EditorRuntime {
@@ -33,6 +35,21 @@ impl EditorRuntime {
                 .unwrap_or_default();
             self.reference_ids.clear();
             self.continuation_id = None;
+            self.continuation_task_id = None;
+        }
+        let continuation_is_valid = self
+            .continuation_id
+            .as_ref()
+            .is_some_and(|asset_id| state.assets.iter().any(|asset| &asset.id == asset_id))
+            && self
+                .continuation_task_id
+                .as_ref()
+                .is_some_and(|task_id| state.tasks.iter().any(|task| &task.id == task_id));
+        if (self.continuation_id.is_some() || self.continuation_task_id.is_some())
+            && !continuation_is_valid
+        {
+            self.continuation_id = None;
+            self.continuation_task_id = None;
         }
         // 缺失的编辑资源不静默移除，提交前由共享校验明确报错。
     }
@@ -156,6 +173,7 @@ mod tests {
             reference_ids: vec!["base".into(), "second".into()],
             editing_by_thread: HashMap::from([(thread_id.clone(), editing.clone())]),
             continuation_id: None,
+            continuation_task_id: None,
         };
         let mut restored: EditorRuntime =
             serde_json::from_str(&serde_json::to_string(&runtime).unwrap()).unwrap();

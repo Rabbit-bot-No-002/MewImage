@@ -80,6 +80,7 @@ use models::*;
 use state::*;
 use utils::appearance::*;
 use utils::audio::*;
+use utils::conversation::*;
 use utils::formatting::*;
 pub(crate) use utils::image::*;
 pub(crate) use utils::persistence::*;

@@ -572,6 +572,8 @@ pub(crate) fn TemplatePlaza(
                         items.remove(&workspace.current_thread_id.get_untracked());
                     });
                     composer.continuation_asset_id.set(None);
+                    composer.continuation_task_id.set(None);
+                    composer.conversation_rebase_requested.set(false);
                     composer.draft_prompt.set(template.prompt.clone());
                     workspace.threads.update(|threads| {
                         if let Some(thread) = threads
@@ -786,6 +788,7 @@ pub(crate) fn TemplatePlaza(
                         prompt: template.prompt.clone(),
                         requested_model: template.recommended_model.clone(),
                         reference_asset_ids: reference_ids,
+                        conversation: None,
                         generation_settings: Some(template.generation_settings.clone()),
                         result: Some(GenerationResult {
                             images: (0..result_count)
@@ -800,6 +803,7 @@ pub(crate) fn TemplatePlaza(
                                 requested_quality: template.generation_settings.quality.clone(),
                                 ..Default::default()
                             },
+                            upstream_response_id: None,
                             raw_response_json: None,
                         }),
                         favorite: true,
@@ -2926,6 +2930,7 @@ mod tests {
             prompt: "prompt".into(),
             requested_model: "model".into(),
             reference_asset_ids: Vec::new(),
+            conversation: None,
             generation_settings: None,
             result: None,
             favorite: true,
