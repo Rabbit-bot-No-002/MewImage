@@ -1372,6 +1372,43 @@ select option:checked {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-height: min(68vh, 520px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.config-switcher-group {
+  padding: 4px;
+  border-radius: 14px;
+  border: 1px solid transparent;
+}
+
+.config-switcher-group + .config-switcher-group {
+  border-top-color: var(--floating-border, var(--line));
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.config-switcher-group-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px 4px;
+}
+
+.config-switcher-protocol {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--floating-muted, var(--muted));
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.config-switcher-models {
+  display: grid;
+  gap: 3px;
 }
 
 .config-switcher-item {
@@ -1381,7 +1418,7 @@ select option:checked {
   border-radius: 12px;
   padding: 8px 10px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 24px;
+  grid-template-columns: minmax(0, 1fr) 24px;
   align-items: center;
   gap: 8px;
   color: var(--text);
@@ -1404,8 +1441,8 @@ select option:checked {
 }
 
 .config-switcher-model {
-  color: var(--muted);
-  font-size: 12px;
+  color: inherit;
+  font-size: 13px;
 }
 
 .muted,
@@ -1826,6 +1863,109 @@ body[data-theme="night"] .sync-key-settings {
 .settings-config-actions .select-input {
   flex: 1 1 0;
   min-width: 0;
+}
+
+.provider-model-editor {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(var(--primary-rgb), 0.035);
+}
+
+.provider-model-editor-header,
+.provider-model-add-row,
+.provider-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.provider-model-editor-header {
+  justify-content: space-between;
+  font-weight: 800;
+}
+
+.provider-model-list {
+  display: grid;
+  gap: 5px;
+  max-height: 190px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.provider-model-row {
+  padding: 3px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: var(--floating-control, rgba(255, 255, 255, 0.3));
+}
+
+.provider-model-row.is-active {
+  border-color: rgba(var(--primary-rgb), 0.48);
+  background: var(--floating-active, rgba(var(--primary-rgb), 0.16));
+}
+
+.provider-model-select {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 34px;
+  padding: 5px 7px;
+  border: 0;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.provider-model-select .material-symbols-rounded {
+  color: transparent;
+}
+
+.provider-model-row.is-active .provider-model-select .material-symbols-rounded {
+  color: var(--primary);
+}
+
+.provider-model-select span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-model-delete {
+  flex: 0 0 32px;
+  width: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+}
+
+.provider-model-add-row .text-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.provider-model-add {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.provider-model-feedback {
+  margin: 0;
+  color: var(--danger);
+}
+
+.parameter-invalid {
+  border-color: var(--danger) !important;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 18%, transparent);
 }
 
 .api-key-input-row {
@@ -7269,6 +7409,23 @@ body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button.active
   .config-switcher-menu {
     left: 0;
     right: auto;
+    width: 100%;
+    max-height: min(62vh, 460px);
+  }
+
+  .config-switcher-group-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .provider-model-add-row {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .provider-model-add {
+    justify-content: center;
     width: 100%;
   }
 

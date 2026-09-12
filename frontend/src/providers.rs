@@ -113,6 +113,8 @@ struct ProxyHealthCapabilities {
     proxy_generation_status_only: bool,
     #[serde(default)]
     image_conversation_v1: bool,
+    #[serde(default)]
+    provider_model_lists_v1: bool,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -125,10 +127,25 @@ pub(crate) fn sync_requires_image_editing_capability(state: &LocalAppState) -> b
     state.tasks.iter().any(|task| task.editing.is_some())
 }
 
-pub(crate) async fn ensure_image_editing_sync_capability(
-    state: &LocalAppState,
-) -> Result<(), String> {
-    if !sync_requires_image_editing_capability(state) {
+pub(crate) fn sync_requires_provider_model_lists_capability(state: &LocalAppState) -> bool {
+    state.configs.iter().any(|config| {
+        let mut distinct = std::collections::HashSet::new();
+        config
+            .available_models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .filter(|model| distinct.insert(*model))
+            .take(2)
+            .count()
+            > 1
+    })
+}
+
+pub(crate) async fn ensure_sync_capabilities(state: &LocalAppState) -> Result<(), String> {
+    let requires_image_editing = sync_requires_image_editing_capability(state);
+    let requires_model_lists = sync_requires_provider_model_lists_capability(state);
+    if !requires_image_editing && !requires_model_lists {
         return Ok(());
     }
 
@@ -137,10 +154,10 @@ pub(crate) async fn ensure_image_editing_sync_capability(
         .credentials(web_sys::RequestCredentials::Include)
         .send()
         .await
-        .map_err(|error| format!("检查同步服务编辑能力失败：{error}"))?;
+        .map_err(|error| format!("检查同步服务能力失败：{error}"))?;
     if !response.ok() {
         return Err(format!(
-            "检查同步服务编辑能力失败：HTTP {}。",
+            "检查同步服务能力失败：HTTP {}。",
             response.status()
         ));
     }
@@ -148,8 +165,13 @@ pub(crate) async fn ensure_image_editing_sync_capability(
         .json::<ProxyHealthResponse>()
         .await
         .map_err(|error| format!("同步服务健康响应无法解析：{error}"))?;
-    if !health.capabilities.image_editing_v1 {
+    if requires_image_editing && !health.capabilities.image_editing_v1 {
         return Err("当前后端不支持图像编辑数据同步，请先将前后端同时升级后再同步。".into());
+    }
+    if requires_model_lists && !health.capabilities.provider_model_lists_v1 {
+        return Err(
+            "当前后端不支持多模型服务商配置同步；为避免模型列表丢失，请先同步升级前后端。".into(),
+        );
     }
     Ok(())
 }
@@ -249,6 +271,7 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
         endpoint_mode: ProviderEndpointMode::ImagesApi,
         base_url: String::new(),
         model: String::new(),
+        available_models: Vec::new(),
         responses_model: None,
         access_mode: ProviderAccessMode::Smart,
         known_requires_proxy: true,
@@ -269,18 +292,22 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
             config.endpoint_mode = ProviderEndpointMode::CustomJson;
             config.base_url = "https://generativelanguage.googleapis.com".into();
             config.model = "gemini-2.5-flash-image".into();
+            config.available_models = vec![config.model.clone()];
         }
         BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID => {
             config.provider_kind = ProviderKind::OpenAiCompatible;
             config.endpoint_mode = ProviderEndpointMode::CustomJson;
             config.base_url = String::new();
             config.model = "gemini-2.5-flash-image".into();
+            config.available_models = vec![config.model.clone()];
         }
         BUILTIN_OPENAI_IMAGE_TEMPLATE_ID => {
             config.provider_kind = ProviderKind::OpenAiImage;
             config.endpoint_mode = ProviderEndpointMode::ImagesApi;
             config.base_url = "https://api.openai.com".into();
             config.model = "gpt-image-2".into();
+            config.available_models =
+                mew_image_shared::default_available_models(config.provider_kind);
         }
         _ => {
             config.provider_kind = ProviderKind::CustomHttp;
@@ -1725,7 +1752,7 @@ mod tests {
     fn proxy_capability_defaults_off_for_old_health_responses() {
         let old: ProxyHealthResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
         let current: ProxyHealthResponse = serde_json::from_str(
-            r#"{"ok":true,"capabilities":{"proxy_generation_status_only":true,"image_generation_options_v2":true,"image_editing_v1":true,"image_conversation_v1":true}}"#,
+            r#"{"ok":true,"capabilities":{"proxy_generation_status_only":true,"image_generation_options_v2":true,"image_editing_v1":true,"image_conversation_v1":true,"provider_model_lists_v1":true}}"#,
         )
         .unwrap();
 
@@ -1733,10 +1760,26 @@ mod tests {
         assert!(!old.capabilities.image_generation_options_v2);
         assert!(!old.capabilities.image_editing_v1);
         assert!(!old.capabilities.image_conversation_v1);
+        assert!(!old.capabilities.provider_model_lists_v1);
         assert!(current.capabilities.image_editing_v1);
         assert!(current.capabilities.image_generation_options_v2);
         assert!(current.capabilities.proxy_generation_status_only);
         assert!(current.capabilities.image_conversation_v1);
+        assert!(current.capabilities.provider_model_lists_v1);
+    }
+
+    #[test]
+    fn new_openai_config_preloads_known_image_models() {
+        let config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        assert_eq!(config.model, "gpt-image-2");
+        assert_eq!(
+            config.available_models,
+            [
+                "gpt-image-2",
+                "gpt-image-2.5-flare",
+                "gpt-image-2.5-sunburst"
+            ]
+        );
     }
 
     #[test]
@@ -1752,6 +1795,19 @@ mod tests {
             instruction: None,
         })));
         assert!(sync_requires_image_editing_capability(&state));
+    }
+
+    #[test]
+    fn sync_only_requires_model_list_capability_for_multiple_models() {
+        let mut state = LocalAppState::default();
+        let mut config = default_config(BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.available_models = vec![config.model.clone()];
+        state.configs.push(config.clone());
+        assert!(!sync_requires_provider_model_lists_capability(&state));
+
+        config.available_models.push("gpt-image-2.5-flare".into());
+        state.configs = vec![config];
+        assert!(sync_requires_provider_model_lists_capability(&state));
     }
 
     #[test]

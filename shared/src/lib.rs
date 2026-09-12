@@ -335,6 +335,9 @@ pub struct EncryptedApiConfig {
     pub endpoint_mode: ProviderEndpointMode,
     pub base_url: String,
     pub model: String,
+    /// 同一站点与协议下可快捷切换的图片模型；`model` 仍是当前实际使用项。
+    #[serde(default)]
+    pub available_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_model: Option<String>,
     pub access_mode: ProviderAccessMode,
@@ -463,6 +466,43 @@ fn normalize_openai_image_options(config: &mut EncryptedApiConfig) {
     config.background = Some(background.into());
 }
 
+pub fn default_available_models(kind: ProviderKind) -> Vec<String> {
+    match kind {
+        ProviderKind::OpenAiImage => [
+            "gpt-image-2",
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        ProviderKind::NanoBanana | ProviderKind::OpenAiCompatible => {
+            vec!["gemini-2.5-flash-image".into()]
+        }
+        ProviderKind::CustomHttp => Vec::new(),
+    }
+}
+
+/// 旧配置没有模型列表，因此必须优先保留原来的当前模型，不能自动扩充改变用户配置。
+pub fn normalize_available_models(config: &mut EncryptedApiConfig) {
+    config.model = config.model.trim().to_string();
+    let mut seen = HashSet::new();
+    let mut available_models = Vec::with_capacity(config.available_models.len().max(1));
+    for model in std::mem::take(&mut config.available_models) {
+        let model = model.trim().to_string();
+        if !model.is_empty() && seen.insert(model.clone()) {
+            available_models.push(model);
+        }
+    }
+    if !config.model.is_empty() && seen.insert(config.model.clone()) {
+        available_models.insert(0, config.model.clone());
+    }
+    if config.model.is_empty() {
+        config.model = available_models.first().cloned().unwrap_or_default();
+    }
+    config.available_models = available_models;
+}
+
 pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
     if config.provider_template_id == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID {
         config.provider_kind = ProviderKind::OpenAiImage;
@@ -479,6 +519,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
         }
         normalize_openai_image_options(config);
         normalize_responses_model(config);
+        normalize_available_models(config);
         return;
     }
 
@@ -491,6 +532,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
         if config.model.trim().is_empty() {
             config.model = "gemini-2.5-flash-image".into();
         }
+        normalize_available_models(config);
         return;
     }
 
@@ -500,6 +542,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
         if config.model.trim().is_empty() {
             config.model = "gemini-2.5-flash-image".into();
         }
+        normalize_available_models(config);
         return;
     }
 
@@ -538,6 +581,7 @@ pub fn normalize_api_config(config: &mut EncryptedApiConfig) {
         }
         ProviderKind::CustomHttp => {}
     }
+    normalize_available_models(config);
 }
 
 fn normalize_responses_model(config: &mut EncryptedApiConfig) {
@@ -3042,6 +3086,7 @@ mod tests {
             endpoint_mode: ProviderEndpointMode::ResponsesApi,
             base_url: "https://api.openai.com".into(),
             model: "gpt-image-2".into(),
+            available_models: Vec::new(),
             responses_model: None,
             access_mode: ProviderAccessMode::Smart,
             known_requires_proxy: true,
@@ -3064,6 +3109,7 @@ mod tests {
         assert_eq!(config.endpoint_mode, ProviderEndpointMode::ResponsesApi);
         assert_eq!(config.responses_model.as_deref(), Some("gpt-5.5"));
         assert_eq!(config.background.as_deref(), Some("auto"));
+        assert_eq!(config.available_models, ["gpt-image-2"]);
 
         config.background = Some("transparent".into());
         config.output_format = Some("jpeg".into());
@@ -3085,6 +3131,27 @@ mod tests {
     }
 
     #[test]
+    fn available_models_are_trimmed_deduplicated_and_keep_active_model() {
+        let mut config = serde_json::from_value::<EncryptedApiConfig>(serde_json::json!({
+            "id":"config", "name":"test", "provider_template_id":"builtin-openai-image",
+            "provider_kind":"openai_image", "endpoint_mode":"images_api",
+            "base_url":"https://api.openai.com", "model":" relay-model ",
+            "available_models":["gpt-image-2", " gpt-image-2 ", "", "other"],
+            "access_mode":"smart", "known_requires_proxy":true,
+            "prompt_guard_enabled":false, "created_at":"", "updated_at":""
+        }))
+        .unwrap();
+
+        normalize_api_config(&mut config);
+
+        assert_eq!(config.model, "relay-model");
+        assert_eq!(
+            config.available_models,
+            ["relay-model", "gpt-image-2", "other"]
+        );
+    }
+
+    #[test]
     fn openai_compression_only_applies_to_lossy_formats() {
         assert_eq!(openai_output_compression(Some("png"), Some(80)), None);
         assert_eq!(openai_output_compression(None, Some(80)), None);
@@ -3102,6 +3169,7 @@ mod tests {
             endpoint_mode: ProviderEndpointMode::CustomJson,
             base_url: "https://example.com".into(),
             model: String::new(),
+            available_models: Vec::new(),
             responses_model: None,
             access_mode: ProviderAccessMode::Smart,
             known_requires_proxy: true,

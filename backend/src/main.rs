@@ -710,6 +710,7 @@ async fn health() -> impl IntoResponse {
             "image_generation_options_v2": true,
             "image_editing_v1": true,
             "image_conversation_v1": true,
+            "provider_model_lists_v1": true,
             "gallery_import_conflict": true
         }
     }))
@@ -6271,6 +6272,7 @@ mod tests {
                 endpoint_mode: ProviderEndpointMode::ImagesApi,
                 base_url: template.base_url.clone(),
                 model: "test-model".into(),
+                available_models: vec!["test-model".into()],
                 responses_model: None,
                 access_mode: ProviderAccessMode::Proxy,
                 known_requires_proxy: true,
@@ -6813,6 +6815,7 @@ mod tests {
         assert_eq!(value["capabilities"]["gallery_import_conflict"], true);
         assert_eq!(value["capabilities"]["image_generation_options_v2"], true);
         assert_eq!(value["capabilities"]["image_editing_v1"], true);
+        assert_eq!(value["capabilities"]["provider_model_lists_v1"], true);
     }
 
     #[test]

@@ -121,7 +121,7 @@ pub(crate) fn build_account_actions(
         spawn_local(async move {
             let started_at = js_sys::Date::now();
             let mut state = state;
-            if let Err(error) = ensure_image_editing_sync_capability(&state).await {
+            if let Err(error) = ensure_sync_capabilities(&state).await {
                 syncing_signal.set(false);
                 status_signal.set(Some(error));
                 return;

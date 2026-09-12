@@ -22,6 +22,92 @@ use crate::app::{
 
 use super::{asset_drop_zone::AssetDropZone, common::MaterialSymbolIcon};
 
+fn provider_protocol_label(config: &EncryptedApiConfig) -> &'static str {
+    match config.provider_kind {
+        mew_image_shared::ProviderKind::OpenAiImage => match config.endpoint_mode {
+            mew_image_shared::ProviderEndpointMode::ResponsesApi => "OpenAI Image · Responses API",
+            _ => "OpenAI Image · Images API",
+        },
+        mew_image_shared::ProviderKind::NanoBanana => "Nano Banana",
+        mew_image_shared::ProviderKind::OpenAiCompatible => "OpenAI 兼容",
+        mew_image_shared::ProviderKind::CustomHttp => "自定义 HTTP",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_choices_fall_back_to_the_legacy_active_model() {
+        let mut config =
+            crate::providers::default_config(mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        config.model = "legacy-model".into();
+        config.available_models.clear();
+
+        assert_eq!(config_model_choices(&config), ["legacy-model"]);
+    }
+
+    #[test]
+    fn selecting_a_model_updates_only_the_target_config() {
+        let mut target =
+            crate::providers::default_config(mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID);
+        target.id = "target".into();
+        let mut untouched =
+            crate::providers::default_config(mew_image_shared::BUILTIN_NANO_BANANA_TEMPLATE_ID);
+        untouched.id = "untouched".into();
+        let untouched_before = untouched.clone();
+        let mut configs = vec![target, untouched];
+
+        assert!(select_config_model(
+            &mut configs,
+            "target",
+            "gpt-image-2.5-flare",
+            "new-revision".into(),
+        ));
+        assert_eq!(configs[0].model, "gpt-image-2.5-flare");
+        assert_eq!(configs[0].updated_at, "new-revision");
+        assert_eq!(configs[1], untouched_before);
+        assert!(!select_config_model(
+            &mut configs,
+            "target",
+            "unknown-model",
+            "ignored".into(),
+        ));
+    }
+}
+
+fn config_model_choices(config: &EncryptedApiConfig) -> Vec<String> {
+    if config.available_models.is_empty() {
+        return (!config.model.is_empty())
+            .then_some(vec![config.model.clone()])
+            .unwrap_or_default();
+    }
+    config.available_models.clone()
+}
+
+fn select_config_model(
+    configs: &mut [EncryptedApiConfig],
+    config_id: &str,
+    model: &str,
+    updated_at: String,
+) -> bool {
+    let Some(config) = configs.iter_mut().find(|config| config.id == config_id) else {
+        return false;
+    };
+    let selectable = config.model == model
+        || config
+            .available_models
+            .iter()
+            .any(|available| available == model);
+    if !selectable || config.model == model {
+        return false;
+    }
+    config.model = model.to_string();
+    config.updated_at = updated_at;
+    true
+}
+
 #[derive(Clone, PartialEq)]
 struct ConversationTimelineTurn {
     index: usize,
@@ -278,30 +364,86 @@ pub(crate) fn WorkspaceMain(
                                             each=move || configs.get()
                                             key=|config| config.id.clone()
                                             children=move |config| {
-                                                let config_id = config.id.clone();
-                                                let is_active_id = config.id.clone();
-                                                let checked_id = config.id.clone();
                                                 let config_name = config.name.clone();
-                                                let config_model = config.model.clone();
-                                                let config_title = format!("{} · {}", config_name, config_model);
+                                                let protocol_label = provider_protocol_label(&config);
+                                                let config_models = config_model_choices(&config);
                                                 view! {
-                                                    <button
-                                                        class="config-switcher-item"
-                                                        class:is-active=move || current_config_id.get() == is_active_id
-                                                        title=config_title
-                                                        on:click=move |_| {
-                                                            current_config_id.set(config_id.clone());
-                                                            show_config_switcher.set(false);
-                                                        }
-                                                    >
-                                                        <span class="config-switcher-name">{config_name}</span>
-                                                        <span class="config-switcher-model">{config_model}</span>
-                                                        {move || if current_config_id.get() == checked_id {
-                                                            view! { <MaterialSymbolIcon name="check" filled=false /> }.into_any()
-                                                        } else {
-                                                            ().into_any()
-                                                        }}
-                                                    </button>
+                                                    <section class="config-switcher-group">
+                                                        <div class="config-switcher-group-header">
+                                                            <span class="config-switcher-name">{config_name}</span>
+                                                            <span class="config-switcher-protocol">{protocol_label}</span>
+                                                        </div>
+                                                        <div class="config-switcher-models">
+                                                            {config_models.into_iter().map(|model| {
+                                                                let config_id = config.id.clone();
+                                                                let active_config_id = config.id.clone();
+                                                                let checked_config_id = config.id.clone();
+                                                                let pressed_config_id = config.id.clone();
+                                                                let active_model = model.clone();
+                                                                let selected_model = model.clone();
+                                                                let checked_model = model.clone();
+                                                                let pressed_model = model.clone();
+                                                                let warning_model = model.clone();
+                                                                let provider_kind = config.provider_kind;
+                                                                let item_title = format!("切换到 {} · {}", config.name, model);
+                                                                view! {
+                                                                    <button
+                                                                        type="button"
+                                                                        class="config-switcher-item"
+                                                                        class:is-active=move || {
+                                                                            current_config_id.get() == active_config_id
+                                                                                && configs.with(|items| items.iter().any(|config| {
+                                                                                    config.id == active_config_id && config.model == active_model
+                                                                                }))
+                                                                        }
+                                                                        title=item_title
+                                                                        aria-pressed=move || {
+                                                                            current_config_id.get() == pressed_config_id
+                                                                                && configs.with(|items| items.iter().any(|config| {
+                                                                                    config.id == pressed_config_id && config.model == pressed_model
+                                                                                }))
+                                                                        }
+                                                                        on:click=move |_| {
+                                                                            let config_changed = current_config_id.get_untracked() != config_id;
+                                                                            let changed = configs.try_update(|items| {
+                                                                                select_config_model(
+                                                                                    items,
+                                                                                    &config_id,
+                                                                                    &selected_model,
+                                                                                    now_rfc3339(),
+                                                                                )
+                                                                            }).unwrap_or(false);
+                                                                            current_config_id.set(config_id.clone());
+                                                                            show_config_switcher.set(false);
+                                                                            if config_changed || changed {
+                                                                                persist_ui_state();
+                                                                            }
+                                                                            let incompatible_quality = provider_kind
+                                                                                == mew_image_shared::ProviderKind::OpenAiImage
+                                                                                && matches!(quality.get_untracked().as_str(), "xhigh" | "max")
+                                                                                && !mew_image_shared::supports_extended_image_quality(&warning_model);
+                                                                            if incompatible_quality {
+                                                                                status_text.set(format!(
+                                                                                    "已切换到 {warning_model}；当前质量档位不受该模型支持，请先调整质量。"
+                                                                                ));
+                                                                            }
+                                                                        }
+                                                                    >
+                                                                        <span class="config-switcher-model">{model}</span>
+                                                                        {move || if current_config_id.get() == checked_config_id
+                                                                            && configs.with(|items| items.iter().any(|config| {
+                                                                                config.id == checked_config_id && config.model == checked_model
+                                                                            }))
+                                                                        {
+                                                                            view! { <MaterialSymbolIcon name="check" filled=false /> }.into_any()
+                                                                        } else {
+                                                                            ().into_any()
+                                                                        }}
+                                                                    </button>
+                                                                }
+                                                            }).collect_view()}
+                                                        </div>
+                                                    </section>
                                                 }
                                             }
                                         />
@@ -608,6 +750,12 @@ pub(crate) fn WorkspaceMain(
                                 <>
                                     <select
                                         class="select-input compact-select"
+                                        class:parameter-invalid=move || {
+                                            matches!(quality.get().as_str(), "xhigh" | "max")
+                                                && current_config.get().is_some_and(|config| {
+                                                    !mew_image_shared::supports_extended_image_quality(&config.model)
+                                                })
+                                        }
                                         prop:value=move || quality.get()
                                         on:change=move |ev| quality.set(event_target_value(&ev))
                                     >

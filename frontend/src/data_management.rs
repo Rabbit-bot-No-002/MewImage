@@ -888,6 +888,14 @@ mod tests {
         let bytes = build_backup(state.clone(), &HashMap::new()).unwrap();
         let imported = import_backup(&bytes, &LocalAppState::default()).unwrap();
         assert_eq!(imported.state.configs[0].api_key_plaintext, None);
+        assert_eq!(
+            imported.state.configs[0].available_models,
+            [
+                "gpt-image-2",
+                "gpt-image-2.5-flare",
+                "gpt-image-2.5-sunburst"
+            ]
+        );
         assert_eq!(imported.backup_kind, BackupKind::Workspace);
     }
 

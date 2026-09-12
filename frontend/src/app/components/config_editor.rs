@@ -1,7 +1,7 @@
 use leptos::{prelude::*, task::spawn_local};
 use mew_image_shared::{
     BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, EncryptedApiConfig, ProviderAccessMode, ProviderEndpointMode,
-    ProviderKind, ProviderTemplate, normalize_api_config, now_rfc3339,
+    ProviderKind, ProviderTemplate, default_available_models, normalize_api_config, now_rfc3339,
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
@@ -9,6 +9,37 @@ use wasm_bindgen_futures::JsFuture;
 use crate::app::mask_key;
 
 use super::common::MaterialSymbolIcon;
+
+fn add_model(models: &mut Vec<String>, raw_model: &str) -> Result<(), &'static str> {
+    let model = raw_model.trim();
+    if model.is_empty() {
+        return Err("请输入模型 ID。");
+    }
+    if models.iter().any(|current| current == model) {
+        return Err("该模型已经在当前配置中。");
+    }
+    models.push(model.to_string());
+    Ok(())
+}
+
+fn remove_model(
+    models: &mut Vec<String>,
+    active_model: &mut String,
+    removed_model: &str,
+) -> Result<(), &'static str> {
+    if models.len() <= 1 {
+        return Err("每个服务商配置至少需要保留一个模型。");
+    }
+    let Some(index) = models.iter().position(|model| model == removed_model) else {
+        return Ok(());
+    };
+    models.remove(index);
+    if active_model == removed_model {
+        let next_index = index.min(models.len().saturating_sub(1));
+        *active_model = models[next_index].clone();
+    }
+    Ok(())
+}
 
 #[component]
 pub(crate) fn ConfigEditor(
@@ -23,6 +54,9 @@ pub(crate) fn ConfigEditor(
     let name_draft = RwSignal::new(String::new());
     let base_url_draft = RwSignal::new(String::new());
     let model_draft = RwSignal::new(String::new());
+    let available_models_draft = RwSignal::new(Vec::<String>::new());
+    let new_model_draft = RwSignal::new(String::new());
+    let model_feedback = RwSignal::new(None::<String>);
     let responses_model_draft = RwSignal::new(String::new());
     let api_key_draft = RwSignal::new(String::new());
     let api_key_visible = RwSignal::new(false);
@@ -40,7 +74,16 @@ pub(crate) fn ConfigEditor(
             template_id_draft.set(config.provider_template_id);
             name_draft.set(config.name);
             base_url_draft.set(config.base_url);
-            model_draft.set(config.model);
+            model_draft.set(config.model.clone());
+            available_models_draft.set(if config.available_models.is_empty() {
+                (!config.model.is_empty())
+                    .then_some(vec![config.model])
+                    .unwrap_or_default()
+            } else {
+                config.available_models
+            });
+            new_model_draft.set(String::new());
+            model_feedback.set(None);
             responses_model_draft.set(config.responses_model.unwrap_or_else(|| "gpt-5.5".into()));
             api_key_draft.set(config.api_key_plaintext.unwrap_or_default());
             api_key_visible.set(false);
@@ -60,9 +103,6 @@ pub(crate) fn ConfigEditor(
     let commit_base_url = move || {
         has_pending_changes.set(true);
     };
-    let commit_model = move || {
-        has_pending_changes.set(true);
-    };
     let commit_responses_model = move || {
         has_pending_changes.set(true);
     };
@@ -71,6 +111,10 @@ pub(crate) fn ConfigEditor(
     };
 
     let save_config = move |_| {
+        if available_models_draft.with(Vec::is_empty) {
+            model_feedback.set(Some("请至少添加一个图片模型后再保存。".into()));
+            return;
+        }
         let current_id = current_config_id.get_untracked();
         if current_id.is_empty() {
             return;
@@ -90,6 +134,7 @@ pub(crate) fn ConfigEditor(
                 config.name = name_draft.get_untracked().trim().to_string();
                 config.base_url = base_url_draft.get_untracked().trim().to_string();
                 config.model = model_draft.get_untracked().trim().to_string();
+                config.available_models = available_models_draft.get_untracked();
                 config.responses_model =
                     Some(responses_model_draft.get_untracked().trim().to_string());
                 config.access_mode = match access_mode_draft.get_untracked().as_str() {
@@ -131,6 +176,23 @@ pub(crate) fn ConfigEditor(
                 1200,
             );
             callback.forget();
+        }
+    };
+
+    let submit_new_model = move || {
+        let input = new_model_draft.get_untracked();
+        let first_model = available_models_draft.with(Vec::is_empty);
+        let result = available_models_draft.try_update(|models| add_model(models, &input));
+        match result.unwrap_or(Ok(())) {
+            Ok(()) => {
+                if first_model {
+                    model_draft.set(input.trim().to_string());
+                }
+                new_model_draft.set(String::new());
+                model_feedback.set(None);
+                has_pending_changes.set(true);
+            }
+            Err(message) => model_feedback.set(Some(message.into())),
         }
     };
 
@@ -182,13 +244,11 @@ pub(crate) fn ConfigEditor(
                             }
                             ProviderKind::CustomHttp => "CustomJson".into(),
                         });
-                        model_draft.set(match template.kind {
-                            ProviderKind::OpenAiImage => "gpt-image-2".into(),
-                            ProviderKind::NanoBanana | ProviderKind::OpenAiCompatible => {
-                                "gemini-2.5-flash-image".into()
-                            }
-                            ProviderKind::CustomHttp => String::new(),
-                        });
+                        let default_models = default_available_models(template.kind);
+                        model_draft.set(default_models.first().cloned().unwrap_or_default());
+                        available_models_draft.set(default_models);
+                        new_model_draft.set(String::new());
+                        model_feedback.set(None);
                         responses_model_draft.set(if template.kind == ProviderKind::OpenAiImage {
                             "gpt-5.5".into()
                         } else {
@@ -212,18 +272,106 @@ pub(crate) fn ConfigEditor(
                 on:input=move |ev| base_url_draft.set(event_target_value(&ev))
                 on:blur=move |_| commit_base_url()
             />
-            <input
-                class="text-input"
-                placeholder="模型名"
-                list="image-model-suggestions"
-                prop:value=move || model_draft.get()
-                on:input=move |ev| model_draft.set(event_target_value(&ev))
-                on:blur=move |_| commit_model()
-            />
-            <datalist id="image-model-suggestions">
-                <option value="gpt-image-2.5-flare">"GPT Image 2.5 · Flare"</option>
-                <option value="gpt-image-2.5-sunburst">"GPT Image 2.5 · Sunburst"</option>
-            </datalist>
+            <section class="provider-model-editor">
+                <div class="provider-model-editor-header">
+                    <span>"图片模型"</span>
+                    <span class="tag">{move || format!("{} 个", available_models_draft.with(Vec::len))}</span>
+                </div>
+                <div class="provider-model-list">
+                    <For
+                        each=move || available_models_draft.get()
+                        key=|model| model.clone()
+                        children=move |model| {
+                            let select_model = model.clone();
+                            let selected_model = model.clone();
+                            let pressed_model = model.clone();
+                            let delete_model = model.clone();
+                            let model_title = format!("使用模型 {model}");
+                            view! {
+                                <div
+                                    class="provider-model-row"
+                                    class:is-active=move || model_draft.get() == selected_model
+                                >
+                                    <button
+                                        type="button"
+                                        class="provider-model-select"
+                                        title=model_title
+                                        aria-pressed=move || model_draft.get() == pressed_model
+                                        on:click=move |_| {
+                                            if model_draft.get_untracked() != select_model {
+                                                model_draft.set(select_model.clone());
+                                                model_feedback.set(None);
+                                                has_pending_changes.set(true);
+                                            }
+                                        }
+                                    >
+                                        <MaterialSymbolIcon name="check_circle" filled=true />
+                                        <span>{model}</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="button ghost icon-button provider-model-delete"
+                                        title="删除模型"
+                                        disabled=move || available_models_draft.with(|models| models.len() <= 1)
+                                        on:click=move |_| {
+                                            let mut active_model = model_draft.get_untracked();
+                                            let result = available_models_draft.try_update(|models| {
+                                                remove_model(models, &mut active_model, &delete_model)
+                                            });
+                                            match result.unwrap_or(Ok(())) {
+                                                Ok(()) => {
+                                                    model_draft.set(active_model);
+                                                    model_feedback.set(None);
+                                                    has_pending_changes.set(true);
+                                                }
+                                                Err(message) => model_feedback.set(Some(message.into())),
+                                            }
+                                        }
+                                    >
+                                        <MaterialSymbolIcon name="delete" filled=false />
+                                    </button>
+                                </div>
+                            }
+                        }
+                    />
+                </div>
+                <div class="provider-model-add-row">
+                    <input
+                        class="text-input"
+                        placeholder="输入新的模型 ID"
+                        list="image-model-suggestions"
+                        prop:value=move || new_model_draft.get()
+                        on:input=move |ev| {
+                            new_model_draft.set(event_target_value(&ev));
+                            model_feedback.set(None);
+                        }
+                        on:keydown=move |event: web_sys::KeyboardEvent| {
+                            if event.key() == "Enter" && !event.is_composing() {
+                                event.prevent_default();
+                                submit_new_model();
+                            }
+                        }
+                    />
+                    <button
+                        type="button"
+                        class="button secondary provider-model-add"
+                        disabled=move || new_model_draft.with(|model| model.trim().is_empty())
+                        on:click=move |_| submit_new_model()
+                    >
+                        <MaterialSymbolIcon name="add" filled=false />
+                        "添加模型"
+                    </button>
+                </div>
+                <datalist id="image-model-suggestions">
+                    <option value="gpt-image-2">"GPT Image 2"</option>
+                    <option value="gpt-image-2.5-flare">"GPT Image 2.5 · Flare"</option>
+                    <option value="gpt-image-2.5-sunburst">"GPT Image 2.5 · Sunburst"</option>
+                    <option value="gemini-2.5-flash-image">"Gemini 2.5 Flash Image"</option>
+                </datalist>
+                {move || model_feedback.get().map(|message| view! {
+                    <p class="form-hint provider-model-feedback">{message}</p>
+                })}
+            </section>
             {move || {
                 let show_responses_model = template_id_draft.get()
                     == BUILTIN_OPENAI_IMAGE_TEMPLATE_ID
@@ -319,11 +467,36 @@ pub(crate) fn ConfigEditor(
                     class="button secondary"
                     class:save-success=move || save_feedback.get()
                     on:click=save_config
-                    disabled=move || !has_pending_changes.get()
+                    disabled=move || !has_pending_changes.get() || available_models_draft.with(Vec::is_empty)
                 >
                     {move || if save_feedback.get() { "已保存" } else { "保存" }}
                 </button>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_are_added_trimmed_without_duplicates() {
+        let mut models = vec!["gpt-image-2".into()];
+        assert!(add_model(&mut models, "  gpt-image-2.5-flare  ").is_ok());
+        assert!(add_model(&mut models, "gpt-image-2.5-flare").is_err());
+        assert_eq!(models, ["gpt-image-2", "gpt-image-2.5-flare"]);
+    }
+
+    #[test]
+    fn deleting_active_model_selects_the_nearest_remaining_item() {
+        let mut models = vec!["one".into(), "two".into(), "three".into()];
+        let mut active = "two".to_string();
+        remove_model(&mut models, &mut active, "two").unwrap();
+        assert_eq!(models, ["one", "three"]);
+        assert_eq!(active, "three");
+        remove_model(&mut models, &mut active, "three").unwrap();
+        assert_eq!(active, "one");
+        assert!(remove_model(&mut models, &mut active, "one").is_err());
     }
 }

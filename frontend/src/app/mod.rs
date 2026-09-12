@@ -16,8 +16,8 @@ use std::{
 use crate::crypto::derive_trusted_sync_secret;
 use crate::providers::{
     GenerationLifecycle, ProxyBudgetRequest, ProxyGenerationPhase, default_config,
-    ensure_image_editing_sync_capability, generate_with_strategy, generation_uses_proxy,
-    hydrate_local_state, load_templates, prepare_sync_envelope,
+    ensure_sync_capabilities, generate_with_strategy, generation_uses_proxy, hydrate_local_state,
+    load_templates, prepare_sync_envelope,
 };
 use crate::storage::{
     GenerationStagingManifest, apply_asset_payload_changes, clear_asset_payloads,
