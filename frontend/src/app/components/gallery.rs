@@ -34,6 +34,29 @@ pub(crate) fn GallerySidebar(
     let gallery_entries = derived.gallery_entries;
     let paged_gallery_entries = derived.paged_gallery_entries;
     let gallery_page_count = derived.gallery_page_count;
+    let gallery_count_summary = Memo::new(move |_| {
+        let entries = gallery_entries.get();
+        let completed = entries
+            .iter()
+            .filter(|item| item.status == TaskStatus::Succeeded)
+            .count();
+        let running = entries
+            .iter()
+            .filter(|item| item.status == TaskStatus::Running)
+            .count();
+        let failed = entries
+            .iter()
+            .filter(|item| item.status == TaskStatus::Failed)
+            .count();
+        let mut summary = vec![format!("{completed} 张")];
+        if running > 0 {
+            summary.push(format!("{running} 个进行中"));
+        }
+        if failed > 0 {
+            summary.push(format!("{failed} 个失败"));
+        }
+        summary.join(" · ")
+    });
 
     Effect::new(move |_| {
         let missing_source_ids = paged_gallery_entries
@@ -52,32 +75,15 @@ pub(crate) fn GallerySidebar(
 
     view! {
                 <aside class="panel gallery-sidebar">
-                    <div class="row">
+                    <div class="row gallery-sidebar-header">
                         <h2>"结果画廊"</h2>
                         <div class="row gallery-title-actions">
-                            <span class="tag gallery-count-tag">{move || {
-                                let entries = gallery_entries.get();
-                                let completed = entries
-                                    .iter()
-                                    .filter(|item| item.status == TaskStatus::Succeeded)
-                                    .count();
-                                let running = entries
-                                    .iter()
-                                    .filter(|item| item.status == TaskStatus::Running)
-                                    .count();
-                                let failed = entries
-                                    .iter()
-                                    .filter(|item| item.status == TaskStatus::Failed)
-                                    .count();
-                                let mut summary = vec![format!("{completed} 张")];
-                                if running > 0 {
-                                    summary.push(format!("{running} 个进行中"));
-                                }
-                                if failed > 0 {
-                                    summary.push(format!("{failed} 个失败"));
-                                }
-                                summary.join(" · ")
-                            }}</span>
+                            <span
+                                class="tag gallery-count-tag"
+                                title=move || gallery_count_summary.get()
+                            >
+                                {move || gallery_count_summary.get()}
+                            </span>
                         </div>
                     </div>
                     <div class="gallery sidebar-gallery">
