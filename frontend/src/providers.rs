@@ -4,7 +4,8 @@ use gloo_net::http::Request;
 use mew_image_shared::{
     BUILTIN_NANO_BANANA_TEMPLATE_ID, BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
     BUILTIN_OPENAI_IMAGE_TEMPLATE_ID, EncryptedApiConfig, GenerateViaProxyRequest,
-    GenerationRequest, GenerationResult, ImageAssetRef, LocalAppState, ProviderAccessMode,
+    GenerationRequest, GenerationResult, ImageAssetRef, LocalAppState,
+    ManagedGenerateViaProxyRequest, ManagedGenerationOptions, ProviderAccessMode,
     ProviderEndpointMode, ProviderKind, ProviderTemplate, ProxyGenerationJobAccepted,
     ProxyGenerationJobResponse, ProxyGenerationJobStatus, SyncCheckpoint, SyncEnvelope,
     aspect_ratio_from_dimensions, build_gemini_generation_request,
@@ -15,6 +16,41 @@ use mew_image_shared::{
     now_rfc3339, openai_output_compression, parse_openai_responses_event_stream,
     resolve_responses_main_model,
 };
+
+pub(crate) fn managed_summary_runtime_config(
+    summary: &mew_image_shared::ManagedProviderSummary,
+) -> EncryptedApiConfig {
+    let provider_template_id = match summary.provider_kind {
+        ProviderKind::OpenAiImage => mew_image_shared::BUILTIN_OPENAI_IMAGE_TEMPLATE_ID,
+        ProviderKind::NanoBanana => mew_image_shared::BUILTIN_NANO_BANANA_TEMPLATE_ID,
+        ProviderKind::OpenAiCompatible => mew_image_shared::BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
+        ProviderKind::CustomHttp => "managed-custom-http",
+    };
+    EncryptedApiConfig {
+        id: summary.id.clone(),
+        name: summary.name.clone(),
+        provider_template_id: provider_template_id.into(),
+        provider_kind: summary.provider_kind,
+        endpoint_mode: summary.endpoint_mode,
+        base_url: String::new(),
+        model: summary.current_model.clone(),
+        available_models: summary.available_models.clone(),
+        responses_model: summary.responses_model.clone(),
+        access_mode: ProviderAccessMode::Proxy,
+        known_requires_proxy: true,
+        server_managed: true,
+        output_format: summary.output_format.clone(),
+        output_compression: summary.output_compression,
+        background: summary.background.clone(),
+        moderation: summary.moderation.clone(),
+        api_key_plaintext: None,
+        api_key_encrypted: None,
+        api_key_hint: None,
+        prompt_guard_enabled: false,
+        created_at: summary.updated_at.clone(),
+        updated_at: summary.updated_at.clone(),
+    }
+}
 use serde_json::json;
 
 use crate::api::{api_candidates, api_url};
@@ -97,6 +133,7 @@ struct TransportAsset {
 
 struct ProxyGenerationEndpoint {
     submit_url: String,
+    poll_base_url: String,
     supports_status_only: bool,
     supports_options_v2: bool,
     supports_image_editing: bool,
@@ -115,6 +152,8 @@ struct ProxyHealthCapabilities {
     image_conversation_v1: bool,
     #[serde(default)]
     provider_model_lists_v1: bool,
+    #[serde(default)]
+    managed_provider_accounts_v1: bool,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -275,6 +314,7 @@ pub fn default_config(template_id: &str) -> EncryptedApiConfig {
         responses_model: None,
         access_mode: ProviderAccessMode::Smart,
         known_requires_proxy: true,
+        server_managed: false,
         output_format: Some("png".into()),
         output_compression: Some(100),
         background: None,
@@ -322,6 +362,9 @@ pub(crate) fn generation_uses_proxy(
     config: &EncryptedApiConfig,
     has_reference_assets: bool,
 ) -> bool {
+    if config.server_managed {
+        return true;
+    }
     if config.provider_kind == ProviderKind::NanoBanana {
         return config.access_mode == ProviderAccessMode::Proxy;
     }
@@ -546,6 +589,9 @@ async fn generate_once_with_strategy(
     abort_signal: Option<&web_sys::AbortSignal>,
     lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
+    if config.server_managed {
+        return proxy_generate(template, config, request, abort_signal, lifecycle).await;
+    }
     if config.provider_kind == ProviderKind::NanoBanana {
         return match config.access_mode {
             ProviderAccessMode::Proxy => {
@@ -771,10 +817,10 @@ async fn proxy_generate(
     lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
     let config = config.clone();
-    if config.api_key_plaintext.is_none() {
+    if !config.server_managed && config.api_key_plaintext.is_none() {
         return Err("代理模式也需要当前浏览器里已有 API Key。".into());
     }
-    let endpoint = select_proxy_generation_endpoint(abort_signal).await?;
+    let endpoint = select_proxy_generation_endpoint(config.server_managed, abort_signal).await?;
     let mut compatibility_request;
     let request = if request.previous_response_id.is_some() && !endpoint.supports_image_conversation
     {
@@ -858,17 +904,28 @@ async fn proxy_generate(
         mask.remote_url = None;
         mask.remote_object_key = None;
     }
-    let payload = GenerateViaProxyRequest {
-        template: template.clone(),
-        config,
-        request: request_payload,
-    };
     let form = web_sys::FormData::new().map_err(|error| format!("{error:?}"))?;
-    form.append_with_str(
-        "payload",
-        &serde_json::to_string(&payload).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("{error:?}"))?;
+    let payload_json = if config.server_managed {
+        serde_json::to_string(&ManagedGenerateViaProxyRequest {
+            managed_config_id: config.id.clone(),
+            request: request_payload,
+            options: ManagedGenerationOptions {
+                output_format: config.output_format.clone(),
+                output_compression: config.output_compression,
+                background: config.background.clone(),
+                moderation: config.moderation.clone(),
+            },
+        })
+    } else {
+        serde_json::to_string(&GenerateViaProxyRequest {
+            template: template.clone(),
+            config,
+            request: request_payload,
+        })
+    }
+    .map_err(|error| error.to_string())?;
+    form.append_with_str("payload", &payload_json)
+        .map_err(|error| format!("{error:?}"))?;
     form.append_with_str(
         "reference_assets_meta",
         &serde_json::to_string(
@@ -951,6 +1008,7 @@ fn proxy_health_url(submit_url: &str) -> String {
 }
 
 async fn select_proxy_generation_endpoint(
+    managed: bool,
     abort_signal: Option<&web_sys::AbortSignal>,
 ) -> Result<ProxyGenerationEndpoint, String> {
     let mut errors = Vec::new();
@@ -971,8 +1029,19 @@ async fn select_proxy_generation_endpoint(
                     .await
                     .map(|health| health.capabilities)
                     .unwrap_or_default();
+                if managed && !capabilities.managed_provider_accounts_v1 {
+                    return Err(
+                        "当前后端不支持托管账号生成，请同步升级前后端后重试；请求尚未发送。".into(),
+                    );
+                }
+                let managed_submit_url = if managed {
+                    submit_url.replace("/api/providers/generate", "/api/managed/providers/generate")
+                } else {
+                    submit_url.clone()
+                };
                 return Ok(ProxyGenerationEndpoint {
-                    submit_url,
+                    submit_url: managed_submit_url,
+                    poll_base_url: submit_url,
                     supports_status_only: capabilities.proxy_generation_status_only,
                     supports_options_v2: capabilities.image_generation_options_v2,
                     supports_image_editing: capabilities.image_editing_v1,
@@ -1009,7 +1078,11 @@ async fn poll_proxy_generation(
     abort_signal: Option<&web_sys::AbortSignal>,
     lifecycle: &GenerationLifecycle,
 ) -> Result<GenerationExecutionResult, String> {
-    let poll_url = format!("{}/{}", endpoint.submit_url.trim_end_matches('/'), job_id);
+    let poll_url = format!(
+        "{}/{}",
+        endpoint.poll_base_url.trim_end_matches('/'),
+        job_id
+    );
     let status_url = if endpoint.supports_status_only {
         format!("{poll_url}?status_only=true")
     } else {

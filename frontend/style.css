@@ -7768,3 +7768,317 @@ body[data-visual-theme][data-color-scheme] .resolution-sheet .chip-button.active
   box-shadow: inset 0 0 0 2px var(--primary);
 }
 .reference-selection-item img { width: 100%; height: 90px; object-fit: contain; }
+.managed-password-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 1600;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(8, 12, 20, 0.58);
+  backdrop-filter: blur(12px);
+}
+
+.managed-password-card {
+  width: min(430px, 100%);
+  max-height: calc(100dvh - 40px);
+  overflow: auto;
+  padding: 22px;
+  border: 1px solid var(--floating-border, rgba(127, 127, 127, 0.35));
+  border-radius: 20px;
+  color: var(--text);
+  background: var(--floating-surface);
+  box-shadow: var(--floating-shadow, 0 22px 70px rgba(0, 0, 0, 0.35));
+}
+
+.managed-password-card h2 {
+  margin: 0 0 6px;
+}
+
+.managed-password-actions {
+  justify-content: flex-end;
+}
+
+.managed-provider-readonly .data-action-card {
+  align-items: center;
+}
+
+.managed-admin-panel {
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--floating-border, rgba(127, 127, 127, 0.28));
+}
+
+/* 管理后台独立于普通卡片透明度，保证高密度表格始终可读。 */
+.admin-console {
+  --admin-surface: var(--floating-surface-base, rgba(255, 250, 253, 0.96));
+  --admin-control: var(--floating-control, rgba(255, 255, 255, 0.88));
+  --admin-border: var(--floating-border, var(--line));
+  --admin-hover: var(--floating-hover, rgba(127, 127, 127, 0.12));
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  width: 100%;
+  min-height: calc(100vh - 104px);
+  overflow: hidden;
+  color: var(--text);
+  background: var(--floating-surface);
+}
+
+.admin-console-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 12px 12px;
+  padding: 20px 14px;
+  border: 1px solid var(--admin-border);
+  border-radius: 18px;
+  background:
+    linear-gradient(155deg, rgba(var(--primary-rgb), 0.14), rgba(var(--secondary-rgb), 0.07)),
+    var(--floating-surface-base, var(--admin-control));
+  box-shadow: 0 14px 34px rgba(6, 12, 28, 0.12);
+}
+
+.admin-console-nav button,
+.admin-subtabs button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+  transition: transform 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+}
+
+.admin-subtabs button.is-active {
+  color: var(--accent-contrast, #fff);
+  background: var(--accent);
+}
+
+.admin-console-nav button:hover,
+.admin-console-nav button.is-active {
+  color: var(--text);
+  border-color: rgba(var(--primary-rgb), 0.24);
+  background: rgba(255, 255, 255, 0.36);
+  transform: translateX(2px);
+}
+
+body[data-theme="night"] .admin-console-nav button:hover,
+body[data-theme="night"] .admin-console-nav button.is-active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.admin-console-content {
+  min-width: 0;
+  padding: 20px;
+  overflow: auto;
+}
+
+.admin-page > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.admin-page > header h2 { margin: 0; }
+
+.admin-subtabs {
+  display: flex;
+  gap: 6px;
+  align-self: flex-start;
+  padding: 4px;
+  border: 1px solid var(--admin-border);
+  border-radius: 14px;
+  background: var(--admin-control);
+}
+
+.admin-user-toolbar,
+.admin-batch-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--admin-border);
+  border-radius: 14px;
+  color: var(--text);
+  background: var(--admin-surface);
+  box-shadow: var(--floating-shadow, 0 12px 30px rgba(10, 20, 45, 0.14));
+}
+
+.admin-user-toolbar .text-input { min-width: 220px; flex: 1; }
+.admin-user-toolbar .select-input { width: auto; min-width: 118px; }
+.admin-user-toolbar :is(.text-input, .select-input) {
+  color: var(--text);
+  border-color: var(--admin-border);
+  background: var(--admin-control);
+}
+.admin-user-toolbar .text-input::placeholder { color: var(--floating-muted, var(--muted)); }
+.admin-batch-toolbar { top: 66px; flex-wrap: wrap; }
+
+.admin-table-scroll {
+  min-width: 0;
+  overflow: auto;
+  border: 1px solid var(--admin-border);
+  border-radius: 14px;
+}
+
+.admin-table {
+  width: 100%;
+  min-width: 1040px;
+  border-collapse: separate;
+  border-spacing: 0;
+  color: var(--text);
+  background: var(--admin-surface);
+}
+
+.admin-table th {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  height: 44px;
+  padding: 0 12px;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--text);
+  background: var(--admin-control);
+  border-bottom: 1px solid var(--admin-border);
+}
+
+.admin-table td {
+  height: 48px;
+  padding: 0 12px;
+  white-space: nowrap;
+  color: var(--text);
+  border-bottom: 1px solid var(--admin-border);
+}
+
+.admin-table tbody tr:last-child td { border-bottom: 0; }
+.admin-table tbody tr:hover td { background: var(--admin-hover); }
+.admin-row-actions { display: flex; gap: 4px; }
+.admin-managed-link { border: 0; color: var(--accent); background: transparent; cursor: pointer; }
+.admin-pagination { display: flex; justify-content: center; align-items: center; gap: 12px; }
+.admin-delete-confirm { width: min(420px, calc(100vw - 32px)); padding: 22px; border: 1px solid var(--floating-border); border-radius: 18px; color: var(--text); background: var(--floating-surface); }
+
+/* 确认操作保持固定视觉顺序，并统一收拢到弹窗右下角。 */
+:is(.confirm-dialog, .admin-delete-confirm, .image-editor-confirm-dialog) > .row:last-child,
+.template-inline-confirm > .row:last-child {
+  width: 100%;
+  justify-content: flex-end;
+}
+.managed-target-list { display: grid; gap: 6px; max-height: 320px; overflow: auto; }
+.managed-target-list label { display: flex; gap: 8px; align-items: center; padding: 8px; border-radius: 10px; }
+
+@media (max-width: 780px) {
+  .admin-console { display: flex; flex-direction: column; min-height: calc(100vh - 88px); }
+  .admin-console-nav { flex-direction: row; overflow-x: auto; margin: 10px 10px 0; padding: 10px; }
+  .admin-console-nav button { flex: 0 0 auto; }
+  .admin-console-content { padding: 12px; }
+  .admin-user-toolbar { position: static; flex-wrap: wrap; }
+  .admin-user-toolbar .text-input { flex-basis: 100%; }
+  .admin-batch-toolbar { position: static; }
+}
+
+.managed-admin-toolbar,
+.managed-config-row,
+.managed-bulk-bar {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.managed-config-list {
+  display: grid;
+  gap: 8px;
+}
+
+.managed-config-row {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr) auto auto;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--floating-border, rgba(127, 127, 127, 0.28));
+  border-radius: 14px;
+  background: var(--floating-control, rgba(127, 127, 127, 0.08));
+}
+
+.managed-config-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.managed-config-main small,
+.managed-config-main span {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.managed-bulk-bar {
+  display: grid;
+  grid-template-columns: auto minmax(150px, 1fr) minmax(150px, 1fr) auto;
+  align-items: center;
+  padding: 10px;
+  border-radius: 14px;
+  background: var(--floating-active, rgba(92, 119, 255, 0.15));
+}
+
+.managed-form-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(8, 12, 20, 0.55);
+  backdrop-filter: blur(10px);
+}
+
+.managed-form-modal,
+.managed-password-result {
+  width: min(620px, 100%);
+  max-height: calc(100dvh - 36px);
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid var(--floating-border, rgba(127, 127, 127, 0.35));
+  border-radius: 18px;
+  color: var(--text);
+  background: var(--floating-surface);
+  box-shadow: var(--floating-shadow, 0 24px 80px rgba(0, 0, 0, 0.4));
+}
+
+.managed-form-modal > .row:first-child {
+  justify-content: space-between;
+}
+
+.managed-password-result {
+  width: min(460px, 100%);
+}
+
+.managed-password-result code {
+  padding: 12px;
+  overflow-wrap: anywhere;
+  border-radius: 10px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: 1rem;
+}
+
+@media (max-width: 720px) {
+  .managed-config-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .managed-config-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+
+  .managed-bulk-bar {
+    grid-template-columns: 1fr;
+  }
+}

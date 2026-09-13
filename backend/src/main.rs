@@ -1,5 +1,7 @@
+mod admin_console;
 mod edit_png;
 mod gallery_templates;
+mod managed_providers;
 mod migrations;
 mod security_headers;
 mod state;
@@ -37,22 +39,25 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Duration, Utc};
 use mew_image_shared::{
-    AdminBootstrapRequest, AdminSetupStatusResponse, AdminUserActionRequest, AdminUserSummary,
-    AdminUsersResponse, AssetPresenceRequest, AssetPresenceResponse, AuthRequest, AuthResponse,
-    BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID, ChangePasswordRequest, CloudDataClearRequest,
-    CloudDataClearScope, CloudDataStatsResponse, GenerateViaProxyRequest, GeneratedImageResult,
-    GenerationResult, ImageAssetRef, MeResponse, MergePreviewResponse,
-    OpenAiResponsesStreamAccumulator, ParameterSnapshot, ProviderEndpointMode, ProviderKind,
-    ProviderTemplate, ProviderTemplateImportRequest, ProxyGenerationJobAccepted,
-    ProxyGenerationJobResponse, ProxyGenerationJobStatus, RegisterRequest, SyncEntityKind,
-    SyncEnvelope, SyncPullResponse, SyncPushRequest, UploadCompleteRequest, UploadCompleteResponse,
-    UploadInitRequest, UploadInitResponse, UserSummary, UsernameAvailabilityResponse,
-    aspect_ratio_from_dimensions, build_gemini_generation_request,
-    extract_gemini_generation_result, extract_openai_compatible_result,
-    extract_openai_responses_result, gemini_auth_header, gemini_generate_content_url,
-    is_google_official_gemini_base_url, merge_envelopes, nano_banana_image_size_from_dimensions,
-    new_id, normalized_image_output_format, normalized_openai_background, now_rfc3339,
-    openai_output_compression, parse_openai_responses_event_stream, resolve_responses_main_model,
+    AccountKind, AdminBatchFailure, AdminBatchResponse, AdminBootstrapRequest,
+    AdminSetupStatusResponse, AdminUserActionRequest, AdminUserBatchAction, AdminUserBatchRequest,
+    AdminUserExportRequest, AdminUserSummary, AdminUsersResponse, AssetPresenceRequest,
+    AssetPresenceResponse, AuthRequest, AuthResponse, BUILTIN_OPENAI_COMPATIBLE_TEMPLATE_ID,
+    ChangePasswordRequest, CloudDataClearRequest, CloudDataClearScope, CloudDataStatsResponse,
+    EncryptedApiConfig, GenerateViaProxyRequest, GeneratedImageResult, GenerationResult,
+    ImageAssetRef, ManagedGenerateViaProxyRequest, ManagedPasswordResetResponse, MeResponse,
+    MergePreviewResponse, OpenAiResponsesStreamAccumulator, ParameterSnapshot,
+    ProviderEndpointMode, ProviderKind, ProviderTemplate, ProviderTemplateImportRequest,
+    ProxyGenerationJobAccepted, ProxyGenerationJobResponse, ProxyGenerationJobStatus,
+    RegisterRequest, SyncEntityKind, SyncEnvelope, SyncPullResponse, SyncPushRequest,
+    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
+    UserSummary, UsernameAvailabilityResponse, aspect_ratio_from_dimensions,
+    build_gemini_generation_request, extract_gemini_generation_result,
+    extract_openai_compatible_result, extract_openai_responses_result, gemini_auth_header,
+    gemini_generate_content_url, is_google_official_gemini_base_url, merge_envelopes,
+    nano_banana_image_size_from_dimensions, new_id, normalized_image_output_format,
+    normalized_openai_background, now_rfc3339, openai_output_compression,
+    parse_openai_responses_event_stream, resolve_responses_main_model,
     strip_successful_task_payloads,
 };
 use rand::distr::{Alphanumeric, SampleString};
@@ -60,7 +65,7 @@ use reqwest::Url;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Row, SqliteConnection, SqlitePool,
+    QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use state::{
@@ -130,10 +135,38 @@ struct ResponseMemoryPermit {
     _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
-struct ParsedGeneratePayload {
-    payload: GenerateViaProxyRequest,
+struct ParsedGenerationUpload<T> {
+    payload: T,
     reference_files: Vec<TemporaryReferenceFile>,
     mask_file: Option<TemporaryReferenceFile>,
+    redact_upstream_identity: bool,
+}
+
+type ParsedGeneratePayload = ParsedGenerationUpload<GenerateViaProxyRequest>;
+
+trait ContainsGenerationRequest {
+    fn request(&self) -> &mew_image_shared::GenerationRequest;
+    fn request_mut(&mut self) -> &mut mew_image_shared::GenerationRequest;
+}
+
+impl ContainsGenerationRequest for GenerateViaProxyRequest {
+    fn request(&self) -> &mew_image_shared::GenerationRequest {
+        &self.request
+    }
+
+    fn request_mut(&mut self) -> &mut mew_image_shared::GenerationRequest {
+        &mut self.request
+    }
+}
+
+impl ContainsGenerationRequest for ManagedGenerateViaProxyRequest {
+    fn request(&self) -> &mew_image_shared::GenerationRequest {
+        &self.request
+    }
+
+    fn request_mut(&mut self) -> &mut mew_image_shared::GenerationRequest {
+        &mut self.request
+    }
 }
 
 struct TemporaryReferenceFile {
@@ -255,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
         dummy_password_hash,
         guest_proxy_limits: Arc::new(GuestProxyLimits::default()),
     });
+    managed_providers::validate_startup_state(&state).await?;
     let upload_cleanup_task = tokio::spawn(periodically_cleanup_expired_uploads(state.clone()));
 
     // 会话与业务数据共用连接池，避免同一个 SQLite 文件被两个独立池放大写锁竞争。
@@ -309,6 +343,12 @@ async fn main() -> anyhow::Result<()> {
             post(change_password).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT)),
         )
         .route("/api/admin/users", get(admin_list_users))
+        .route("/api/admin/users/batch", post(admin_batch_users))
+        .route("/api/admin/users/export", post(admin_export_users))
+        .route(
+            "/api/admin/users/reset-password",
+            post(admin_reset_user_password),
+        )
         .route("/api/admin/users/approve", post(admin_approve_user))
         .route("/api/admin/users/disable", post(admin_disable_user))
         .route("/api/admin/users/restore", post(admin_restore_user))
@@ -335,6 +375,10 @@ async fn main() -> anyhow::Result<()> {
             post(generate_via_proxy).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT)),
         )
         .route(
+            "/api/managed/providers/generate",
+            post(generate_via_managed_proxy).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT)),
+        )
+        .route(
             "/api/providers/generate/{job_id}",
             get(get_proxy_generation_job).delete(cancel_proxy_generation_job),
         )
@@ -354,6 +398,8 @@ async fn main() -> anyhow::Result<()> {
             max_upload_body_limit,
             gallery_archive_body_limit,
         ))
+        .merge(managed_providers::routes())
+        .merge(admin_console::routes())
         .fallback_service(
             ServeDir::new(&config.frontend_dist)
                 .precompressed_br()
@@ -624,6 +670,8 @@ async fn init_db(db: &SqlitePool) -> anyhow::Result<()> {
     migrate_users_table(db).await?;
     migrations::run_data_integrity_migrations(db).await?;
     gallery_templates::init_db(db).await?;
+    managed_providers::init_db(db).await?;
+    admin_console::init_db(db).await?;
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS users_single_admin ON users(role) WHERE role = 'admin'",
     )
@@ -654,8 +702,11 @@ async fn migrate_users_table(db: &SqlitePool) -> anyhow::Result<()> {
         ("approved_at", "TEXT"),
         ("approved_by", "TEXT"),
         ("last_login_at", "TEXT"),
+        ("last_active_at", "TEXT"),
         ("failed_login_count", "INTEGER NOT NULL DEFAULT 0"),
         ("locked_until", "TEXT"),
+        ("account_kind", "TEXT NOT NULL DEFAULT 'standard'"),
+        ("must_change_password", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !columns.contains(name) {
             sqlx::query(&format!("ALTER TABLE users ADD COLUMN {name} {definition}"))
@@ -667,6 +718,9 @@ async fn migrate_users_table(db: &SqlitePool) -> anyhow::Result<()> {
         .execute(db)
         .await?;
     sqlx::query("UPDATE users SET status = 'approved' WHERE status IS NULL OR status = ''")
+        .execute(db)
+        .await?;
+    sqlx::query("UPDATE users SET account_kind = 'standard' WHERE account_kind IS NULL OR account_kind = ''")
         .execute(db)
         .await?;
     Ok(())
@@ -711,6 +765,9 @@ async fn health() -> impl IntoResponse {
             "image_editing_v1": true,
             "image_conversation_v1": true,
             "provider_model_lists_v1": true,
+            "managed_provider_accounts_v1": true,
+            "admin_console_v1": true,
+            "managed_provider_templates_v1": true,
             "gallery_import_conflict": true
         }
     }))
@@ -805,6 +862,8 @@ async fn register(
         status: status.into(),
         image_count: 0,
         created_at: now.clone(),
+        account_kind: AccountKind::Standard,
+        must_change_password: false,
     };
 
     let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
@@ -913,7 +972,7 @@ async fn login(
     validate_login_credentials(&payload)?;
 
     let row =
-        sqlx::query("SELECT id, username, password_hash, role, status, created_at, locked_until, session_version FROM users WHERE username = ?")
+        sqlx::query("SELECT id, username, password_hash, role, status, account_kind, must_change_password, created_at, locked_until, session_version FROM users WHERE username = ?")
             .bind(payload.username.trim())
             .fetch_optional(&state.db)
             .await
@@ -933,6 +992,11 @@ async fn login(
     let status = row.get::<String, _>("status");
     let created_at = row.get::<String, _>("created_at");
     let session_version = row.get::<i64, _>("session_version");
+    let account_kind = match row.get::<String, _>("account_kind").as_str() {
+        "managed" => AccountKind::Managed,
+        _ => AccountKind::Standard,
+    };
+    let must_change_password = row.get::<i64, _>("must_change_password") != 0;
     if let Some(retry_after) = active_lock_retry_seconds(row.get("locked_until")) {
         return Err(AppError::rate_limited(
             format!("账号已临时锁定，请在 {retry_after} 秒后重试。"),
@@ -970,11 +1034,15 @@ async fn login(
         status,
         image_count,
         created_at,
+        account_kind,
+        must_change_password,
     };
+    let login_at = now_rfc3339();
     sqlx::query(
-        "UPDATE users SET last_login_at = ?, failed_login_count = 0, locked_until = NULL WHERE id = ?",
+        "UPDATE users SET last_login_at = ?, last_active_at = ?, failed_login_count = 0, locked_until = NULL WHERE id = ?",
     )
-        .bind(now_rfc3339())
+        .bind(&login_at)
+        .bind(&login_at)
         .bind(&user.id)
         .execute(&state.db)
         .await
@@ -1018,7 +1086,7 @@ async fn change_password(
     let password_hash = hash_password_with_limit(&state, payload.new_password).await?;
     let session_version = sqlx::query_scalar::<_, i64>(
         "UPDATE users
-         SET password_hash = ?, password_updated_at = ?, failed_login_count = 0,
+         SET password_hash = ?, password_updated_at = ?, must_change_password = 0, failed_login_count = 0,
              locked_until = NULL, session_version = session_version + 1
          WHERE id = ?
          RETURNING session_version",
@@ -1033,25 +1101,75 @@ async fn change_password(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct AdminUsersQuery {
+    page: Option<usize>,
+    limit: Option<usize>,
+    q: Option<String>,
+    status: Option<String>,
+    role: Option<String>,
+    account_kind: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
+}
+
 async fn admin_list_users(
     State(state): State<Arc<AppState>>,
     session: Session,
+    Query(query): Query<AdminUsersQuery>,
 ) -> Result<Json<AdminUsersResponse>, AppError> {
     require_admin(&state, &session).await?;
-    let rows = sqlx::query(
-        "SELECT id, username, role, status, created_at, approved_at, approved_by, last_login_at
-         FROM users
-         ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, created_at DESC",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(AppError::internal)?;
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = match query.limit.unwrap_or(20) {
+        value @ (20 | 50 | 100) => value,
+        _ => return Err(AppError::bad_request("每页数量仅支持 20、50 或 100。")),
+    };
+    let keyword = query.q.unwrap_or_default().trim().to_string();
+    if keyword.chars().count() > 100 {
+        return Err(AppError::bad_request("用户名搜索不能超过 100 个字符。"));
+    }
+    let status = normalized_admin_filter(query.status, &["pending", "approved", "disabled"])?;
+    let role = normalized_admin_filter(query.role, &["admin", "user"])?;
+    let account_kind = normalized_admin_filter(query.account_kind, &["standard", "managed"])?;
+    let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM users u WHERE 1=1");
+    append_admin_user_filters(&mut count, &keyword, &status, &role, &account_kind);
+    let total = count
+        .build_query_scalar::<i64>()
+        .fetch_one(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .max(0) as usize;
 
-    let mut users = Vec::with_capacity(rows.len());
+    let mut users = QueryBuilder::<Sqlite>::new(
+        "SELECT u.id, u.username, u.role, u.status, u.account_kind, u.must_change_password, u.created_at, u.approved_at, u.approved_by, u.last_login_at, u.last_active_at, COALESCE(a.image_count, 0) image_count, COALESCE(m.provider_count, 0) managed_provider_count FROM users u LEFT JOIN (SELECT user_id, COUNT(*) image_count FROM assets WHERE user_id IS NOT NULL GROUP BY user_id) a ON a.user_id = u.id LEFT JOIN (SELECT user_id, COUNT(*) provider_count FROM managed_provider_configs GROUP BY user_id) m ON m.user_id = u.id WHERE 1=1",
+    );
+    append_admin_user_filters(&mut users, &keyword, &status, &role, &account_kind);
+    let sort = match query.sort.as_deref() {
+        Some("image_count") => "image_count",
+        Some("created_at") | None => "u.created_at",
+        _ => return Err(AppError::bad_request("不支持的用户排序字段。")),
+    };
+    let order = match query.order.as_deref() {
+        Some("asc") => "ASC",
+        Some("desc") | None => "DESC",
+        _ => return Err(AppError::bad_request("不支持的用户排序方向。")),
+    };
+    users
+        .push(format!(" ORDER BY {sort} {order}, u.id ASC LIMIT "))
+        .push_bind(limit as i64)
+        .push(" OFFSET ")
+        .push_bind(page.saturating_sub(1).saturating_mul(limit) as i64);
+    let rows = users
+        .build()
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+
+    let mut summaries = Vec::with_capacity(rows.len());
     for row in rows {
         let id = row.get::<String, _>("id");
-        users.push(AdminUserSummary {
-            image_count: user_image_count(&state.db, &id).await?,
+        summaries.push(AdminUserSummary {
+            image_count: row.get::<i64, _>("image_count").max(0) as usize,
             id,
             username: row.get("username"),
             role: row.get("role"),
@@ -1060,9 +1178,338 @@ async fn admin_list_users(
             approved_at: row.get("approved_at"),
             approved_by: row.get("approved_by"),
             last_login_at: row.get("last_login_at"),
+            last_active_at: row.get("last_active_at"),
+            account_kind: match row.get::<String, _>("account_kind").as_str() {
+                "managed" => AccountKind::Managed,
+                _ => AccountKind::Standard,
+            },
+            must_change_password: row.get::<i64, _>("must_change_password") != 0,
+            managed_provider_count: row.get::<i64, _>("managed_provider_count").max(0) as usize,
         });
     }
-    Ok(Json(AdminUsersResponse { users }))
+    Ok(Json(AdminUsersResponse {
+        users: summaries,
+        total,
+        page,
+        limit,
+    }))
+}
+
+fn normalized_admin_filter(value: Option<String>, allowed: &[&str]) -> Result<String, AppError> {
+    let value = value.unwrap_or_else(|| "all".into());
+    if value == "all" || allowed.contains(&value.as_str()) {
+        Ok(value)
+    } else {
+        Err(AppError::bad_request("不支持的用户筛选条件。"))
+    }
+}
+
+fn append_admin_user_filters(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    keyword: &str,
+    status: &str,
+    role: &str,
+    account_kind: &str,
+) {
+    if !keyword.is_empty() {
+        let escaped = keyword
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        builder
+            .push(" AND u.username LIKE ")
+            .push_bind(format!("%{escaped}%"))
+            .push(" ESCAPE '\\'");
+    }
+    for (column, value) in [
+        ("u.status", status),
+        ("u.role", role),
+        ("u.account_kind", account_kind),
+    ] {
+        if value != "all" {
+            builder
+                .push(format!(" AND {column} = "))
+                .push_bind(value.to_string());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AdminTarget {
+    id: String,
+    username: String,
+    role: String,
+    status: String,
+}
+
+async fn load_admin_targets(
+    db: &SqlitePool,
+    ids: &BTreeSet<String>,
+) -> Result<Vec<AdminTarget>, AppError> {
+    let mut query =
+        QueryBuilder::<Sqlite>::new("SELECT id, username, role, status FROM users WHERE id IN (");
+    let mut separated = query.separated(", ");
+    for id in ids {
+        separated.push_bind(id);
+    }
+    separated.push_unseparated(") ORDER BY username COLLATE NOCASE");
+    let targets = query
+        .build()
+        .fetch_all(db)
+        .await
+        .map_err(AppError::internal)?
+        .into_iter()
+        .map(|row| AdminTarget {
+            id: row.get("id"),
+            username: row.get("username"),
+            role: row.get("role"),
+            status: row.get("status"),
+        })
+        .collect::<Vec<_>>();
+    if targets.len() != ids.len() {
+        return Err(AppError::bad_request("所选用户中包含不存在的账号。"));
+    }
+    Ok(targets)
+}
+
+fn validate_admin_batch_ids(ids: Vec<String>) -> Result<BTreeSet<String>, AppError> {
+    if ids.is_empty() || ids.len() > 100 || ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(AppError::bad_request("请选择 1–100 个有效用户。"));
+    }
+    let original_len = ids.len();
+    let unique = ids.into_iter().collect::<BTreeSet<_>>();
+    if unique.len() != original_len {
+        return Err(AppError::bad_request("用户 ID 不能重复。"));
+    }
+    if unique.len() > 100 {
+        return Err(AppError::bad_request("一次最多操作 100 个用户。"));
+    }
+    Ok(unique)
+}
+
+async fn admin_batch_users(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(request): Json<AdminUserBatchRequest>,
+) -> Result<Json<AdminBatchResponse>, AppError> {
+    let admin = require_admin(&state, &session).await?;
+    let ids = validate_admin_batch_ids(request.ids)?;
+    let targets = load_admin_targets(&state.db, &ids).await?;
+    if targets
+        .iter()
+        .any(|target| target.role == "admin" || target.id == admin.id)
+    {
+        return Err(AppError::bad_request(
+            "批量操作不能包含管理员账号或当前账号。",
+        ));
+    }
+    let operation_id = new_id();
+    if request.action == AdminUserBatchAction::Delete {
+        let expected = if targets.len() == 1 {
+            targets[0].username.clone()
+        } else {
+            format!("删除 {} 个用户", targets.len())
+        };
+        if request.confirmation.as_deref() != Some(expected.as_str()) {
+            return Err(AppError::bad_request("删除确认文字不匹配。"));
+        }
+        let mut response = AdminBatchResponse::default();
+        for target in targets {
+            match delete_user_data(&state, &admin, &operation_id, &target).await {
+                Ok(()) => response.updated_count += 1,
+                Err(error) => response.failed.push(AdminBatchFailure {
+                    id: target.id,
+                    message: error.message,
+                }),
+            }
+        }
+        return Ok(Json(response));
+    }
+
+    let (required_status, next_status, action_name) = match request.action {
+        AdminUserBatchAction::Approve => ("pending", "approved", "user.approve"),
+        AdminUserBatchAction::Disable => ("approved", "disabled", "user.disable"),
+        AdminUserBatchAction::Restore => ("disabled", "approved", "user.restore"),
+        AdminUserBatchAction::Delete => unreachable!(),
+    };
+    if targets
+        .iter()
+        .any(|target| target.status != required_status)
+    {
+        return Err(AppError::bad_request("所选用户包含不适用于该操作的状态。"));
+    }
+    let now = now_rfc3339();
+    let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
+    for target in &targets {
+        sqlx::query(
+            "UPDATE users SET status = ?, approved_at = CASE WHEN ? = 'approved' THEN ? ELSE approved_at END, approved_by = CASE WHEN ? = 'approved' THEN ? ELSE approved_by END, session_version = session_version + 1 WHERE id = ?",
+        )
+        .bind(next_status)
+        .bind(next_status)
+        .bind(&now)
+        .bind(next_status)
+        .bind(&admin.id)
+        .bind(&target.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(AppError::internal)?;
+        admin_console::record(
+            &mut transaction,
+            admin_console::AuditRecord {
+                operation_id: &operation_id,
+                actor_user_id: &admin.id,
+                actor_username: &admin.username,
+                action: action_name,
+                target_type: "user",
+                target_id: &target.id,
+                target_name: &target.username,
+                summary: next_status,
+            },
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok(Json(AdminBatchResponse {
+        updated_count: targets.len(),
+        failed: Vec::new(),
+    }))
+}
+
+async fn admin_export_users(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(request): Json<AdminUserExportRequest>,
+) -> Result<Response, AppError> {
+    let admin = require_admin(&state, &session).await?;
+    let ids = validate_admin_batch_ids(request.ids)?;
+    let targets = load_admin_targets(&state.db, &ids).await?;
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT u.id, u.username, u.role, u.status, u.account_kind, u.created_at, u.last_active_at, COALESCE(a.image_count, 0) image_count FROM users u LEFT JOIN (SELECT user_id, COUNT(*) image_count FROM assets WHERE user_id IS NOT NULL GROUP BY user_id) a ON a.user_id = u.id WHERE u.id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for id in &ids {
+        separated.push_bind(id);
+    }
+    separated.push_unseparated(") ORDER BY u.username COLLATE NOCASE");
+    let rows = query
+        .build()
+        .fetch_all(&state.db)
+        .await
+        .map_err(AppError::internal)?;
+    let mut csv =
+        String::from("\u{feff}用户ID,用户名,角色,状态,账号类型,服务器图片数,注册时间,最后活跃\r\n");
+    for row in rows {
+        let values = [
+            row.get::<String, _>("id"),
+            row.get("username"),
+            row.get("role"),
+            row.get("status"),
+            row.get("account_kind"),
+            row.get::<i64, _>("image_count").to_string(),
+            row.get("created_at"),
+            row.get::<Option<String>, _>("last_active_at")
+                .unwrap_or_default(),
+        ];
+        csv.push_str(
+            &values
+                .into_iter()
+                .map(|value| csv_cell(&value))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        csv.push_str("\r\n");
+    }
+    let operation_id = new_id();
+    let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
+    for target in targets {
+        admin_console::record(
+            &mut transaction,
+            admin_console::AuditRecord {
+                operation_id: &operation_id,
+                actor_user_id: &admin.id,
+                actor_username: &admin.username,
+                action: "user.export",
+                target_type: "user",
+                target_id: &target.id,
+                target_name: &target.username,
+                summary: "csv",
+            },
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"mew-users.csv\"",
+            ),
+        ],
+        csv,
+    )
+        .into_response())
+}
+
+async fn admin_reset_user_password(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(request): Json<AdminUserActionRequest>,
+) -> Result<Json<ManagedPasswordResetResponse>, AppError> {
+    let admin = require_admin(&state, &session).await?;
+    let target = sqlx::query("SELECT username FROM users WHERE id = ?")
+        .bind(&request.user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("用户不存在。"))?;
+    let username = target.get::<String, _>("username");
+    let temporary_password = managed_providers::generate_temporary_password();
+    let password_hash = hash_password_with_limit(&state, temporary_password.clone()).await?;
+    let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
+    sqlx::query(
+        "UPDATE users SET password_hash = ?, password_updated_at = ?, must_change_password = 1,
+         failed_login_count = 0, locked_until = NULL, session_version = session_version + 1
+         WHERE id = ?",
+    )
+    .bind(password_hash)
+    .bind(now_rfc3339())
+    .bind(&request.user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(AppError::internal)?;
+    let operation_id = new_id();
+    admin_console::record(
+        &mut transaction,
+        admin_console::AuditRecord {
+            operation_id: &operation_id,
+            actor_user_id: &admin.id,
+            actor_username: &admin.username,
+            action: "user.reset_password",
+            target_type: "user",
+            target_id: &request.user_id,
+            target_name: &username,
+            summary: "temporary_password_issued",
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok(Json(ManagedPasswordResetResponse {
+        user_id: request.user_id,
+        temporary_password,
+    }))
+}
+
+fn csv_cell(value: &str) -> String {
+    let safe = if value.starts_with(['=', '+', '-', '@']) {
+        format!("'{value}")
+    } else {
+        value.into()
+    };
+    format!(
+        "\"{}\"",
+        safe.replace('"', "\"\"").replace(['\r', '\n'], " ")
+    )
 }
 
 async fn admin_approve_user(
@@ -1071,13 +1518,7 @@ async fn admin_approve_user(
     Json(payload): Json<AdminUserActionRequest>,
 ) -> Result<StatusCode, AppError> {
     let admin = require_admin(&state, &session).await?;
-    update_user_status(
-        &state,
-        &payload.user_id,
-        "approved",
-        Some(admin.id.as_str()),
-    )
-    .await
+    update_user_status_audited(&state, &admin, &payload.user_id, "approved", "user.approve").await
 }
 
 async fn admin_disable_user(
@@ -1089,7 +1530,7 @@ async fn admin_disable_user(
     if payload.user_id == admin.id {
         return Err(AppError::bad_request("不能禁用当前登录的管理员账号。"));
     }
-    update_user_status(&state, &payload.user_id, "disabled", None).await
+    update_user_status_audited(&state, &admin, &payload.user_id, "disabled", "user.disable").await
 }
 
 async fn admin_restore_user(
@@ -1098,13 +1539,7 @@ async fn admin_restore_user(
     Json(payload): Json<AdminUserActionRequest>,
 ) -> Result<StatusCode, AppError> {
     let admin = require_admin(&state, &session).await?;
-    update_user_status(
-        &state,
-        &payload.user_id,
-        "approved",
-        Some(admin.id.as_str()),
-    )
-    .await
+    update_user_status_audited(&state, &admin, &payload.user_id, "approved", "user.restore").await
 }
 
 async fn admin_delete_user(
@@ -1113,28 +1548,30 @@ async fn admin_delete_user(
     Json(payload): Json<AdminUserActionRequest>,
 ) -> Result<StatusCode, AppError> {
     let admin = require_admin(&state, &session).await?;
-    if payload.user_id == admin.id {
-        return Err(AppError::bad_request("不能删除当前登录的管理员账号。"));
-    }
-
-    let _write_guard = user_data_write_lock(&state, &payload.user_id).lock().await;
-    let role = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = ?")
-        .bind(&payload.user_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(AppError::internal)?
-        .ok_or_else(|| AppError::not_found("用户不存在"))?;
-    if role == "admin" {
+    let ids = BTreeSet::from([payload.user_id]);
+    let target = load_admin_targets(&state.db, &ids).await?.remove(0);
+    if target.id == admin.id || target.role == "admin" {
         return Err(AppError::bad_request(
             "管理员账号不能通过用户管理页面删除。",
         ));
     }
+    delete_user_data(&state, &admin, &new_id(), &target).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_user_data(
+    state: &AppState,
+    admin: &UserSummary,
+    operation_id: &str,
+    target: &AdminTarget,
+) -> Result<(), AppError> {
+    let _write_guard = user_data_write_lock(state, &target.id).lock().await;
 
     let mut object_keys = BTreeSet::new();
     for table in ["assets", "upload_tokens"] {
         let query = format!("SELECT object_key FROM {table} WHERE user_id = ?");
         let rows = sqlx::query(&query)
-            .bind(&payload.user_id)
+            .bind(&target.id)
             .fetch_all(&state.db)
             .await
             .map_err(AppError::internal)?;
@@ -1144,9 +1581,9 @@ async fn admin_delete_user(
         );
     }
     for object_key in object_keys {
-        delete_object(&state, &object_key).await?;
+        delete_object(state, &object_key).await?;
     }
-    delete_user_object_namespace(&state, &payload.user_id).await?;
+    delete_user_object_namespace(state, &target.id).await?;
 
     let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
     for table in [
@@ -1154,23 +1591,39 @@ async fn admin_delete_user(
         "assets",
         "sync_snapshots",
         "provider_templates",
+        "managed_provider_configs",
     ] {
         let query = format!("DELETE FROM {table} WHERE user_id = ?");
         sqlx::query(&query)
-            .bind(&payload.user_id)
+            .bind(&target.id)
             .execute(&mut *transaction)
             .await
             .map_err(AppError::internal)?;
     }
     sqlx::query("DELETE FROM users WHERE id = ?")
-        .bind(&payload.user_id)
+        .bind(&target.id)
         .execute(&mut *transaction)
         .await
         .map_err(AppError::internal)?;
+    admin_console::record(
+        &mut transaction,
+        admin_console::AuditRecord {
+            operation_id,
+            actor_user_id: &admin.id,
+            actor_username: &admin.username,
+            action: "user.delete",
+            target_type: "user",
+            target_id: &target.id,
+            target_name: &target.username,
+            summary: "deleted",
+        },
+    )
+    .await?;
     transaction.commit().await.map_err(AppError::internal)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
+#[cfg(test)]
 async fn update_user_status(
     state: &AppState,
     user_id: &str,
@@ -1213,6 +1666,54 @@ async fn update_user_status(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_user_status_audited(
+    state: &AppState,
+    admin: &UserSummary,
+    user_id: &str,
+    status: &str,
+    action: &str,
+) -> Result<StatusCode, AppError> {
+    let _write_guard = user_data_write_lock(state, user_id).lock().await;
+    let target = sqlx::query("SELECT username FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("用户不存在。"))?;
+    let target_username = target.get::<String, _>("username");
+    let approved_at = (status == "approved").then(now_rfc3339);
+    let mut transaction = state.db.begin().await.map_err(AppError::internal)?;
+    sqlx::query(
+        "UPDATE users
+         SET status = ?, approved_at = COALESCE(?, approved_at),
+             approved_by = COALESCE(?, approved_by), session_version = session_version + 1
+         WHERE id = ?",
+    )
+    .bind(status)
+    .bind(approved_at)
+    .bind((status == "approved").then_some(admin.id.as_str()))
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(AppError::internal)?;
+    admin_console::record(
+        &mut transaction,
+        admin_console::AuditRecord {
+            operation_id: &new_id(),
+            actor_user_id: &admin.id,
+            actor_username: &admin.username,
+            action,
+            target_type: "user",
+            target_id: user_id,
+            target_name: &target_username,
+            summary: status,
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(AppError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn user_data_write_lock<'a>(state: &'a AppState, user_id: &str) -> &'a tokio::sync::Mutex<()> {
     // 同一用户稳定落在同一分片，串行化同步、配额预留与清理；不同用户仍可并行。
     let digest = Sha256::digest(user_id.as_bytes());
@@ -1242,7 +1743,11 @@ async fn sync_push(
     let user = require_approved_user(&state, &session).await?;
     let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
     let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
-    let normalized = normalize_envelope_assets(&state, &user.id, payload.envelope).await?;
+    let mut incoming = payload.envelope;
+    if user.account_kind == AccountKind::Managed {
+        incoming.configs.clear();
+    }
+    let normalized = normalize_envelope_assets(&state, &user.id, incoming).await?;
     let stored =
         match sync_store::merge_snapshot_transactionally(&state.db, &user.id, &normalized.envelope)
             .await
@@ -1259,8 +1764,17 @@ async fn sync_push(
                 return Err(AppError::internal_message("服务器内部错误"));
             }
         };
-    let merged = stored.envelope;
+    let mut merged = stored.envelope;
     let updated_at = stored.updated_at;
+    if user.account_kind == AccountKind::Managed && !merged.configs.is_empty() {
+        merged.configs.clear();
+        sqlx::query("UPDATE sync_snapshots SET payload = ? WHERE user_id = ?")
+            .bind(serde_json::to_string(&merged).map_err(AppError::internal)?)
+            .bind(&user.id)
+            .execute(&state.db)
+            .await
+            .map_err(AppError::internal)?;
+    }
 
     if let Err(error) = cleanup_tombstoned_assets(&state, &user.id, &merged).await {
         // 快照已经提交，清理失败交由下次同步重试，不能把成功提交伪装成失败响应。
@@ -1354,7 +1868,10 @@ async fn sync_pull(
     session: Session,
 ) -> Result<Json<SyncPullResponse>, AppError> {
     let user = require_approved_user(&state, &session).await?;
-    let envelope = load_sync_envelope(&state.db, &user.id).await?;
+    let mut envelope = load_sync_envelope(&state.db, &user.id).await?;
+    if user.account_kind == AccountKind::Managed {
+        envelope.configs.clear();
+    }
     let now = now_rfc3339();
     Ok(Json(SyncPullResponse {
         envelope,
@@ -1465,8 +1982,13 @@ async fn sync_merge_preview(
     Json(payload): Json<SyncPushRequest>,
 ) -> Result<Json<MergePreviewResponse>, AppError> {
     let user = require_approved_user(&state, &session).await?;
-    let existing = load_sync_envelope(&state.db, &user.id).await?;
-    let merged = merge_envelopes(&existing, &payload.envelope);
+    let mut existing = load_sync_envelope(&state.db, &user.id).await?;
+    let mut incoming = payload.envelope;
+    if user.account_kind == AccountKind::Managed {
+        existing.configs.clear();
+        incoming.configs.clear();
+    }
+    let merged = merge_envelopes(&existing, &incoming);
     Ok(Json(MergePreviewResponse {
         merged_updated_at: merged.updated_at.clone(),
         config_count: merged.configs.len(),
@@ -1508,6 +2030,11 @@ async fn import_provider_template(
     Json(payload): Json<ProviderTemplateImportRequest>,
 ) -> Result<Json<ProviderTemplate>, AppError> {
     let user = require_approved_user(&state, &session).await?;
+    if user.account_kind == AccountKind::Managed {
+        return Err(AppError::unauthorized(
+            "托管账号的服务商模板只能由管理员配置。",
+        ));
+    }
     let _write_guard = user_data_write_lock(&state, &user.id).lock().await;
     let user = revalidate_locked_approved_user(&state, &session, &user.id).await?;
     validate_template(
@@ -2304,9 +2831,17 @@ async fn generate_via_proxy(
     session: Session,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<ProxyGenerationJobAccepted>), AppError> {
-    let approved_user = current_user(&state, &session)
-        .await?
-        .filter(|user| user.status == "approved");
+    let current = current_user(&state, &session).await?;
+    if current
+        .as_ref()
+        .is_some_and(|user| user.account_kind == AccountKind::Managed)
+    {
+        return Err(AppError::unauthorized(
+            "托管账号必须使用服务端托管配置生成，请更新前端后重试。",
+        ));
+    }
+    let approved_user =
+        current.filter(|user| user.status == "approved" && !user.must_change_password);
     if approved_user.is_none() && !state.config.enable_guest_proxy {
         return Err(AppError::unauthorized(
             "当前部署已关闭游客代理，请登录后再试。",
@@ -2338,8 +2873,72 @@ async fn generate_via_proxy(
         .acquire_many_owned(temp_permits)
         .await
         .map_err(AppError::internal)?;
-    let payload = parse_generate_multipart(multipart).await?;
+    let payload = parse_generate_multipart::<GenerateViaProxyRequest>(multipart).await?;
     validate_generate_request(&state, approved_user.as_ref(), &payload.payload)?;
+    enqueue_proxy_generation(state, payload, job_slot, temp_budget_permit, guest_permit).await
+}
+
+async fn generate_via_managed_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    session: Session,
+    multipart: Multipart,
+) -> Result<(StatusCode, Json<ProxyGenerationJobAccepted>), AppError> {
+    let user = require_approved_user(&state, &session).await?;
+    if user.account_kind != AccountKind::Managed {
+        return Err(AppError::unauthorized("该接口仅供托管账号使用。"));
+    }
+    let job_slot = state
+        .generation_job_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            AppError::rate_limited(
+                "当前代理生成任务较多，请稍后重试。",
+                "proxy_generation_queue_full",
+                5,
+            )
+        })?;
+    let temp_permits = generation_temp_permits(&state, &headers)?;
+    let temp_budget_permit = state
+        .generation_temp_budget
+        .clone()
+        .acquire_many_owned(temp_permits)
+        .await
+        .map_err(AppError::internal)?;
+    let managed = parse_generate_multipart::<ManagedGenerateViaProxyRequest>(multipart).await?;
+    let (mut config, template) = managed_providers::resolve_generation_config(
+        &state,
+        &user.id,
+        &managed.payload.managed_config_id,
+        &managed.payload.request.model,
+    )
+    .await?;
+    config.output_format = managed.payload.options.output_format;
+    config.output_compression = managed.payload.options.output_compression;
+    config.background = managed.payload.options.background;
+    config.moderation = managed.payload.options.moderation;
+    let payload = ParsedGeneratePayload {
+        payload: GenerateViaProxyRequest {
+            template,
+            config,
+            request: managed.payload.request,
+        },
+        reference_files: managed.reference_files,
+        mask_file: managed.mask_file,
+        redact_upstream_identity: true,
+    };
+    validate_generate_request(&state, Some(&user), &payload.payload)?;
+    enqueue_proxy_generation(state, payload, job_slot, temp_budget_permit, None).await
+}
+
+async fn enqueue_proxy_generation(
+    state: Arc<AppState>,
+    payload: ParsedGeneratePayload,
+    job_slot: tokio::sync::OwnedSemaphorePermit,
+    temp_budget_permit: tokio::sync::OwnedSemaphorePermit,
+    guest_permit: Option<GuestProxyPermit>,
+) -> Result<(StatusCode, Json<ProxyGenerationJobAccepted>), AppError> {
     let memory_permits = estimate_generation_memory_permits(&state, &payload.payload.request);
 
     cleanup_proxy_generation_jobs(&state).await;
@@ -2428,7 +3027,14 @@ async fn run_proxy_generation_job(
                     Err(error) => (ProxyGenerationJobState::Failed(error), None),
                 }
             }
-            Ok(Err(error)) => (ProxyGenerationJobState::Failed(error.message), None),
+            Ok(Err(error)) => {
+                let message = if payload.redact_upstream_identity {
+                    redact_managed_upstream_error(&error.message, &payload.payload.config)
+                } else {
+                    error.message
+                };
+                (ProxyGenerationJobState::Failed(message), None)
+            }
             Err(_) => (
                 ProxyGenerationJobState::Failed(
                     "代理任务排队或生成超过 30 分钟，任务已停止，请稍后重试。".into(),
@@ -2639,9 +3245,12 @@ fn cleanup_proxy_generation_job_entries(
     }
 }
 
-async fn parse_generate_multipart(
+async fn parse_generate_multipart<T>(
     mut multipart: Multipart,
-) -> Result<ParsedGeneratePayload, AppError> {
+) -> Result<ParsedGenerationUpload<T>, AppError>
+where
+    T: serde::de::DeserializeOwned + ContainsGenerationRequest,
+{
     let mut payload = None;
     let mut reference_assets_meta = None;
     let mut reference_assets_files = Vec::new();
@@ -2665,11 +3274,9 @@ async fn parse_generate_multipart(
                     "生成请求主体",
                 )
                 .await?;
-                payload = Some(
-                    serde_json::from_str::<GenerateViaProxyRequest>(&text).map_err(|error| {
-                        AppError::bad_request(format!("生成请求解析失败：{error}"))
-                    })?,
-                );
+                payload = Some(serde_json::from_str::<T>(&text).map_err(|error| {
+                    AppError::bad_request(format!("生成请求解析失败：{error}"))
+                })?);
             }
             "reference_assets_meta" => {
                 if reference_assets_meta.is_some() {
@@ -2780,10 +3387,10 @@ async fn parse_generate_multipart(
         });
     }
 
-    payload.request.reference_assets = reference_assets;
+    payload.request_mut().reference_assets = reference_assets;
     match (
         payload
-            .request
+            .request()
             .editing
             .as_ref()
             .and_then(|editing| editing.mask.as_ref()),
@@ -2796,21 +3403,40 @@ async fn parse_generate_multipart(
                 ));
             }
             payload
-                .request
+                .request()
                 .editing
                 .as_ref()
                 .unwrap()
-                .validate(&payload.request)
+                .validate(payload.request())
                 .map_err(AppError::bad_request)?;
         }
         (None, None) => (),
         _ => return Err(AppError::bad_request("遮罩文件与编辑元数据必须同时提供。")),
     }
-    Ok(ParsedGeneratePayload {
+    Ok(ParsedGenerationUpload {
         payload,
         reference_files: reference_assets_files,
         mask_file,
+        redact_upstream_identity: false,
     })
+}
+
+fn redact_managed_upstream_error(message: &str, config: &EncryptedApiConfig) -> String {
+    let mut sanitized = message.to_string();
+    if let Some(api_key) = config.api_key_plaintext.as_deref()
+        && !api_key.is_empty()
+    {
+        sanitized = sanitized.replace(api_key, "[REDACTED]");
+    }
+    if !config.base_url.is_empty() {
+        sanitized = sanitized.replace(&config.base_url, "[托管上游]");
+        if let Ok(url) = Url::parse(&config.base_url)
+            && let Some(host) = url.host_str()
+        {
+            sanitized = sanitized.replace(host, "[托管上游]");
+        }
+    }
+    sanitized
 }
 
 async fn read_multipart_text_limited(
@@ -3026,7 +3652,7 @@ async fn current_user(
         .await
         .map_err(AppError::internal)?;
     let row = sqlx::query(
-        "SELECT id, username, role, status, created_at, session_version
+        "SELECT id, username, role, status, account_kind, must_change_password, created_at, session_version, last_active_at
          FROM users WHERE id = ?",
     )
     .bind(user_id)
@@ -3041,6 +3667,19 @@ async fn current_user(
             return Ok(None);
         }
         let id = row.get::<String, _>("id");
+        let last_active_at = row.get::<Option<String>, _>("last_active_at");
+        let activity_is_stale = last_active_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_none_or(|value| value < Utc::now() - Duration::minutes(10));
+        if activity_is_stale {
+            sqlx::query("UPDATE users SET last_active_at = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(&id)
+                .execute(&state.db)
+                .await
+                .map_err(AppError::internal)?;
+        }
         let image_count = user_image_count(&state.db, &id).await?;
         Ok(Some(UserSummary {
             id,
@@ -3049,6 +3688,11 @@ async fn current_user(
             status: row.get("status"),
             image_count,
             created_at: row.get("created_at"),
+            account_kind: match row.get::<String, _>("account_kind").as_str() {
+                "managed" => AccountKind::Managed,
+                _ => AccountKind::Standard,
+            },
+            must_change_password: row.get::<i64, _>("must_change_password") != 0,
         }))
     } else {
         session.delete().await.map_err(AppError::internal)?;
@@ -3089,6 +3733,9 @@ async fn require_approved_user(
         return Err(AppError::unauthorized(
             "账号待管理员审批，暂不能使用云端同步和服务器资源存储。",
         ));
+    }
+    if user.must_change_password {
+        return Err(AppError::unauthorized("首次登录必须先修改临时密码。"));
     }
     Ok(user)
 }
@@ -6111,6 +6758,7 @@ mod tests {
             trust_proxy_headers: false,
             trusted_proxy_cidrs: Vec::new(),
             auth_secret: "test-auth-secret".into(),
+            managed_provider_key: Some(state::ManagedProviderKey::from_bytes([7; 32])),
             register_device_limit: 3,
             register_ip_limit: 10,
             register_window_seconds: 86_400,
@@ -6276,6 +6924,7 @@ mod tests {
                 responses_model: None,
                 access_mode: ProviderAccessMode::Proxy,
                 known_requires_proxy: true,
+                server_managed: false,
                 output_format: Some("png".into()),
                 output_compression: None,
                 background: Some("auto".into()),
@@ -6461,6 +7110,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn csv_cells_block_formula_execution_and_escape_content() {
+        assert_eq!(csv_cell("=1+1"), "\"'=1+1\"");
+        assert_eq!(csv_cell("a,\"b\""), "\"a,\"\"b\"\"\"");
+        assert_eq!(csv_cell("line\r\nbreak"), "\"line  break\"");
+    }
+
+    #[tokio::test]
+    async fn admin_password_reset_invalidates_sessions_and_requires_change() {
+        let state = Arc::new(test_app_state(String::new()).await);
+        insert_test_user(
+            &state.db,
+            "admin-reset",
+            "admin",
+            "hash",
+            "admin",
+            "approved",
+            0,
+        )
+        .await;
+        insert_test_user(
+            &state.db,
+            "user-reset",
+            "user",
+            "hash",
+            "user",
+            "approved",
+            0,
+        )
+        .await;
+        let store = Arc::new(MemoryStore::default());
+        let admin_session = authenticated_test_session(store.clone(), "admin-reset", 0).await;
+        let old_user_session = authenticated_test_session(store, "user-reset", 0).await;
+
+        let Json(response) = admin_reset_user_password(
+            State(state.clone()),
+            admin_session,
+            Json(AdminUserActionRequest {
+                user_id: "user-reset".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        validate_strong_password(&response.temporary_password, &response.temporary_password)
+            .unwrap();
+        let row = sqlx::query(
+            "SELECT must_change_password, session_version, password_hash FROM users WHERE id = ?",
+        )
+        .bind("user-reset")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("must_change_password"), 1);
+        assert_eq!(row.get::<i64, _>("session_version"), 1);
+        assert!(
+            password_matches(
+                &response.temporary_password,
+                &row.get::<String, _>("password_hash")
+            )
+            .unwrap()
+        );
+        assert!(
+            current_user(&state, &old_user_session)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM admin_audit_logs WHERE action = 'user.reset_password' AND target_id = 'user-reset'",
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn locked_write_revalidation_rejects_session_invalidated_after_initial_check() {
         let state = test_app_state(String::new()).await;
@@ -6549,6 +7277,8 @@ mod tests {
                 status: status.into(),
                 image_count: 0,
                 created_at: now_rfc3339(),
+                account_kind: AccountKind::Standard,
+                must_change_password: false,
             };
             assert!(validate_generate_request(&state, Some(&user), &standard_request).is_ok());
             let error =
@@ -6563,6 +7293,8 @@ mod tests {
             status: "approved".into(),
             image_count: 0,
             created_at: now_rfc3339(),
+            account_kind: AccountKind::Standard,
+            must_change_password: false,
         };
         assert!(validate_generate_request(&state, Some(&approved), &custom_request).is_ok());
     }
@@ -6816,6 +7548,7 @@ mod tests {
         assert_eq!(value["capabilities"]["image_generation_options_v2"], true);
         assert_eq!(value["capabilities"]["image_editing_v1"], true);
         assert_eq!(value["capabilities"]["provider_model_lists_v1"], true);
+        assert_eq!(value["capabilities"]["managed_provider_accounts_v1"], true);
     }
 
     #[test]
@@ -7139,7 +7872,7 @@ mod tests {
     async fn multipart_parser_url() -> (String, tokio::task::JoinHandle<()>) {
         use axum::{Router, extract::Multipart, http::StatusCode, routing::post};
         async fn parse(multipart: Multipart) -> Result<StatusCode, AppError> {
-            let _parsed = parse_generate_multipart(multipart).await?;
+            let _parsed = parse_generate_multipart::<GenerateViaProxyRequest>(multipart).await?;
             Ok(StatusCode::NO_CONTENT)
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

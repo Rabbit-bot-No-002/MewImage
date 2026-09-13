@@ -19,8 +19,10 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, Event, HtmlAnchorElement, HtmlCanvasElement, HtmlInputElement, MouseEvent};
 
 use crate::app::{
-    FAVORITE_ARCHIVE_ASSET_KEY, asset_src, bytes_to_data_url, ensure_asset_display_sources_loaded,
-    favorite_folder_picker_style, load_html_image, normalized_favorite_folders, sha256_hex,
+    FAVORITE_ARCHIVE_ASSET_KEY, asset_src, bytes_to_data_url,
+    derived::AppDerived,
+    ensure_asset_display_sources_loaded, favorite_folder_picker_style, load_html_image,
+    normalized_favorite_folders, sha256_hex,
     state::{AccountState, ComposerState, MainView, UiState, WorkspaceState},
 };
 use crate::{api::api_url, storage::apply_asset_payload_changes};
@@ -182,6 +184,7 @@ pub(crate) fn TemplatePlaza(
     let composer = expect_context::<ComposerState>();
     let account = expect_context::<AccountState>();
     let ui = expect_context::<UiState>();
+    let derived = expect_context::<AppDerived>();
 
     let templates = RwSignal::new(Vec::<GalleryTemplate>::new());
     let visible_template_count = RwSignal::new(TEMPLATE_BATCH_SIZE);
@@ -608,29 +611,52 @@ pub(crate) fn TemplatePlaza(
                     composer
                         .count
                         .set(template.generation_settings.count.clamp(1, 4));
-                    let current_kind = workspace.configs.with_untracked(|configs| {
+                    let current_config = derived.provider_configs.with_untracked(|configs| {
                         configs
                             .iter()
                             .find(|config| config.id == workspace.current_config_id.get_untracked())
-                            .map(|config| config.provider_kind)
+                            .cloned()
                     });
+                    let current_kind = current_config.as_ref().map(|config| config.provider_kind);
                     if current_kind == Some(template.recommended_provider_kind) {
-                        workspace.configs.update(|configs| {
-                            if let Some(config) = configs.iter_mut().find(|config| {
-                                config.id == workspace.current_config_id.get_untracked()
-                            }) {
-                                config.output_format =
-                                    template.generation_settings.output_format.clone();
-                                config.output_compression =
-                                    template.generation_settings.output_compression;
-                                config.background = template.generation_settings.background.clone();
-                                config.moderation = template.generation_settings.moderation.clone();
-                                config.responses_model =
-                                    template.generation_settings.responses_model.clone();
-                                config.updated_at = now_rfc3339();
-                            }
-                        });
-                        persist_ui_state();
+                        if current_config
+                            .as_ref()
+                            .is_some_and(|config| config.server_managed)
+                        {
+                            account.managed_provider_configs.update(|configs| {
+                                if let Some(config) = configs.iter_mut().find(|config| {
+                                    config.id == workspace.current_config_id.get_untracked()
+                                }) {
+                                    config.output_format =
+                                        template.generation_settings.output_format.clone();
+                                    config.output_compression =
+                                        template.generation_settings.output_compression;
+                                    config.background =
+                                        template.generation_settings.background.clone();
+                                    config.moderation =
+                                        template.generation_settings.moderation.clone();
+                                }
+                            });
+                        } else {
+                            workspace.configs.update(|configs| {
+                                if let Some(config) = configs.iter_mut().find(|config| {
+                                    config.id == workspace.current_config_id.get_untracked()
+                                }) {
+                                    config.output_format =
+                                        template.generation_settings.output_format.clone();
+                                    config.output_compression =
+                                        template.generation_settings.output_compression;
+                                    config.background =
+                                        template.generation_settings.background.clone();
+                                    config.moderation =
+                                        template.generation_settings.moderation.clone();
+                                    config.responses_model =
+                                        template.generation_settings.responses_model.clone();
+                                    config.updated_at = now_rfc3339();
+                                }
+                            });
+                            persist_ui_state();
+                        }
                     }
                     persist_state();
                     ui.main_view.set(MainView::Workspace);

@@ -4,7 +4,7 @@ use wasm_bindgen::JsValue;
 
 use crate::app::{
     resolved_night_mode,
-    state::{MainView, UiState, WorkspaceState},
+    state::{AccountState, MainView, UiState, WorkspaceState},
 };
 
 use super::common::MaterialSymbolIcon;
@@ -12,6 +12,7 @@ use super::common::MaterialSymbolIcon;
 #[component]
 pub(crate) fn TopBar(persist_ui_state: impl Fn() + Copy + Send + Sync + 'static) -> impl IntoView {
     let workspace = expect_context::<WorkspaceState>();
+    let account = expect_context::<AccountState>();
     let ui = expect_context::<UiState>();
     let preferences = workspace.preferences;
     let show_favorites_panel = ui.show_favorites_panel;
@@ -20,9 +21,15 @@ pub(crate) fn TopBar(persist_ui_state: impl Fn() + Copy + Send + Sync + 'static)
 
     let switch_view = move |view: MainView| {
         main_view.set(view);
+        if view == MainView::Admin {
+            // 顶栏入口始终回到后台默认页，避免残留上一次的审计或账号深链状态。
+            ui.admin_section.set("users".into());
+            ui.admin_user_id.set(None);
+        }
         let url = match view {
             MainView::Workspace => "/",
             MainView::TemplatePlaza => "/?view=templates",
+            MainView::Admin => "/#/admin",
         };
         if let Some(window) = web_sys::window()
             && let Ok(history) = window.history()
@@ -71,7 +78,31 @@ pub(crate) fn TopBar(persist_ui_state: impl Fn() + Copy + Send + Sync + 'static)
                     <h1>"MewImage"</h1>
                 </div>
                 <div class="row topbar-actions">
-                    <button class="button ghost" on:click=move |_| {
+                    <Show when=move || account.auth_user.get().is_some_and(|user| user.role == "admin")>
+                        <button
+                            class="button ghost icon-button"
+                            class:is-active=move || main_view.get() == MainView::Admin
+                            title="管理后台"
+                            aria-label="管理后台"
+                            aria-pressed=move || main_view.get() == MainView::Admin
+                            on:click=move |_| switch_view(MainView::Admin)
+                        >
+                            <MaterialSymbolIcon name="shield_person" filled=true />
+                        </button>
+                    </Show>
+                    <button
+                        class="button ghost icon-button"
+                        title=move || if resolved_night_mode(preferences.get().theme, ui.system_dark.get()) {
+                            "切换到白天模式"
+                        } else {
+                            "切换到夜间模式"
+                        }
+                        aria-label=move || if resolved_night_mode(preferences.get().theme, ui.system_dark.get()) {
+                            "切换到白天模式"
+                        } else {
+                            "切换到夜间模式"
+                        }
+                        on:click=move |_| {
                         let night = resolved_night_mode(
                             preferences.get_untracked().theme,
                             ui.system_dark.get_untracked(),
@@ -80,11 +111,22 @@ pub(crate) fn TopBar(persist_ui_state: impl Fn() + Copy + Send + Sync + 'static)
                             value.theme = if night { ThemePreference::Day } else { ThemePreference::Night };
                         });
                         persist_ui_state();
-                    }>
-                        {move || if resolved_night_mode(preferences.get().theme, ui.system_dark.get()) { "白天模式" } else { "夜间模式" }}
+                    }
+                    >
+                        {move || if resolved_night_mode(preferences.get().theme, ui.system_dark.get()) {
+                            view! { <MaterialSymbolIcon name="dark_mode" filled=true /> }.into_any()
+                        } else {
+                            view! { <MaterialSymbolIcon name="light_mode" filled=true /> }.into_any()
+                        }}
                     </button>
-                    <button class="button secondary" on:click=move |_| show_settings_menu.update(|value| *value = !*value)>
-                        {move || if show_settings_menu.get() { "收起设置" } else { "打开设置" }}
+                    <button
+                        class="button secondary icon-button"
+                        title=move || if show_settings_menu.get() { "收起设置" } else { "打开设置" }
+                        aria-label=move || if show_settings_menu.get() { "收起设置" } else { "打开设置" }
+                        aria-expanded=move || show_settings_menu.get()
+                        on:click=move |_| show_settings_menu.update(|value| *value = !*value)
+                    >
+                        <MaterialSymbolIcon name="settings" filled=true />
                     </button>
                 </div>
             </header>

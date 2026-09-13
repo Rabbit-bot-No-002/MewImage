@@ -4,6 +4,7 @@ use super::*;
 pub(super) fn AppController() -> impl IntoView {
     let workspace = expect_context::<WorkspaceState>();
     let composer = expect_context::<ComposerState>();
+    let account = expect_context::<AccountState>();
     let ui = expect_context::<UiState>();
     let persistence = expect_context::<PersistenceState>();
 
@@ -37,6 +38,9 @@ pub(super) fn AppController() -> impl IntoView {
         };
         let popstate_handler = Closure::<dyn FnMut(Event)>::new(move |_| {
             ui.main_view.set(MainView::from_location());
+            let (section, user_id) = admin_route_from_location();
+            ui.admin_section.set(section);
+            ui.admin_user_id.set(user_id);
         });
         if window
             .add_event_listener_with_callback("popstate", popstate_handler.as_ref().unchecked_ref())
@@ -46,6 +50,21 @@ pub(super) fn AppController() -> impl IntoView {
         }
         // 根控制器与页面同寿命，固定保留一个监听器不会随交互累积。
         popstate_handler.forget();
+        let hashchange_handler = Closure::<dyn FnMut(Event)>::new(move |_| {
+            ui.main_view.set(MainView::from_location());
+            let (section, user_id) = admin_route_from_location();
+            ui.admin_section.set(section);
+            ui.admin_user_id.set(user_id);
+        });
+        if window
+            .add_event_listener_with_callback(
+                "hashchange",
+                hashchange_handler.as_ref().unchecked_ref(),
+            )
+            .is_ok()
+        {
+            hashchange_handler.forget();
+        }
     });
     let enqueue_payload_deletes = {
         move |asset_ids: Vec<String>| {
@@ -74,7 +93,7 @@ pub(super) fn AppController() -> impl IntoView {
         }
     };
 
-    let derived = AppDerived::new(workspace, composer, ui);
+    let derived = AppDerived::new(workspace, composer, account, ui);
     provide_context(derived);
     super::effects::install_app_effects();
 
@@ -87,7 +106,7 @@ pub(super) fn AppController() -> impl IntoView {
         if asset_id.is_some() && asset.is_none() {
             return None;
         }
-        let preview_config = configs.with_untracked(|items| {
+        let preview_config = derived.provider_configs.with_untracked(|items| {
             items
                 .iter()
                 .find(|config| config.id == task.config_id)
@@ -204,6 +223,20 @@ pub(super) fn AppController() -> impl IntoView {
 
     let update_current_config = move |updater: fn(&mut EncryptedApiConfig, String),
                                       value: String| {
+        if let Some(mut config) = derived.current_config.get_untracked()
+            && config.server_managed
+        {
+            updater(&mut config, value);
+            account.managed_provider_configs.update(|items| {
+                if let Some(summary) = items.iter_mut().find(|item| item.id == config.id) {
+                    summary.output_format = config.output_format.clone();
+                    summary.output_compression = config.output_compression;
+                    summary.background = config.background.clone();
+                    summary.moderation = config.moderation.clone();
+                }
+            });
+            return;
+        }
         configs.update(|items| {
             if let Some(config) = items
                 .iter_mut()
@@ -244,9 +277,9 @@ pub(super) fn AppController() -> impl IntoView {
         submit_auth,
         bootstrap_current_user_as_admin,
         change_password,
-        refresh_admin_users,
+        _refresh_admin_users,
         admin_user_action,
-        delete_managed_user,
+        _delete_managed_user,
     ) = build_account_actions(persist_state, persist_ui_state, enqueue_payload_deletes);
     let (
         refresh_cloud_data_stats,
@@ -379,27 +412,84 @@ pub(super) fn AppController() -> impl IntoView {
                 </div>
             </div>
         </Show>
+        <Show when=move || account.auth_user.get().is_some_and(|user| user.must_change_password)>
+            <div class="managed-password-gate" role="dialog" aria-modal="true" aria-labelledby="managed-password-title">
+                <section class="managed-password-card stack">
+                    <div>
+                        <h2 id="managed-password-title">"首次登录，请修改临时密码"</h2>
+                        <p class="status">"完成改密后才会加载管理员分配的服务商配置。此窗口不能跳过。"</p>
+                    </div>
+                    <input
+                        class="text-input"
+                        type="password"
+                        autocomplete="current-password"
+                        placeholder="当前临时密码"
+                        prop:value=move || account.change_old_password.get()
+                        on:input=move |event| {
+                            account.change_old_password.set(event_target_value(&event));
+                            account.password_form_message.set(None);
+                        }
+                    />
+                    <input
+                        class="text-input"
+                        type="password"
+                        autocomplete="new-password"
+                        placeholder="新密码"
+                        prop:value=move || account.change_new_password.get()
+                        on:input=move |event| {
+                            account.change_new_password.set(event_target_value(&event));
+                            account.password_form_message.set(None);
+                        }
+                    />
+                    <input
+                        class="text-input"
+                        type="password"
+                        autocomplete="new-password"
+                        placeholder="确认新密码"
+                        prop:value=move || account.change_new_password_confirm.get()
+                        on:input=move |event| {
+                            account.change_new_password_confirm.set(event_target_value(&event));
+                            account.password_form_message.set(None);
+                        }
+                    />
+                    {move || account.password_form_message.get().map(|message| view! {
+                        <p class="form-error">{message}</p>
+                    })}
+                    <div class="row managed-password-actions">
+                        <button class="button primary" on:click=change_password>"修改密码并继续"</button>
+                        <button class="button ghost" on:click=move |_| {
+                            spawn_local(async move {
+                                let _ = Request::post(&api_url("/api/auth/logout"))
+                                    .credentials(web_sys::RequestCredentials::Include)
+                                    .send()
+                                    .await;
+                                account.auth_user.set(None);
+                                account.managed_provider_configs.set(Vec::new());
+                            });
+                        }>"退出登录"</button>
+                    </div>
+                </section>
+            </div>
+        </Show>
         <div
             class="shell shell-single"
             inert=move || !local_state_status.with(LocalStateLoadStatus::is_ready)
+                || account.auth_user.get().is_some_and(|user| user.must_change_password)
         >
             <TopBar persist_ui_state=persist_ui_state />
             <SettingsOverlay
                 add_config=add_config
-                admin_user_action=admin_user_action
                 bootstrap_current_user_as_admin=bootstrap_current_user_as_admin
                 change_password=change_password
                 check_username_availability=check_username_availability
                 confirm_cloud_clear=confirm_cloud_clear
                 confirm_local_clear=confirm_local_clear
                 delete_config=delete_config
-                delete_managed_user=delete_managed_user
                 export_local_backup=export_local_backup
                 export_session_backup=export_session_backup
                 import_local_backup=import_local_backup
                 import_theme_background=import_theme_background
                 persist_ui_state=persist_ui_state
-                refresh_admin_users=refresh_admin_users
                 refresh_cloud_data_stats=refresh_cloud_data_stats
                 request_delete_theme_background=request_delete_theme_background
                 submit_auth=submit_auth
@@ -458,6 +548,10 @@ pub(super) fn AppController() -> impl IntoView {
 
             <Show when=move || ui.main_view.get() == MainView::TemplatePlaza>
                 <TemplatePlaza persist_state=persist_state persist_ui_state=persist_ui_state />
+            </Show>
+
+            <Show when=move || ui.main_view.get() == MainView::Admin>
+                <AdminConsole />
             </Show>
 
             <ReferenceMenuOverlay delete_asset=delete_asset />

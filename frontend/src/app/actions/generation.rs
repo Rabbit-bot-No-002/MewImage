@@ -496,7 +496,6 @@ pub(crate) fn build_generation_actions(
     let ui = expect_context::<UiState>();
     let persistence = expect_context::<PersistenceState>();
     let derived = expect_context::<AppDerived>();
-    let configs = workspace.configs;
     let tasks = workspace.tasks;
     let threads = workspace.threads;
     let assets = workspace.assets;
@@ -529,6 +528,7 @@ pub(crate) fn build_generation_actions(
     let show_settings = ui.show_settings;
     let gallery_page = ui.gallery_page;
     let current_config = derived.current_config;
+    let provider_configs = derived.provider_configs;
     let auth_user = account.auth_user;
 
     let run_generation = move || {
@@ -558,12 +558,13 @@ pub(crate) fn build_generation_actions(
             status_text.set("CustomHttp 仅限已审批账号".into());
             return;
         }
-        if config
-            .api_key_plaintext
-            .clone()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
+        if !config.server_managed
+            && config
+                .api_key_plaintext
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
         {
             status_text.set("请先在设置中填写 API Key。".into());
             show_settings.set(true);
@@ -1423,7 +1424,7 @@ pub(crate) fn build_generation_actions(
             return;
         };
         let selected_config_id = current_config_id.get_untracked();
-        let Some(config) = configs
+        let Some(config) = provider_configs
             .get_untracked()
             .into_iter()
             .find(|config| config.id == selected_config_id)

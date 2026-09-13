@@ -149,6 +149,24 @@ pub(crate) fn install_app_effects() {
             if event.key() != "Escape" {
                 return;
             }
+            if ui.confirm_popover.get_untracked().is_some() {
+                ui.confirm_popover.set(None);
+                event.prevent_default();
+                event.stop_immediate_propagation();
+                return;
+            }
+            if ui.text_popover.get_untracked().is_some() {
+                ui.text_popover.set(None);
+                event.prevent_default();
+                event.stop_immediate_propagation();
+                return;
+            }
+            if ui.favorite_folder_picker.get_untracked().is_some() {
+                ui.favorite_folder_picker.set(None);
+                event.prevent_default();
+                event.stop_immediate_propagation();
+                return;
+            }
             if ui.image_editor_thread.get_untracked().is_some() {
                 return;
             }
@@ -230,6 +248,88 @@ pub(crate) fn install_app_effects() {
     Effect::new(move |_| {
         let _ = derived.active_favorite_folder_id.get();
         ui.favorite_page.set(1);
+    });
+
+    Effect::new(move |_| {
+        let user = account.auth_user.get();
+        let Some(user) = user.filter(|user| {
+            user.account_kind == mew_image_shared::AccountKind::Managed
+                && user.status == "approved"
+                && !user.must_change_password
+        }) else {
+            account.managed_provider_configs.set(Vec::new());
+            account.managed_provider_error.set(None);
+            account.managed_provider_loading.set(false);
+            let local_configs = workspace.configs.get();
+            if !local_configs
+                .iter()
+                .any(|config| config.id == workspace.current_config_id.get_untracked())
+            {
+                workspace.current_config_id.set(
+                    local_configs
+                        .first()
+                        .map(|config| config.id.clone())
+                        .unwrap_or_default(),
+                );
+            }
+            return;
+        };
+        let expected_user_id = user.id;
+        account.managed_provider_loading.set(true);
+        account.managed_provider_error.set(None);
+        spawn_local(async move {
+            let result = Request::get(&api_url("/api/managed/providers"))
+                .credentials(web_sys::RequestCredentials::Include)
+                .send()
+                .await;
+            if account
+                .auth_user
+                .get_untracked()
+                .as_ref()
+                .map(|current| current.id.as_str())
+                != Some(expected_user_id.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(response) if response.ok() => {
+                    match response
+                        .json::<mew_image_shared::ManagedProviderListResponse>()
+                        .await
+                    {
+                        Ok(payload) => {
+                            let selected_exists = payload.configs.iter().any(|config| {
+                                config.id == workspace.current_config_id.get_untracked()
+                            });
+                            if !selected_exists {
+                                workspace.current_config_id.set(
+                                    payload
+                                        .configs
+                                        .first()
+                                        .map(|config| config.id.clone())
+                                        .unwrap_or_default(),
+                                );
+                            }
+                            account.managed_provider_configs.set(payload.configs);
+                        }
+                        Err(error) => account
+                            .managed_provider_error
+                            .set(Some(format!("托管服务商配置响应解析失败：{error}"))),
+                    }
+                }
+                Ok(response) => {
+                    let message = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "托管服务商配置加载失败。".into());
+                    account.managed_provider_error.set(Some(message));
+                }
+                Err(error) => account
+                    .managed_provider_error
+                    .set(Some(format!("托管服务商配置加载失败：{error}"))),
+            }
+            account.managed_provider_loading.set(false);
+        });
     });
 }
 
@@ -520,6 +620,7 @@ async fn initialize_app_state(
         }
         account.auth_user.set(me.user);
     }
+    account.auth_checked.set(true);
 
     if let Ok(response) = Request::get(&api_url("/api/auth/setup-status"))
         .send()

@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use leptos::{html, prelude::*};
 use mew_image_shared::{
     AdminUserSummary, AppPreferences, CloudDataStatsResponse, ConversationThread,
-    EncryptedApiConfig, ImageAssetRef, LocalTaskRecord, ProviderTemplate, SyncCheckpoint,
-    SyncTombstone, UserSummary,
+    EncryptedApiConfig, ImageAssetRef, LocalTaskRecord, ManagedProviderAdminView,
+    ManagedProviderSummary, ProviderTemplate, SyncCheckpoint, SyncTombstone, UserSummary,
 };
 
 use crate::storage::load_generation_queue_mode;
@@ -29,15 +29,45 @@ pub(crate) enum LocalStateLoadStatus {
 pub(crate) enum MainView {
     Workspace,
     TemplatePlaza,
+    Admin,
 }
 
 impl MainView {
     pub(crate) fn from_location() -> Self {
-        let search = web_sys::window()
-            .and_then(|window| window.location().search().ok())
-            .unwrap_or_default();
-        main_view_from_search(&search)
+        let Some(window) = web_sys::window() else {
+            return Self::Workspace;
+        };
+        let hash = window.location().hash().unwrap_or_default();
+        if hash == "#/admin" || hash.starts_with("#/admin/") {
+            return Self::Admin;
+        }
+        main_view_from_search(&window.location().search().unwrap_or_default())
     }
+}
+
+pub(crate) fn admin_route_from_location() -> (String, Option<String>) {
+    let hash = web_sys::window()
+        .and_then(|window| window.location().hash().ok())
+        .unwrap_or_default();
+    parse_admin_route(&hash)
+}
+
+fn parse_admin_route(hash: &str) -> (String, Option<String>) {
+    let route = hash.trim_start_matches('#');
+    if let Some(query) = route.strip_prefix("/admin/managed?") {
+        let user_id = query.split('&').find_map(|part| part.strip_prefix("user="));
+        return ("managed".into(), user_id.map(str::to_string));
+    }
+    if route.starts_with("/admin/managed") {
+        return ("managed".into(), None);
+    }
+    if route.starts_with("/admin/providers") {
+        return ("providers".into(), None);
+    }
+    if route.starts_with("/admin/audit") {
+        return ("audit".into(), None);
+    }
+    ("users".into(), None)
 }
 
 fn main_view_from_search(search: &str) -> MainView {
@@ -71,6 +101,20 @@ mod tests {
         assert_eq!(
             main_view_from_search("?view=workspace"),
             MainView::Workspace
+        );
+    }
+
+    #[test]
+    fn admin_hash_routes_preserve_section_and_managed_user() {
+        assert_eq!(parse_admin_route("#/admin"), ("users".into(), None));
+        assert_eq!(parse_admin_route("#/admin/audit"), ("audit".into(), None));
+        assert_eq!(
+            parse_admin_route("#/admin/providers"),
+            ("providers".into(), None)
+        );
+        assert_eq!(
+            parse_admin_route("#/admin/managed?user=user-123"),
+            ("managed".into(), Some("user-123".into()))
         );
     }
 }
@@ -191,6 +235,7 @@ pub(crate) struct ComposerState {
 #[derive(Clone, Copy)]
 pub(crate) struct AccountState {
     pub(crate) auth_user: RwSignal<Option<UserSummary>>,
+    pub(crate) auth_checked: RwSignal<bool>,
     pub(crate) login_username: RwSignal<String>,
     pub(crate) login_password: RwSignal<String>,
     pub(crate) auth_mode: RwSignal<String>,
@@ -206,6 +251,12 @@ pub(crate) struct AccountState {
     pub(crate) password_form_message: RwSignal<Option<String>>,
     pub(crate) admin_users: RwSignal<Vec<AdminUserSummary>>,
     pub(crate) loading_admin_users: RwSignal<bool>,
+    /// 托管配置只保存在当前页面内存中，不能写入工作区、同步快照或备份。
+    pub(crate) managed_provider_configs: RwSignal<Vec<ManagedProviderSummary>>,
+    pub(crate) managed_provider_loading: RwSignal<bool>,
+    pub(crate) managed_provider_error: RwSignal<Option<String>>,
+    pub(crate) admin_managed_providers: RwSignal<Vec<ManagedProviderAdminView>>,
+    pub(crate) loading_admin_managed_providers: RwSignal<bool>,
     pub(crate) sync_secret: RwSignal<String>,
     pub(crate) legacy_sync_secret: RwSignal<String>,
     pub(crate) sync_api_keys_enabled: RwSignal<bool>,
@@ -222,6 +273,8 @@ pub(crate) struct UiState {
     pub(crate) reference_selection:
         RwSignal<Option<super::components::reference_selection::ReferenceSelection>>,
     pub(crate) main_view: RwSignal<MainView>,
+    pub(crate) admin_section: RwSignal<String>,
+    pub(crate) admin_user_id: RwSignal<Option<String>>,
     pub(crate) gallery_template_draft_task_id: RwSignal<Option<String>>,
     pub(crate) show_favorites_panel: RwSignal<bool>,
     pub(crate) favorite_folder_picker: RwSignal<Option<FavoriteFolderPickerState>>,
@@ -335,6 +388,7 @@ impl AppState {
         };
         let account = AccountState {
             auth_user: RwSignal::new(None),
+            auth_checked: RwSignal::new(false),
             login_username: RwSignal::new(String::new()),
             login_password: RwSignal::new(String::new()),
             auth_mode: RwSignal::new("login".into()),
@@ -351,6 +405,11 @@ impl AppState {
             password_form_message: RwSignal::new(None),
             admin_users: RwSignal::new(Vec::new()),
             loading_admin_users: RwSignal::new(false),
+            managed_provider_configs: RwSignal::new(Vec::new()),
+            managed_provider_loading: RwSignal::new(false),
+            managed_provider_error: RwSignal::new(None),
+            admin_managed_providers: RwSignal::new(Vec::new()),
+            loading_admin_managed_providers: RwSignal::new(false),
             sync_secret: RwSignal::new(String::new()),
             legacy_sync_secret: RwSignal::new(String::new()),
             sync_api_keys_enabled: RwSignal::new(true),
@@ -364,6 +423,8 @@ impl AppState {
             image_editor_base_id: RwSignal::new(None),
             reference_selection: RwSignal::new(None),
             main_view: RwSignal::new(MainView::from_location()),
+            admin_section: RwSignal::new(admin_route_from_location().0),
+            admin_user_id: RwSignal::new(admin_route_from_location().1),
             gallery_template_draft_task_id: RwSignal::new(None),
             show_favorites_panel: RwSignal::new(false),
             favorite_folder_picker: RwSignal::new(None),

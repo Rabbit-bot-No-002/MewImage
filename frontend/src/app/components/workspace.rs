@@ -1,19 +1,21 @@
 use std::collections::HashSet;
 
+use gloo_net::http::Request;
 use leptos::{prelude::*, task::spawn_local};
 use mew_image_shared::{
-    ConversationContextMode, EncryptedApiConfig, ImageAssetRef, LocalTaskRecord, now_rfc3339,
+    ConversationContextMode, EncryptedApiConfig, ImageAssetRef, LocalTaskRecord,
+    ManagedProviderModelRequest, ManagedProviderSummary, now_rfc3339,
 };
 use web_sys::{DragEvent, FileList, MouseEvent};
 
-use crate::storage::save_generation_queue_mode;
+use crate::{api::api_url, storage::save_generation_queue_mode};
 
 use crate::app::{
     MAX_ACTIVE_GENERATION_TASKS, asset_display_src, background_mode_label, cycle_background_mode,
     derived::AppDerived,
     ensure_asset_display_sources_loaded, is_openai_image_config,
     models::{ConfirmPopoverKind, ConfirmPopoverState},
-    state::{ComposerState, UiState, WorkspaceState},
+    state::{AccountState, ComposerState, UiState, WorkspaceState},
     thread_display_name, transparent_background_enabled,
     utils::resolution::{
         custom_ratio_dimensions, effective_custom_ratio, preset_dimensions, resolve_dimensions,
@@ -141,6 +143,7 @@ pub(crate) fn WorkspaceMain(
 ) -> impl IntoView {
     let workspace = expect_context::<WorkspaceState>();
     let composer = expect_context::<ComposerState>();
+    let account = expect_context::<AccountState>();
     let ui = expect_context::<UiState>();
     let derived = expect_context::<AppDerived>();
     let configs = workspace.configs;
@@ -178,6 +181,7 @@ pub(crate) fn WorkspaceMain(
     let show_resolution_menu = ui.show_resolution_menu;
     let show_config_switcher = ui.show_config_switcher;
     let current_config = derived.current_config;
+    let provider_configs = derived.provider_configs;
     let visible_threads = derived.visible_threads;
     let archived_threads = derived.archived_threads;
     let reference_assets = derived.reference_assets;
@@ -361,7 +365,7 @@ pub(crate) fn WorkspaceMain(
                                 view! {
                                     <div class="config-switcher-menu">
                                         <For
-                                            each=move || configs.get()
+                                            each=move || provider_configs.get()
                                             key=|config| config.id.clone()
                                             children=move |config| {
                                                 let config_name = config.name.clone();
@@ -392,19 +396,56 @@ pub(crate) fn WorkspaceMain(
                                                                         class="config-switcher-item"
                                                                         class:is-active=move || {
                                                                             current_config_id.get() == active_config_id
-                                                                                && configs.with(|items| items.iter().any(|config| {
+                                                                                && provider_configs.with(|items| items.iter().any(|config| {
                                                                                     config.id == active_config_id && config.model == active_model
                                                                                 }))
                                                                         }
                                                                         title=item_title
                                                                         aria-pressed=move || {
                                                                             current_config_id.get() == pressed_config_id
-                                                                                && configs.with(|items| items.iter().any(|config| {
+                                                                                && provider_configs.with(|items| items.iter().any(|config| {
                                                                                     config.id == pressed_config_id && config.model == pressed_model
                                                                                 }))
                                                                         }
                                                                         on:click=move |_| {
                                                                             let config_changed = current_config_id.get_untracked() != config_id;
+                                                                            if config.server_managed {
+                                                                                let request_config_id = config_id.clone();
+                                                                                let request_model = selected_model.clone();
+                                                                                spawn_local(async move {
+                                                                                    let builder = Request::post(&api_url(&format!(
+                                                                                        "/api/managed/providers/{request_config_id}/model"
+                                                                                    )))
+                                                                                    .credentials(web_sys::RequestCredentials::Include)
+                                                                                    .json(&ManagedProviderModelRequest { model: request_model });
+                                                                                    let Ok(builder) = builder else {
+                                                                                        status_text.set("托管模型切换请求创建失败。".into());
+                                                                                        return;
+                                                                                    };
+                                                                                    match builder.send().await {
+                                                                                        Ok(response) if response.ok() => match response.json::<ManagedProviderSummary>().await {
+                                                                                            Ok(mut updated) => {
+                                                                                                account.managed_provider_configs.update(|items| {
+                                                                                                    if let Some(item) = items.iter_mut().find(|item| item.id == updated.id) {
+                                                                                                        // 工作台输出选项是本次会话状态，切换模型不应被服务端默认值覆盖。
+                                                                                                        updated.output_format = item.output_format.clone();
+                                                                                                        updated.output_compression = item.output_compression;
+                                                                                                        updated.background = item.background.clone();
+                                                                                                        updated.moderation = item.moderation.clone();
+                                                                                                        *item = updated;
+                                                                                                    }
+                                                                                                });
+                                                                                                current_config_id.set(request_config_id);
+                                                                                            }
+                                                                                            Err(error) => status_text.set(format!("托管模型切换响应解析失败：{error}")),
+                                                                                        },
+                                                                                        Ok(response) => status_text.set(response.text().await.unwrap_or_else(|_| "托管模型切换失败。".into())),
+                                                                                        Err(error) => status_text.set(format!("托管模型切换失败：{error}")),
+                                                                                    }
+                                                                                });
+                                                                                show_config_switcher.set(false);
+                                                                                return;
+                                                                            }
                                                                             let changed = configs.try_update(|items| {
                                                                                 select_config_model(
                                                                                     items,
@@ -431,7 +472,7 @@ pub(crate) fn WorkspaceMain(
                                                                     >
                                                                         <span class="config-switcher-model">{model}</span>
                                                                         {move || if current_config_id.get() == checked_config_id
-                                                                            && configs.with(|items| items.iter().any(|config| {
+                                                                            && provider_configs.with(|items| items.iter().any(|config| {
                                                                                 config.id == checked_config_id && config.model == checked_model
                                                                             }))
                                                                         {
@@ -791,17 +832,10 @@ pub(crate) fn WorkspaceMain(
                                             .is_some_and(|config| transparent_background_enabled(&config))
                                         title="依次切换关闭、API 原生透明和浏览器本地去背景；透明输出仅支持 PNG 或 WebP"
                                         on:click=move |_| {
-                                            configs.update(|items| {
-                                                let Some(config) = items
-                                                    .iter_mut()
-                                                    .find(|config| config.id == current_config_id.get_untracked())
-                                                else {
-                                                    return;
-                                                };
-                                                cycle_background_mode(config);
-                                                config.updated_at = now_rfc3339();
-                                            });
-                                            persist_ui_state();
+                                            update_current_config(
+                                                |config, _| cycle_background_mode(config),
+                                                String::new(),
+                                            );
                                         }
                                     >
                                         <MaterialSymbolIcon name="opacity" filled=false />
@@ -817,13 +851,10 @@ pub(crate) fn WorkspaceMain(
                                             class="stepper-button"
                                             on:click=move |_| {
                                                 let value = current_config.get_untracked().and_then(|config| config.output_compression).unwrap_or(100).saturating_sub(1);
-                                                configs.update(|items| {
-                                                    if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                                                        config.output_compression = Some(value);
-                                                        config.updated_at = now_rfc3339();
-                                                    }
-                                                });
-                                                persist_ui_state();
+                                                update_current_config(
+                                                    |config, value| config.output_compression = value.parse().ok(),
+                                                    value.to_string(),
+                                                );
                                             }
                                         >"-"</button>
                                         <input
@@ -834,13 +865,10 @@ pub(crate) fn WorkspaceMain(
                                             prop:value=move || current_config.get().and_then(|config| config.output_compression).unwrap_or(100).to_string()
                                             on:input=move |ev| {
                                                 let value = event_target_value(&ev).parse::<u8>().unwrap_or(100).clamp(0, 100);
-                                                configs.update(|items| {
-                                                    if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                                                        config.output_compression = Some(value);
-                                                        config.updated_at = now_rfc3339();
-                                                    }
-                                                });
-                                                persist_ui_state();
+                                                update_current_config(
+                                                    |config, value| config.output_compression = value.parse().ok(),
+                                                    value.to_string(),
+                                                );
                                             }
                                         />
                                         <button
@@ -848,13 +876,10 @@ pub(crate) fn WorkspaceMain(
                                             class="stepper-button"
                                             on:click=move |_| {
                                                 let value = current_config.get_untracked().and_then(|config| config.output_compression).unwrap_or(100).saturating_add(1).min(100);
-                                                configs.update(|items| {
-                                                    if let Some(config) = items.iter_mut().find(|config| config.id == current_config_id.get_untracked()) {
-                                                        config.output_compression = Some(value);
-                                                        config.updated_at = now_rfc3339();
-                                                    }
-                                                });
-                                                persist_ui_state();
+                                                update_current_config(
+                                                    |config, value| config.output_compression = value.parse().ok(),
+                                                    value.to_string(),
+                                                );
                                             }
                                         >"+"</button>
                                     </div>
@@ -868,6 +893,7 @@ pub(crate) fn WorkspaceMain(
                                     </select>
                                     <select
                                         class="select-input compact-select codex-compat-select"
+                                        disabled=move || current_config.get().is_some_and(|config| config.server_managed)
                                         prop:value=move || {
                                             current_config
                                                 .get()

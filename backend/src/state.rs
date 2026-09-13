@@ -11,6 +11,26 @@ use std::{
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
+#[derive(Clone)]
+pub struct ManagedProviderKey([u8; 32]);
+
+impl std::fmt::Debug for ManagedProviderKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManagedProviderKey([REDACTED])")
+    }
+}
+
+impl ManagedProviderKey {
+    #[cfg(test)]
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 const GUEST_LIMIT_STATE_TTL: Duration = Duration::from_secs(20 * 60);
 
 pub enum ProxyGenerationJobState {
@@ -61,6 +81,7 @@ pub struct AppConfig {
     pub trust_proxy_headers: bool,
     pub trusted_proxy_cidrs: Vec<IpNet>,
     pub auth_secret: String,
+    pub managed_provider_key: Option<ManagedProviderKey>,
     pub register_device_limit: u32,
     pub register_ip_limit: u32,
     pub register_window_seconds: u64,
@@ -110,6 +131,14 @@ impl AppConfig {
             .filter(|value| !value.trim().is_empty())
             .or_else(|| admin_setup_token.clone())
             .unwrap_or_else(|| format!("{}{}", new_id(), new_id()));
+        let managed_provider_key = env_value(
+            "MEW_MANAGED_PROVIDER_SECRET",
+            "MEW_IMAGE_MANAGED_PROVIDER_SECRET",
+        )
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| parse_managed_provider_key(&value))
+        .transpose()?;
         Ok(Self {
             listen_addr: env_value("MEW_LISTEN", "MEW_IMAGE_LISTEN")
                 .unwrap_or_else(|_| "127.0.0.1:3000".into()),
@@ -131,6 +160,7 @@ impl AppConfig {
                 "MEW_IMAGE_TRUSTED_PROXY_CIDRS",
             )?,
             auth_secret,
+            managed_provider_key,
             register_device_limit: parse_u32_env(
                 "MEW_REGISTER_DEVICE_LIMIT",
                 "MEW_IMAGE_REGISTER_DEVICE_LIMIT",
@@ -319,6 +349,21 @@ impl AppConfig {
             ),
         })
     }
+}
+
+fn parse_managed_provider_key(value: &str) -> anyhow::Result<ManagedProviderKey> {
+    let value = value.trim();
+    anyhow::ensure!(
+        value.len() == 64,
+        "MEW_MANAGED_PROVIDER_SECRET 必须是 64 位十六进制值，可使用 `openssl rand -hex 32` 生成。"
+    );
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair)?;
+        bytes[index] = u8::from_str_radix(pair, 16)
+            .map_err(|_| anyhow::anyhow!("MEW_MANAGED_PROVIDER_SECRET 只能包含十六进制字符。"))?;
+    }
+    Ok(ManagedProviderKey(bytes))
 }
 
 #[derive(Clone)]

@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use mew_image_shared::CloudDataClearScope;
+use mew_image_shared::{AccountKind, CloudDataClearScope};
 use web_sys::{Event, FileList, MouseEvent};
 
 use crate::app::{
@@ -18,20 +18,17 @@ use crate::app::{
 #[component]
 pub(crate) fn SettingsOverlay(
     add_config: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
-    admin_user_action: impl Fn(&'static str, String) + Copy + Send + Sync + 'static,
     bootstrap_current_user_as_admin: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     change_password: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     check_username_availability: impl Fn() + Copy + Send + Sync + 'static,
     confirm_cloud_clear: impl Fn(CloudDataClearScope, MouseEvent) + Copy + Send + Sync + 'static,
     confirm_local_clear: impl Fn(LocalDataClearScope, MouseEvent) + Copy + Send + Sync + 'static,
     delete_config: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
-    delete_managed_user: impl Fn(String, f64, f64) + Copy + Send + Sync + 'static,
     export_local_backup: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     export_session_backup: impl Fn(String) + Copy + Send + Sync + 'static,
     import_local_backup: impl Fn(Event) + Copy + Send + Sync + 'static,
     import_theme_background: impl Fn(FileList) + Copy + Send + Sync + 'static,
     persist_ui_state: impl Fn() + Copy + Send + Sync + 'static,
-    refresh_admin_users: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     refresh_cloud_data_stats: impl Fn() + Copy + Send + Sync + 'static,
     request_delete_theme_background: impl Fn(MouseEvent) + Copy + Send + Sync + 'static,
     submit_auth: impl Fn(&'static str) + Copy + Send + Sync + 'static,
@@ -66,8 +63,6 @@ pub(crate) fn SettingsOverlay(
     let change_new_password = account.change_new_password;
     let change_new_password_confirm = account.change_new_password_confirm;
     let password_form_message = account.password_form_message;
-    let admin_users = account.admin_users;
-    let loading_admin_users = account.loading_admin_users;
     let sync_secret = account.sync_secret;
     let sync_api_keys_enabled = account.sync_api_keys_enabled;
     let sync_unlock_password = account.sync_unlock_password;
@@ -83,6 +78,7 @@ pub(crate) fn SettingsOverlay(
     let cloud_data_stats = ui.cloud_data_stats;
     let backup_file_input = ui.backup_file_input;
     let current_config = derived.current_config;
+    let provider_configs = derived.provider_configs;
 
     view! {
             {move || if show_settings_menu.get() {
@@ -125,24 +121,6 @@ pub(crate) fn SettingsOverlay(
                                                 >
                                                     <MaterialSymbolIcon name="lock_reset" filled=false />
                                                     <span>"密码更改"</span>
-                                                </button>
-                                            }.into_any()
-                                        } else {
-                                            ().into_any()
-                                        }}
-                                        {move || if auth_user
-                                            .get()
-                                            .map(|user| user.role == "admin")
-                                            .unwrap_or(false)
-                                        {
-                                            view! {
-                                                <button
-                                                    class="settings-nav-button"
-                                                    class:is-active=move || settings_tab.get() == "admin"
-                                                    on:click=move |_| settings_tab.set("admin".into())
-                                                >
-                                                    <MaterialSymbolIcon name="admin_panel_settings" filled=false />
-                                                    <span>"用户管理"</span>
                                                 </button>
                                             }.into_any()
                                         } else {
@@ -327,7 +305,10 @@ pub(crate) fn SettingsOverlay(
                                                     } else {
                                                         ().into_any()
                                                     }}
-                                                    {move || if auth_user.get().is_some() {
+                                                    {move || if auth_user
+                                                        .get()
+                                                        .is_some_and(|user| user.account_kind == AccountKind::Standard)
+                                                    {
                                                         view! {
                                                             <div class="sync-key-settings">
                                                                 <label class="sync-key-toggle-row">
@@ -456,82 +437,6 @@ pub(crate) fn SettingsOverlay(
                                                         <div class="admin-empty">"登录后才能修改密码。"</div>
                                                     }.into_any()
                                                 }}
-                                            </section>
-                                        }.into_any(),
-                                        "admin" => view! {
-                                            <section class="stack admin-panel">
-                                                <div class="row admin-panel-header">
-                                                    <h2>"用户管理"</h2>
-                                                    <button class="button ghost" on:click=refresh_admin_users disabled=move || loading_admin_users.get()>
-                                                        {move || if loading_admin_users.get() { "刷新中…" } else { "刷新列表" }}
-                                                    </button>
-                                                </div>
-                                                <div class="admin-user-list">
-                                                    {move || {
-                                                        let rows = admin_users.get();
-                                                        if rows.is_empty() {
-                                                            return vec![view! {
-                                                                <div class="admin-empty">
-                                                                    "还没有加载用户列表。点击“刷新列表”查看注册申请。"
-                                                                </div>
-                                                            }.into_any()];
-                                                        }
-                                                        rows.into_iter().map(|user| {
-                                                            let approve_id = user.id.clone();
-                                                            let disable_id = user.id.clone();
-                                                            let restore_id = user.id.clone();
-                                                            let delete_id = user.id.clone();
-                                                            let can_delete = user.role != "admin";
-                                                            view! {
-                                                                <article class="admin-user-row">
-                                                                    <div class="admin-user-main">
-                                                                        <strong>{user.username}</strong>
-                                                                        <span class="muted">{format!("{} · {}", user.role, user.status)}</span>
-                                                                    </div>
-                                                                    <span class="tag">{format!("服务器图片资源 {} 个", user.image_count)}</span>
-                                                                    <span class="muted admin-user-date">{format!("注册 {}", user.created_at)}</span>
-                                                                    <div class="row admin-user-actions">
-                                                                        {if user.status == "pending" {
-                                                                            view! {
-                                                                                <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/approve", approve_id.clone())>
-                                                                                    "批准"
-                                                                                </button>
-                                                                            }.into_any()
-                                                                        } else if user.status == "disabled" {
-                                                                            view! {
-                                                                                <button class="button secondary" on:click=move |_| admin_user_action("/api/admin/users/restore", restore_id.clone())>
-                                                                                    "恢复"
-                                                                                </button>
-                                                                            }.into_any()
-                                                                        } else {
-                                                                            view! {
-                                                                                <button class="button ghost danger" on:click=move |_| admin_user_action("/api/admin/users/disable", disable_id.clone())>
-                                                                                    "禁用"
-                                                                                </button>
-                                                                            }.into_any()
-                                                                        }}
-                                                                        {if can_delete {
-                                                                            view! {
-                                                                                <button
-                                                                                    class="button ghost danger"
-                                                                                    on:click=move |event: MouseEvent| delete_managed_user(
-                                                                                        delete_id.clone(),
-                                                                                        event.client_x() as f64,
-                                                                                        event.client_y() as f64,
-                                                                                    )
-                                                                                >
-                                                                                    "删除"
-                                                                                </button>
-                                                                            }.into_any()
-                                                                        } else {
-                                                                            ().into_any()
-                                                                        }}
-                                                                    </div>
-                                                                </article>
-                                                            }.into_any()
-                                                        }).collect::<Vec<_>>()
-                                                    }}
-                                                </div>
                                             </section>
                                         }.into_any(),
                                         "data" => view! {
@@ -730,6 +635,41 @@ pub(crate) fn SettingsOverlay(
                                                         <span class="tag">"Rust · Leptos · Axum · SQLite"</span>
                                                     </div>
                                                 </div>
+                                            </section>
+                                        }.into_any(),
+                                        _ if auth_user.get().is_some_and(|user| user.account_kind == AccountKind::Managed) => view! {
+                                            <section class="stack managed-provider-readonly">
+                                                <div class="row">
+                                                    <h2>"托管服务商配置"</h2>
+                                                    <span class="tag">"由管理员维护 · 强制代理"</span>
+                                                </div>
+                                                <p class="status">
+                                                    "上游地址、API Key、访问方式和协议模板仅保存在服务器。你可以在工作台切换获配配置与模型，但浏览器不会接收或保存连接凭据。"
+                                                </p>
+                                                {move || account.managed_provider_error.get().map(|message| view! {
+                                                    <p class="form-hint error">{message}</p>
+                                                })}
+                                                <div class="stack">
+                                                    <For
+                                                        each=move || provider_configs.get()
+                                                        key=|config| config.id.clone()
+                                                        children=move |config| view! {
+                                                            <article class="data-action-card">
+                                                                <div>
+                                                                    <h3>{config.name}</h3>
+                                                                    <p class="status compact-help">{format!("当前模型：{} · 可用模型 {} 个", config.model, config.available_models.len())}</p>
+                                                                </div>
+                                                                <span class="tag">"可用"</span>
+                                                            </article>
+                                                        }
+                                                    />
+                                                </div>
+                                                <Show when=move || account.managed_provider_loading.get()>
+                                                    <p class="status">"正在加载管理员分配的配置…"</p>
+                                                </Show>
+                                                <Show when=move || !account.managed_provider_loading.get() && provider_configs.get().is_empty()>
+                                                    <p class="admin-empty">"当前没有可用配置，请联系管理员添加或启用服务商配置。"</p>
+                                                </Show>
                                             </section>
                                         }.into_any(),
                                         _ => view! {

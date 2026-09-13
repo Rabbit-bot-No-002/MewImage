@@ -8,7 +8,7 @@ use mew_image_shared::{
 
 use super::{
     FAVORITE_PAGE_SIZE, GALLERY_PAGE_SIZE,
-    state::{ComposerState, UiState, WorkspaceState},
+    state::{AccountState, ComposerState, UiState, WorkspaceState},
     utils::workspace::{
         GalleryItem, gallery_items, normalized_favorite_folders, paged_items,
         selected_reference_assets, thread_reference_assets, visible_thread_items,
@@ -17,6 +17,7 @@ use super::{
 
 #[derive(Clone, Copy)]
 pub(crate) struct AppDerived {
+    pub(crate) provider_configs: Memo<Vec<EncryptedApiConfig>>,
     pub(crate) current_config: Memo<Option<EncryptedApiConfig>>,
     pub(crate) visible_threads: Memo<Vec<ConversationThread>>,
     pub(crate) archived_threads: Memo<Vec<ConversationThread>>,
@@ -34,10 +35,29 @@ pub(crate) struct AppDerived {
 }
 
 impl AppDerived {
-    pub(crate) fn new(workspace: WorkspaceState, composer: ComposerState, ui: UiState) -> Self {
+    pub(crate) fn new(
+        workspace: WorkspaceState,
+        composer: ComposerState,
+        account: AccountState,
+        ui: UiState,
+    ) -> Self {
+        let provider_configs = Memo::new(move |_| {
+            if account
+                .auth_user
+                .get()
+                .is_some_and(|user| user.account_kind == mew_image_shared::AccountKind::Managed)
+            {
+                return account
+                    .managed_provider_configs
+                    .get()
+                    .iter()
+                    .map(crate::providers::managed_summary_runtime_config)
+                    .collect();
+            }
+            workspace.configs.get()
+        });
         let current_config = Memo::new(move |_| {
-            workspace
-                .configs
+            provider_configs
                 .get()
                 .into_iter()
                 .find(|config| config.id == workspace.current_config_id.get())
@@ -137,7 +157,7 @@ impl AppDerived {
         });
         let gallery_entries = Memo::new(move |_| {
             let visible = visible_tasks.get();
-            let configs = workspace.configs.get();
+            let configs = provider_configs.get();
             workspace
                 .assets
                 .with(|assets| gallery_items(&visible, &configs, assets))
@@ -177,7 +197,7 @@ impl AppDerived {
                     .collect::<Vec<_>>()
             });
             favorite_tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-            let configs = workspace.configs.get();
+            let configs = provider_configs.get();
             workspace
                 .assets
                 .with(|assets| gallery_items(&favorite_tasks, &configs, assets))
@@ -214,6 +234,7 @@ impl AppDerived {
         });
 
         Self {
+            provider_configs,
             current_config,
             visible_threads,
             archived_threads,

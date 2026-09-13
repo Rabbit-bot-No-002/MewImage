@@ -1,3 +1,4 @@
+pub(crate) mod admin_console;
 pub(crate) mod appearance;
 pub(crate) mod asset_drop_zone;
 pub(crate) mod common;
@@ -5,6 +6,7 @@ pub(crate) mod config_editor;
 pub(crate) mod favorites;
 pub(crate) mod gallery;
 pub(crate) mod image_editor;
+pub(crate) mod managed_accounts;
 pub(crate) mod overlays;
 pub(crate) mod popovers;
 pub(crate) mod preview;

@@ -1,4 +1,5 @@
 use super::super::*;
+use mew_image_shared::AccountKind;
 
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_account_actions(
@@ -74,7 +75,7 @@ pub(crate) fn build_account_actions(
         }
         syncing.set(true);
         sync_status_text.set(Some("正在整理本地同步数据……".into()));
-        let state = snapshot_local_state(
+        let mut state = snapshot_local_state(
             configs,
             tasks,
             threads,
@@ -83,7 +84,13 @@ pub(crate) fn build_account_actions(
             checkpoint,
             tombstones,
         );
-        let sync_api_keys = sync_api_keys_enabled.get_untracked();
+        let managed_account = user.account_kind == AccountKind::Managed;
+        let local_config_backup = managed_account.then(|| state.configs.clone());
+        if managed_account {
+            // 托管账号只同步工作数据；本机普通配置既不上云，也不能被空响应覆盖。
+            state.configs.clear();
+        }
+        let sync_api_keys = !managed_account && sync_api_keys_enabled.get_untracked();
         let has_api_key_material = state
             .configs
             .iter()
@@ -298,6 +305,9 @@ pub(crate) fn build_account_actions(
                             },
                         );
                         let mut hydrated = hydrated;
+                        if let Some(local_configs) = local_config_backup.clone() {
+                            hydrated.configs = local_configs;
+                        }
                         reconcile_task_integrity(&mut hydrated.tasks, &hydrated.assets, true);
                         let needs_legacy_key_migration = sync_api_keys
                             && hydrated.configs.iter().any(|config| {
@@ -402,10 +412,11 @@ pub(crate) fn build_account_actions(
                             conversation_rebase_requested_signal.set(false);
                         }
                         let current_config_id_value = current_config_id_signal.get_untracked();
-                        if !hydrated
-                            .configs
-                            .iter()
-                            .any(|config| config.id == current_config_id_value)
+                        if !managed_account
+                            && !hydrated
+                                .configs
+                                .iter()
+                                .any(|config| config.id == current_config_id_value)
                         {
                             current_config_id_signal.set(
                                 hydrated
@@ -672,7 +683,8 @@ pub(crate) fn build_account_actions(
             match builder.send().await {
                 Ok(response) if response.ok() => match response.json::<AuthResponse>().await {
                     Ok(auth) => {
-                        let enabled = load_api_key_sync_enabled(&auth.user.id);
+                        let enabled = auth.user.account_kind != AccountKind::Managed
+                            && load_api_key_sync_enabled(&auth.user.id);
                         sync_api_keys_enabled.set(enabled);
                         if enabled {
                             let trusted_secret =
@@ -789,6 +801,7 @@ pub(crate) fn build_account_actions(
         let change_old_password = change_old_password;
         let change_new_password = change_new_password;
         let change_new_password_confirm = change_new_password_confirm;
+        let auth_user = auth_user;
         let previous_sync_secret = sync_secret.get_untracked();
         spawn_local(async move {
             let request = Request::post(&api_url("/api/auth/change-password"))
@@ -819,6 +832,15 @@ pub(crate) fn build_account_actions(
                     change_old_password.set(String::new());
                     change_new_password.set(String::new());
                     change_new_password_confirm.set(String::new());
+                    if let Ok(response) = Request::get(&api_url("/api/auth/me"))
+                        .credentials(web_sys::RequestCredentials::Include)
+                        .send()
+                        .await
+                        && response.ok()
+                        && let Ok(me) = response.json::<MeResponse>().await
+                    {
+                        auth_user.set(me.user);
+                    }
                     status_text.set("密码已更新，下次登录请使用新密码。".into());
                 }
                 Ok(response) => {

@@ -62,6 +62,7 @@ use actions::data::build_data_actions;
 use actions::generation::build_generation_actions;
 use actions::preview::build_preview_actions;
 use actions::workspace::build_workspace_actions;
+use components::admin_console::AdminConsole;
 use components::appearance::ThemeBackdrop;
 use components::favorites::FavoritesOverlay;
 use components::gallery::GallerySidebar;

@@ -342,6 +342,10 @@ pub struct EncryptedApiConfig {
     pub responses_model: Option<String>,
     pub access_mode: ProviderAccessMode,
     pub known_requires_proxy: bool,
+    /// 仅用于前端运行时标识服务端托管配置；此类配置不得进入本地持久化或同步。
+    /// 仅供前端当前登录会话标记服务端托管配置，不参与任何持久化格式。
+    #[serde(default, skip_serializing)]
+    pub server_managed: bool,
     pub output_format: Option<String>,
     pub output_compression: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1419,6 +1423,23 @@ pub struct GenerateViaProxyRequest {
     pub request: GenerationRequest,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ManagedGenerationOptions {
+    pub output_format: Option<String>,
+    pub output_compression: Option<u8>,
+    pub background: Option<String>,
+    pub moderation: Option<String>,
+}
+
+/// 托管账号的生成载荷不包含任何上游连接信息，后端只按配置 ID 解析服务商。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManagedGenerateViaProxyRequest {
+    pub managed_config_id: String,
+    pub request: GenerationRequest,
+    #[serde(default)]
+    pub options: ManagedGenerationOptions,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProxyGenerationJobAccepted {
     pub job_id: String,
@@ -1886,6 +1907,126 @@ pub struct ProviderTemplateImportRequest {
     pub template: ProviderTemplate,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    #[default]
+    Standard,
+    Managed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderConfigInput {
+    pub name: String,
+    pub template: ProviderTemplate,
+    pub endpoint_mode: ProviderEndpointMode,
+    pub base_url: String,
+    pub available_models: Vec<String>,
+    pub current_model: String,
+    pub responses_model: Option<String>,
+    pub output_format: Option<String>,
+    pub output_compression: Option<u8>,
+    pub background: Option<String>,
+    pub moderation: Option<String>,
+    pub prompt_guard_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderConfigWriteRequest {
+    pub config: ManagedProviderConfigInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedAccountCreateRequest {
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_provider: Option<ManagedProviderConfigWriteRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_template_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedAccountCreateResponse {
+    pub user: AdminUserSummary,
+    pub temporary_password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedPasswordResetResponse {
+    pub user_id: String,
+    pub temporary_password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub provider_kind: ProviderKind,
+    pub endpoint_mode: ProviderEndpointMode,
+    pub available_models: Vec<String>,
+    pub current_model: String,
+    pub responses_model: Option<String>,
+    pub output_format: Option<String>,
+    pub output_compression: Option<u8>,
+    pub background: Option<String>,
+    pub moderation: Option<String>,
+    pub enabled: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderAdminView {
+    pub user_id: String,
+    pub username: String,
+    pub summary: ManagedProviderSummary,
+    pub base_url: String,
+    pub api_key_hint: String,
+    pub responses_model: Option<String>,
+    pub prompt_guard_enabled: bool,
+    pub template: ProviderTemplate,
+    pub updated_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_template_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderListResponse {
+    pub configs: Vec<ManagedProviderSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderAdminListResponse {
+    pub configs: Vec<ManagedProviderAdminView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderModelRequest {
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderEnabledRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderBulkCredentialsRequest {
+    pub config_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderMutationResponse {
+    pub updated_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthRequest {
     pub username: String,
@@ -1940,11 +2081,131 @@ pub struct AdminUserSummary {
     pub approved_at: Option<String>,
     pub approved_by: Option<String>,
     pub last_login_at: Option<String>,
+    #[serde(default)]
+    pub last_active_at: Option<String>,
+    #[serde(default)]
+    pub account_kind: AccountKind,
+    #[serde(default)]
+    pub must_change_password: bool,
+    #[serde(default)]
+    pub managed_provider_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminUsersResponse {
     pub users: Vec<AdminUserSummary>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default = "default_admin_page")]
+    pub page: usize,
+    #[serde(default = "default_admin_limit")]
+    pub limit: usize,
+}
+
+fn default_admin_page() -> usize {
+    1
+}
+
+fn default_admin_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminUserBatchAction {
+    Approve,
+    Disable,
+    Restore,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUserBatchRequest {
+    pub action: AdminUserBatchAction,
+    pub ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AdminBatchResponse {
+    pub updated_count: usize,
+    #[serde(default)]
+    pub failed: Vec<AdminBatchFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminBatchFailure {
+    pub id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUserExportRequest {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderTemplateWriteRequest {
+    pub config: ManagedProviderConfigInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderTemplateAdminView {
+    pub id: String,
+    pub revision: u64,
+    pub enabled: bool,
+    pub assigned_count: usize,
+    pub outdated_count: usize,
+    pub config: ManagedProviderConfigInput,
+    pub api_key_hint: String,
+    pub updated_at: String,
+    pub updated_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ManagedProviderTemplateListResponse {
+    pub templates: Vec<ManagedProviderTemplateAdminView>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub page: usize,
+    #[serde(default)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedProviderTemplateTargetsRequest {
+    pub user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ManagedProviderTemplateMutationResponse {
+    pub affected_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminAuditEntry {
+    pub id: String,
+    pub operation_id: String,
+    pub actor_user_id: String,
+    pub actor_username: String,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub target_name: String,
+    pub summary: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AdminAuditResponse {
+    pub entries: Vec<AdminAuditEntry>,
+    pub total: usize,
+    pub page: usize,
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1955,6 +2216,10 @@ pub struct UserSummary {
     pub status: String,
     pub image_count: usize,
     pub created_at: String,
+    #[serde(default)]
+    pub account_kind: AccountKind,
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3090,6 +3355,7 @@ mod tests {
             responses_model: None,
             access_mode: ProviderAccessMode::Smart,
             known_requires_proxy: true,
+            server_managed: true,
             output_format: Some("png".into()),
             output_compression: Some(100),
             background: None,
@@ -3102,8 +3368,10 @@ mod tests {
             updated_at: now_rfc3339(),
         };
         let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized.get("server_managed").is_none());
         assert!(serialized.get("background").is_none());
         config = serde_json::from_value(serialized).unwrap();
+        assert!(!config.server_managed);
         normalize_api_config(&mut config);
         assert_eq!(config.provider_kind, ProviderKind::OpenAiImage);
         assert_eq!(config.endpoint_mode, ProviderEndpointMode::ResponsesApi);
@@ -3173,6 +3441,7 @@ mod tests {
             responses_model: None,
             access_mode: ProviderAccessMode::Smart,
             known_requires_proxy: true,
+            server_managed: false,
             output_format: Some("png".into()),
             output_compression: Some(100),
             background: None,
