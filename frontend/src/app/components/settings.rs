@@ -619,7 +619,7 @@ pub(crate) fn SettingsOverlay(
                                                     <div class="stack">
                                                         <div class="row settings-about-title">
                                                             <h2>"关于 MewImage"</h2>
-                                                            <span class="tag settings-version-tag">"v1.1.0"</span>
+                                                            <span class="tag settings-version-tag">"v1.1.1"</span>
                                                             <a
                                                                 class="button ghost icon-button settings-github-button"
                                                                 href="https://github.com/Rabbit-bot-No-002/MewImage"
