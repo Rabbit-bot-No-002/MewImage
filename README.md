@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="favicon/og-image-dark.png">
+    <source media="(prefers-color-scheme: dark)" srcset="documentation/images/og-image-dark.png">
     <img src="favicon/og-image.png" alt="喵图 MewImage" width="640">
   </picture>
 </p>

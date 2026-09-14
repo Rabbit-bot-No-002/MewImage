@@ -39,6 +39,8 @@ MEW_ALLOWED_ORIGINS=https://你的正式域名
 >
 > 它参与设备与 IP 摘要和认证保护。中途更换会让已签发的会话与设备摘要失效。
 
+上了 HTTPS 之后再补这几项：`MEW_SESSION_SECURE=true`、`MEW_TRUST_PROXY_HEADERS=true`（配合 `MEW_TRUSTED_PROXY_CIDRS`），以及 `MEW_PUBLIC_BASE_URL=https://你的正式域名`——最后这个用来生成分享预览图的绝对地址，留空时页面照常访问，但社交平台可能抓不到预览图。
+
 ## 3. 建数据目录并启动
 
 容器以固定的非 root 用户 `10001:10001` 运行。**先自己创建 `./data`**，否则 Docker 自动创建的目录会属于 `root`，容器启动后日志会报 `Permission denied (os error 13)`。
@@ -66,7 +68,15 @@ docker compose pull && docker compose up -d   # 镜像也更新过时
 
 ## 4. 创建第一个管理员
 
-打开站点后注册第一个账号，在折叠的「管理员初始化」入口填入 `MEW_ADMIN_TOKEN`。第一个管理员建立成功后，普通用户的注册会进入待审批状态，需要管理员在管理后台批准。
+打开站点，走 **设置 → 账号与同步 → 注册 → 使用管理员初始化口令**，填入 `.env` 里的 `MEW_ADMIN_TOKEN`。密码至少 10 位，包含大小写字母、数字和符号。这个账号直接是已审批的管理员；之后普通用户注册会进入待审批状态，需要管理员在管理后台批准。
+
+如果已经注册过普通账号、但库里还没有管理员，可以先登录该账号，再点「将当前账号初始化为管理员」。想确认当前状态：
+
+```bash
+curl http://127.0.0.1:3188/api/auth/setup-status
+```
+
+`admin_exists` 为 `true` 表示库里已经有管理员，这条初始化路径就不再允许创建第二个。
 
 ## 默认端口与暴露范围
 
