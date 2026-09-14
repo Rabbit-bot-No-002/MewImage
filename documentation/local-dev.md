@@ -11,6 +11,8 @@ rustup target add wasm32-unknown-unknown
 cargo install trunk --version 0.21.14 --locked   # 版本和 Dockerfile 保持一致
 ```
 
+Linux 上还需要常见的构建工具链（`gcc`、`pkg-config`、`libssl` 开发包等）和 `openssl` 命令，用发行版的包管理器装即可。前后端一起编大概要几百个依赖包。
+
 ## 启动
 
 ```bash
@@ -21,7 +23,23 @@ cd frontend && trunk serve --open  # 前端，8080
 
 ## 初始化第一个管理员
 
-后端第一次跑起来时数据库是空的，需要自己造管理员。`MEW_AUTH_SECRET` 和 `MEW_ADMIN_TOKEN` 都要用随机值，Linux/macOS 用 `openssl rand`，Windows 下这一对命令等价：
+后端第一次跑起来时数据库是空的，需要自己造管理员。`MEW_AUTH_SECRET` 和 `MEW_ADMIN_TOKEN` 都要用随机值。
+
+**Linux / macOS（bash、zsh）**
+
+```bash
+export MEW_AUTH_SECRET="$(openssl rand -hex 32)"
+export MEW_ADMIN_TOKEN="$(openssl rand -base64 32)"
+export MEW_ALLOW_ADMIN_SETUP=true
+
+# 需要访问明文 HTTP 上游时再加这两行
+export MEW_ALLOW_HTTP_UPSTREAM=true
+export MEW_DEV_BYPASS_UPSTREAM_SSRF=true
+
+cargo run -p mew-image-backend
+```
+
+**Windows（PowerShell）**——和上面等价：
 
 ```powershell
 # MEW_ADMIN_TOKEN —— 等价 openssl rand -base64 32
@@ -39,18 +57,12 @@ $env:MEW_AUTH_SECRET = [System.BitConverter]::ToString($b).Replace('-','').ToLow
 >
 > Windows PowerShell 5.1 跑在 .NET Framework 上，没有 .NET Core 才有的静态方法 `RandomNumberGenerator::Fill`，调用会报 MethodNotFound。用 `Create().GetBytes()` 这条路在两边都能跑。
 
-托管账号要用到 `MEW_MANAGED_PROVIDER_SECRET`（同样用 hex 生成），设好后要固定备份——丢了已有的托管配置解不开。
+托管账号要用到 `MEW_MANAGED_PROVIDER_SECRET`（同样用 hex 生成），设好后固定备份——丢了已有的托管配置解不开。
 
-接着在启动后端的**同一个终端**里设置开关并启动：
+这些变量只在设置它的那个终端里有效，所以**和后端在同一个窗口**里导出。绑定地址也要显式给一下，环回相关的开关才生效：
 
-```powershell
-Set-Location D:\project\MewImage
-$env:MEW_LISTEN = "127.0.0.1:3000"
-$env:MEW_ALLOW_ADMIN_SETUP = "true"
-$env:MEW_ALLOW_HTTP_UPSTREAM = "true"        # 需要明文 HTTP 上游时才要
-$env:MEW_DEV_BYPASS_UPSTREAM_SSRF = "true"   # 上游是局域网或 Fake-IP 时才要
-
-cargo run -p mew-image-backend
+```bash
+export MEW_LISTEN=127.0.0.1:3000        # Windows：$env:MEW_LISTEN = "127.0.0.1:3000"
 ```
 
 然后在页面上走：**设置 → 账号与同步 → 注册 → 使用管理员初始化口令**，填入刚才输出的 `MEW_ADMIN_TOKEN`。密码至少 10 位，包含大小写字母、数字和符号。这个第一个账号直接是 `approved` 状态的管理员。
@@ -59,8 +71,12 @@ cargo run -p mew-image-backend
 
 检查状态：
 
+```bash
+curl http://127.0.0.1:3000/api/auth/setup-status          # Linux / macOS
+```
+
 ```powershell
-Invoke-RestMethod http://127.0.0.1:3000/api/auth/setup-status
+Invoke-RestMethod http://127.0.0.1:3000/api/auth/setup-status   # Windows
 ```
 
 `admin_exists` 为 `true` 表示库里已经有管理员，这条初始化路径不再允许创建第二个。
@@ -136,6 +152,26 @@ unset MEW_DEV_BYPASS_UPSTREAM_SSRF MEW_ALLOW_HTTP_UPSTREAM
 - **允许来源要对得上**。前端跑在 `8080` 时默认的 `MEW_ALLOWED_ORIGINS` 已经包含 `http://127.0.0.1:8080`；换了端口要自己加，末尾不要带 `/`。
 - **Windows 下跑整个工作区测试**：`Cargo.toml` 里的 `[profile.test]` 关掉了调试符号，因为完整工作区测试会超过 MSVC 单个 PDB 的容量。别改回来。
 - **依赖审计**：`deny.toml` 里挂着两条 Leptos 0.8 间接依赖的 RUSTSEC 例外，带到期时间。升级 Leptos 时要回头清掉。
+
+## 内存不够用的时候
+
+前后端一起编大概 514 个包（`backend` 29 个直接依赖、`frontend` 21 个），前端还要额外编一遍 `wasm32` 目标，等于两套编译。默认的 dev profile 带完整调试信息，`target/` 体积和链接期内存都不小；并行度又默认等于 CPU 核心数，16 GiB 的机器上很容易同时跑满核数的 `rustc`。仓库里只对 `[profile.test]` 和 `[profile.docker-release]` 做过调优，`[profile.dev]` 保持默认。
+
+按代价从低到高排：
+
+- **限制并行度**：`CARGO_BUILD_JOBS=2 cargo run -p mew-image-backend`（Windows：`$env:CARGO_BUILD_JOBS = "2"`）。
+- **别全量编**：只编需要的那一半，`cargo build --workspace` 会把前端 WASM 一起拉进来；`cargo test --workspace` 更重，按 crate 分开跑。
+- **关掉调试信息**（换内存，代价是断点调试看不到局部变量）。可以在 `~/.cargo/config.toml` 或项目 `Cargo.toml` 里加：
+
+  ```toml
+  [profile.dev]
+  debug = 0                 # 或者 "line-tables-only"
+  split-debuginfo = "unpacked"
+  ```
+
+- **换链接器**：Linux 上装 `lld` 或 `mold`，在 `~/.cargo/config.toml` 里指定（`-C link-arg=-fuse-ld=mold`），链接阶段的内存和时间都会降下来。
+- **编辑器**：rust-analyzer 常常比编译更吃内存，可以关掉保存时自动 `cargo check`，或者让它跑 `check` 而不是 `build`。
+- **系统层**：开 zram 或给足 swap，至少避免被 OOM 杀掉；顺便把 `target/` 排除在备份和同步目录之外——它有几十 GB，删了下次要全量重编。
 
 ## 相关页面
 
