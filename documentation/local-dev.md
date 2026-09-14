@@ -155,12 +155,26 @@ unset MEW_DEV_BYPASS_UPSTREAM_SSRF MEW_ALLOW_HTTP_UPSTREAM
 
 ## 内存不够用的时候
 
-前后端一起编大概 514 个包（`backend` 29 个直接依赖、`frontend` 21 个），前端还要额外编一遍 `wasm32` 目标，等于两套编译。默认的 dev profile 带完整调试信息，`target/` 体积和链接期内存都不小；并行度又默认等于 CPU 核心数，16 GiB 的机器上很容易同时跑满核数的 `rustc`。仓库里只对 `[profile.test]` 和 `[profile.docker-release]` 做过调优，`[profile.dev]` 保持默认。
+`Cargo.lock` 里 514 个包（464 个不同名字），其中一部分是只在 Windows 上编译的 `windows-*`。前后端一起编等于两套编译：前端还要额外编一遍 `wasm32` 目标。默认的 dev profile 带完整调试信息，`target/` 体积和链接期内存都不小；并行度又默认等于 CPU 核心数，16 GiB 的机器上很容易同时跑满核数的 `rustc`。仓库只对 `[profile.test]` 和 `[profile.docker-release]` 做过调优，`[profile.dev]` 保持默认。
+
+按边际包数看（已排除只在 Windows 编译的那些），花钱的地方是这几处：
+
+| 部分 | 独有的包 | 说明 |
+| --- | --- | --- |
+| 前端 `leptos` | 118 | 框架本身，占前端的大头 |
+| 后端 S3（`aws-config` + `aws-sdk-s3`） | 45 | 只用本地目录存储时用不上；要做成可选 feature 需要改代码，现在还没做 |
+| 后端 `sqlx`（只开 sqlite） | 37 | 数据库层与迁移 |
+| 后端 `reqwest` | 10 | 出站请求，含 HTTP/3 相关的 `quinn*` |
+| 前端 `rexie` | 10 | IndexedDB 封装 |
+| 后端 `tracing-subscriber`（`env-filter`） | 8 | 会带进 `regex` |
+| 后端 `image`（只开 webp/png） | 8 | 已经裁过格式 |
+
+`shared` 同时被前后端依赖，**改它两边都要重编**，这是最容易忽略的一次全量编译。
 
 按代价从低到高排：
 
 - **限制并行度**：`CARGO_BUILD_JOBS=2 cargo run -p mew-image-backend`（Windows：`$env:CARGO_BUILD_JOBS = "2"`）。
-- **别全量编**：只编需要的那一半，`cargo build --workspace` 会把前端 WASM 一起拉进来；`cargo test --workspace` 更重，按 crate 分开跑。
+- **别全量编**：只改后端时 `cargo run -p mew-image-backend` 就够了，前端那 118 个包不会参与编译；`cargo build --workspace` 会把前端 WASM 一起拉进来，`cargo test --workspace` 更重，按 crate 分开跑。
 - **关掉调试信息**（换内存，代价是断点调试看不到局部变量）。可以在 `~/.cargo/config.toml` 或项目 `Cargo.toml` 里加：
 
   ```toml
