@@ -5047,6 +5047,10 @@ body[data-visual-theme="aurora"][data-background-layer="above-decorations"] .gal
   overflow: hidden;
 }
 
+.gallery-card-compact .compact-card-body {
+  padding-bottom: 52px;
+}
+
 .gallery-card-compact.is-failed .compact-card-body {
   gap: 4px;
 }
@@ -5094,6 +5098,31 @@ body[data-visual-theme="aurora"][data-background-layer="above-decorations"] .gal
   align-items: center;
   justify-content: flex-end;
   margin-left: auto;
+}
+
+/* 操作按钮以整张卡片为边界；数量增加时可向左覆盖预览图，但不能越过右边缘。 */
+.gallery-card-compact .compact-actions {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 6;
+  width: max-content;
+  max-width: calc(100% - 20px);
+  gap: 4px;
+  margin-left: 0;
+  padding: 4px;
+  border: 1px solid rgba(var(--primary-rgb), 0.14);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--floating-surface-base, var(--panel-strong)) 90%, transparent);
+  box-shadow: 0 6px 18px rgba(7, 12, 26, 0.14);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
+.gallery-card-compact .compact-actions .mini-action {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
 }
 
 .mini-action {
