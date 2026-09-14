@@ -33,7 +33,7 @@ use axum::{
     extract::{ConnectInfo, Multipart, Path, Query, Request, State, multipart::Field},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -113,6 +113,8 @@ const S3_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(5 * 60);
 const DOCKER_DATA_PERMISSION_HINT: &str = "Docker Compose 默认以 UID:GID 10001:10001 运行；请在部署目录停止容器后执行 `sudo chown -R 10001:10001 ./data`，并确认该目录允许所有者读写。";
 const REGISTRATION_DEVICE_COOKIE: &str = "mew_registration_device";
 const OPENAI_EDIT_IMAGE_FIELD: &str = "image[]";
+const SOCIAL_IMAGE_PATH: &str = "/favicon/og-image.png";
+const PUBLIC_URL_METADATA_MARKER: &str = "<!-- mew-public-url -->";
 static PROXY_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 static MALLOC_TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -321,6 +323,8 @@ async fn main() -> anyhow::Result<()> {
     .unwrap_or(usize::MAX);
 
     let app = Router::new()
+        .route("/", get(frontend_index))
+        .route("/index.html", get(frontend_index))
         .route("/api/health", get(health))
         .route(
             "/api/auth/register",
@@ -754,6 +758,34 @@ fn build_cors_layer(config: &AppConfig) -> anyhow::Result<CorsLayer> {
             Method::OPTIONS,
         ])
         .allow_origin(AllowOrigin::list(origin_headers)))
+}
+
+fn render_frontend_index(index_html: &str, public_base_url: Option<&str>) -> String {
+    let Some(public_base_url) = public_base_url else {
+        return index_html.to_string();
+    };
+    let social_image_url = format!("{public_base_url}{SOCIAL_IMAGE_PATH}");
+    let metadata = format!(
+        "<meta property=\"og:url\" content=\"{public_base_url}/\" />\n    <link rel=\"canonical\" href=\"{public_base_url}/\" />"
+    );
+    index_html
+        .replace(SOCIAL_IMAGE_PATH, &social_image_url)
+        .replace(PUBLIC_URL_METADATA_MARKER, &metadata)
+}
+
+async fn frontend_index(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
+    let path = FsPath::new(&state.config.frontend_dist).join("index.html");
+    let index_html = tokio::fs::read_to_string(&path).await.map_err(|error| {
+        error!("读取前端入口 {} 失败：{error}", path.display());
+        AppError::internal_message("前端入口文件不可用")
+    })?;
+    let html = render_frontend_index(&index_html, state.config.public_base_url.as_deref());
+    let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
+    Ok(response)
 }
 
 async fn health() -> impl IntoResponse {
@@ -6754,6 +6786,7 @@ mod tests {
             listen_addr: "127.0.0.1:0".into(),
             database_url: "sqlite::memory:".into(),
             frontend_dist: String::new(),
+            public_base_url: None,
             session_secure: false,
             trust_proxy_headers: false,
             trusted_proxy_cidrs: Vec::new(),
@@ -6797,6 +6830,27 @@ mod tests {
             gallery_asset_quota_bytes: 5 * 1024 * 1024 * 1024,
             gallery_asset_quota_count: 20_000,
         }
+    }
+
+    #[test]
+    fn frontend_index_uses_absolute_social_urls_when_configured() {
+        let source = concat!(
+            "<meta property=\"og:image\" content=\"/favicon/og-image.png\" />",
+            "<!-- mew-public-url -->",
+            "<meta name=\"twitter:image\" content=\"/favicon/og-image.png\" />"
+        );
+        let rendered = render_frontend_index(source, Some("https://img.example.com"));
+        assert_eq!(
+            rendered
+                .matches("https://img.example.com/favicon/og-image.png")
+                .count(),
+            2
+        );
+        assert!(rendered.contains("property=\"og:url\" content=\"https://img.example.com/\""));
+        assert!(rendered.contains("rel=\"canonical\" href=\"https://img.example.com/\""));
+        assert!(!rendered.contains(PUBLIC_URL_METADATA_MARKER));
+
+        assert_eq!(render_frontend_index(source, None), source);
     }
 
     async fn test_db() -> SqlitePool {

@@ -62,18 +62,20 @@ openssl rand -hex 32
 openssl rand -base64 32
 ```
 
-编辑 `.env`，至少修改以下三项：
+编辑 `.env`，至少修改以下四项：
 
 ```dotenv
 MEW_AUTH_SECRET=第一条命令生成的随机值
 MEW_ADMIN_TOKEN=第二条命令生成的随机值
 MEW_ALLOWED_ORIGINS=https://你的正式域名
+MEW_PUBLIC_BASE_URL=https://你的正式域名
 ```
 
 如果暂时通过 `http://服务器IP:3188` 直接访问，则把 `MEW_ALLOWED_ORIGINS` 改成该完整来源，并保持：
 
 ```dotenv
 MEW_HOST_BIND=0.0.0.0
+MEW_PUBLIC_BASE_URL=http://你的服务器IP:3188
 MEW_SESSION_SECURE=false
 MEW_TRUST_PROXY_HEADERS=false
 ```
@@ -82,6 +84,7 @@ MEW_TRUST_PROXY_HEADERS=false
 
 ```dotenv
 MEW_ALLOWED_ORIGINS=https://你的正式域名
+MEW_PUBLIC_BASE_URL=https://你的正式域名
 MEW_SESSION_SECURE=true
 MEW_TRUST_PROXY_HEADERS=true
 MEW_TRUSTED_PROXY_CIDRS=反向代理所在的精确IP或CIDR
@@ -126,6 +129,8 @@ mewimage/
 如需使用托管账号，先在 `.env` 中设置 `MEW_MANAGED_PROVIDER_SECRET`。它必须是 `openssl rand -hex 32` 生成的 64 位十六进制值，并应与 SQLite 数据库一同固定备份。没有任何托管配置时缺少该密钥不会影响普通部署启动；一旦数据库已有托管配置，密钥缺失、错误或无法解密都会阻止启动，避免带着不可用凭据继续运行。密钥丢失后无法恢复原有 API Key，只能从数据库备份和对应密钥一起恢复。
 
 管理员从顶栏盾牌按钮进入 `#/admin` 管理后台；“托管账号”和“服务商模板”使用独立侧栏入口。创建托管账号时必须选择服务商模板或手工保存第一条配置。系统生成的临时密码只展示一次，托管用户首次登录必须修改密码；管理员重置密码会立即使旧会话失效。托管配置可逐项维护，也可选择协议和接口模式一致的多条记录批量更新地址和/或 Key；Key 留空表示保留旧值，保存后仅显示末尾提示且不能回显或复制。服务商模板修改后不会自动影响账号，需由管理员明确选择关联账号执行同步。
+
+首页内置 Open Graph 与 Twitter Card 分享元数据，预览图位于 `/favicon/og-image.png`。生产部署应将 `MEW_PUBLIC_BASE_URL` 设置为外部实际访问的 HTTP(S) 站点来源，例如 `https://img.example.com`；该值只能包含协议、域名和可选端口，不能包含路径、账号、查询参数、片段或末尾斜杠。留空时页面保留相对图片地址，浏览器访问不受影响，但部分社交平台可能无法抓取预览图。修改 Compose 使用的 `.env` 后应执行 `docker compose up -d --force-recreate` 重新创建容器，单纯 `docker restart` 不会重新载入环境变量。
 
 说明：
 

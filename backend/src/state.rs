@@ -2,6 +2,7 @@ use aws_sdk_s3::Client as S3Client;
 use bytes::Bytes;
 use ipnet::IpNet;
 use mew_image_shared::{ProviderTemplate, new_id};
+use reqwest::Url;
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
@@ -77,6 +78,7 @@ pub struct AppConfig {
     pub listen_addr: String,
     pub database_url: String,
     pub frontend_dist: String,
+    pub public_base_url: Option<String>,
     pub session_secure: bool,
     pub trust_proxy_headers: bool,
     pub trusted_proxy_cidrs: Vec<IpNet>,
@@ -139,6 +141,11 @@ impl AppConfig {
         .filter(|value| !value.trim().is_empty())
         .map(|value| parse_managed_provider_key(&value))
         .transpose()?;
+        let public_base_url = env_value("MEW_PUBLIC_BASE_URL", "MEW_IMAGE_PUBLIC_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| normalize_public_base_url(&value))
+            .transpose()?;
         Ok(Self {
             listen_addr: env_value("MEW_LISTEN", "MEW_IMAGE_LISTEN")
                 .unwrap_or_else(|_| "127.0.0.1:3000".into()),
@@ -146,6 +153,7 @@ impl AppConfig {
                 .unwrap_or_else(|_| "sqlite://./data/mew-image.db?mode=rwc".into()),
             frontend_dist: env_value("MEW_FRONTEND_DIST", "MEW_IMAGE_FRONTEND_DIST")
                 .unwrap_or_else(|_| "./frontend/dist-app".into()),
+            public_base_url,
             session_secure: env_value("MEW_SESSION_SECURE", "MEW_IMAGE_SESSION_SECURE")
                 .map(|value| value == "true")
                 .unwrap_or(false),
@@ -513,6 +521,25 @@ fn env_value(short_key: &str, legacy_key: &str) -> Result<String, std::env::VarE
     std::env::var(short_key).or_else(|_| std::env::var(legacy_key))
 }
 
+fn normalize_public_base_url(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    let url = Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("MEW_PUBLIC_BASE_URL 必须是完整的 http(s) 站点地址。"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(anyhow::anyhow!(
+            "MEW_PUBLIC_BASE_URL 只能填写站点来源，例如 https://img.example.com，不能包含路径、账号、查询参数或片段。"
+        ));
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
 fn parse_csv_env(short_key: &str, legacy_key: &str) -> Vec<String> {
     env_value(short_key, legacy_key)
         .ok()
@@ -613,6 +640,17 @@ fn default_proxy_memory_budget_mib() -> usize {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn public_base_url_accepts_only_clean_http_origins() {
+        assert_eq!(
+            normalize_public_base_url(" https://img.example.com/ ").unwrap(),
+            "https://img.example.com"
+        );
+        assert!(normalize_public_base_url("https://img.example.com/app").is_err());
+        assert!(normalize_public_base_url("https://user@example.com").is_err());
+        assert!(normalize_public_base_url("javascript:alert(1)").is_err());
+    }
 
     #[test]
     fn guest_generation_and_image_concurrency_are_isolated_per_ip() {
