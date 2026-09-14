@@ -27,15 +27,13 @@
 
 ## 截图
 
+*经典 Mew 主题的工作台*
+
 ![工作台](documentation/images/workbench.webp)
 
-四套主题：星轨 · 星轨日间 · 液态玻璃 · 自定义背景
+*三套主题（经典 Mew / 极光星轨 / 液态玻璃）各自都有日间与夜间。这里放的是极光星轨的夜间、日间，以及液态玻璃和自定义背景*
 
 ![主题](documentation/images/themes.webp)
-
-模板广场
-
-![模板广场](documentation/images/plaza.webp)
 
 ## 功能
 
@@ -120,11 +118,13 @@ docker compose up -d
 rustup target add wasm32-unknown-unknown
 cargo install trunk --version 0.21.14 --locked
 
-cd backend && cargo run          # 后端 127.0.0.1:3000
-cd frontend && trunk serve       # 前端 8080
+cargo run -p mew-image-backend    # 后端 127.0.0.1:3000
+cd frontend && trunk serve --open  # 前端 8080
 ```
 
-本机连局域网内的上游、或代理软件用 Fake-IP DNS 时会被 SSRF 策略拦住，见[排障](documentation/troubleshooting.md)。
+`cargo run` 不会自动读根目录的 `.env`（那是 `docker compose` 的行为），要读到变量得在启动后端的同一个终端里先 `export`。本机或局域网的上游会被 SSRF 策略拦住，按情况开 `MEW_ALLOW_LOOPBACK_UPSTREAM` / `MEW_DEV_BYPASS_UPSTREAM_SSRF`——两个开关都要求后端自己监听环回地址，启动日志会写明生效没有。
+
+踩过的坑（`.env` 不自动加载、图片重定向也走检查、Fake-IP DNS、Windows 跑整个工作区测试、依赖审计例外）整理在[本地开发与联调](documentation/local-dev.md)。
 
 ## 许可
 

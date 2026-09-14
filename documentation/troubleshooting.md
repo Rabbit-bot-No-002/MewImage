@@ -145,4 +145,4 @@ MEW_TRUST_PROXY_HEADERS=false
 [部署](deploy.md) · [环境变量参考](config.md) · [后端资源存储](storage.md) · [快速开始](quickstart.md)
 ---
 
-[← 文档目录](README.md) · [上一页：后端资源存储](storage.md) · [下一页：架构与设计原则](architecture.md)
+[← 文档目录](README.md) · [上一页：后端资源存储](storage.md) · [下一页：本地开发与联调](local-dev.md)

@@ -117,4 +117,4 @@ SQLite 启用 WAL、`synchronous=NORMAL` 和 busy timeout；同步拉取后的�
 - [手动云同步](sync.md)：合并、墓碑与图片同步的实际行为
 ---
 
-[← 文档目录](README.md) · [上一页：排障](troubleshooting.md) · [下一页：安全边界](security.md)
+[← 文档目录](README.md) · [上一页：本地开发与联调](local-dev.md) · [下一页：安全边界](security.md)
