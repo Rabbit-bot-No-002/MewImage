@@ -17,7 +17,8 @@
 | 想知道能做什么 | [工作台与生图](workbench.md) → [参考图与编辑器](editor.md) |
 | 要给团队/朋友开账号 | [账号与审批](accounts.md) → [托管账号](managed.md) |
 | 想弄清数据到底存在哪 | [手动云同步](sync.md) → [后端资源存储](storage.md) |
-| 准备读代码或二次开发 | [架构与设计原则](architecture.md) → [后端 API](api.md) |
+| 要读代码或二次开发 | [架构与设计原则](architecture.md) → [后端 API](api.md) |
+| 要改代码、跑本地前后端 | [本地开发与联调](local-dev.md) → [架构与设计原则](architecture.md) |
 
 ## 版本
 
